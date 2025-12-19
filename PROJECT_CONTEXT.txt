@@ -130,3 +130,130 @@ Price @ 112850 (rising)
 
 This is mathematically correct for an infinite expanding grid.
 
+## Production Deployment (VPS)
+
+### VPS Details
+- **IP**: 45.144.242.97
+- **Port**: 800
+- **Access URL**: http://45.144.242.97:800/
+- **Project Path**: `C:\Users\Administrator\Downloads\trade-bot-deriv-v2`
+- **Python Path**: `C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe`
+- **NSSM Path**: `C:\nssm\nssm.exe`
+
+### File Structure (Production)
+```
+trade-bot-deriv-v2/
+├── main.py                    # Entry point (port 800, rotating logs)
+├── run_forever.py             # Watchdog wrapper (infinite restart loop)
+├── install_service.bat        # NSSM service installer
+├── uninstall_service.bat      # NSSM service remover
+├── .env                       # Production credentials
+├── .env.production            # Credentials template
+├── DEPLOYMENT.md              # Full deployment guide
+├── logs/                      # Log files directory
+│   ├── bot.log               # Main application log (10MB, 5 rotations)
+│   ├── crash.log             # Crash reports from watchdog
+│   ├── stdout.log            # Real-time console output
+│   ├── service_stdout.log    # NSSM service stdout
+│   └── service_stderr.log    # NSSM service stderr
+└── ...
+```
+
+### 3-Layer Crash Protection Architecture
+```
+┌─────────────────────────────────────────────────────────┐
+│             Layer 3: NSSM Service                       │
+│  - Starts on Windows boot                               │
+│  - Restarts on crash (5 second delay)                   │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │       Layer 2: run_forever.py (Watchdog)          │  │
+│  │  - Catches Python exceptions                      │  │
+│  │  - Cooldown if too many rapid restarts            │  │
+│  │  ┌─────────────────────────────────────────────┐  │  │
+│  │  │     Layer 1: core/engine.py (MT5 Health)    │  │  │
+│  │  │  - Health check every 100 ticks             │  │  │
+│  │  │  - Auto-reconnect (10 attempts, 5s delay)   │  │  │
+│  │  └─────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+### NSSM Service Commands
+
+**Install Service:**
+```cmd
+C:\nssm\nssm.exe install TradingBotService "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe" "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\run_forever.py"
+C:\nssm\nssm.exe set TradingBotService AppDirectory "C:\Users\Administrator\Downloads\trade-bot-deriv-v2"
+C:\nssm\nssm.exe set TradingBotService AppExit Default Restart
+C:\nssm\nssm.exe set TradingBotService AppRestartDelay 5000
+C:\nssm\nssm.exe set TradingBotService Start SERVICE_AUTO_START
+```
+
+**Or use batch file:**
+```cmd
+cd C:\Users\Administrator\Downloads\trade-bot-deriv-v2
+install_service.bat
+```
+
+**Start/Stop Service:**
+```cmd
+net start TradingBotService
+net stop TradingBotService
+```
+
+**Check Service Status:**
+```cmd
+sc query TradingBotService
+```
+
+**View Logs:**
+```cmd
+type "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\bot.log"
+type "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\service_stdout.log"
+```
+
+**Uninstall Service:**
+```cmd
+net stop TradingBotService
+C:\nssm\nssm.exe remove TradingBotService confirm
+```
+
+### Environment Variables (.env)
+```
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your-anon-key
+MT5_LOGIN=your-mt5-login
+MT5_PASSWORD=your-mt5-password
+MT5_SERVER=Weltrade-Demo
+MT5_PATH=C:\Program Files\Weltrade MT5\terminal64.exe
+BOT_HOST=0.0.0.0
+BOT_PORT=800
+```
+
+### Firewall Rule
+```powershell
+New-NetFirewallRule -DisplayName "Allow Bot Port 800" -Direction Inbound -Protocol TCP -LocalPort 800 -Action Allow
+```
+
+### Important Notes
+
+1. **NO EMOJIS IN CODE**: Windows service uses cp1252 encoding. All print/logger statements must use ASCII only.
+
+2. **Relative API URLs**: Frontend uses `BASE_URL = ""` (empty string) so API calls work from any host.
+
+3. **MT5 Requires Desktop Session**: MT5 terminal must be running with logged-in user session.
+
+4. **Update Process**:
+   ```cmd
+   net stop TradingBotService
+   # Copy updated files to VPS
+   net start TradingBotService
+   ```
+
+## Last Updated
+2025-12-19 17:39 - PRODUCTION DEPLOYMENT COMPLETE
+- Added run_forever.py watchdog wrapper
+- Added NSSM service configuration
+- Added MT5 health monitoring with auto-reconnect
+- Removed all Unicode emojis for Windows service compatibility
+- Fixed BASE_URL for production API calls
