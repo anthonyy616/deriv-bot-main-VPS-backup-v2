@@ -83,15 +83,15 @@ class ConfigManager:
                     self.config = loaded
                 else:
                     # Migrate from old format (symbols is a list or missing)
-                    print(f"🔄 Migrating config to multi-asset format...")
+                    print(f"[CONFIG] Migrating config to multi-asset format...")
                     self.config = self._migrate_old_config(loaded)
                     self.save_config()
                     
             except Exception as e:
-                print(f"⚠️ Error loading config {self.config_file}: {e}")
+                print(f"[CONFIG] Error loading config {self.config_file}: {e}")
                 self.config = self._get_defaults()
         else:
-            print(f"ℹ️ Creating new config file: {self.config_file}")
+            print(f"[CONFIG] Creating new config file: {self.config_file}")
             self.config = self._get_defaults()
             self.save_config()
 
