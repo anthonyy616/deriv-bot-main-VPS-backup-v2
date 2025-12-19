@@ -1043,7 +1043,12 @@
             lastRunningState = status.running;
         }
 
-        function logout() { supabase.auth.signOut(); }
+        async function logout() {
+            await supabaseClient.auth.signOut();
+            sessionToken = null;
+            log("Signed out successfully.");
+            setLoggedOutState();
+        }
         function startPolling() { if (updateInterval) clearInterval(updateInterval); updateInterval = setInterval(fetchStatus, 1000); }
         function log(msg) {
             const logs = document.getElementById('logs');

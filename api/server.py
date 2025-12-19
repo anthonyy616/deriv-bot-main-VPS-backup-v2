@@ -28,8 +28,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Auth Cache (60 seconds)
-auth_cache = TTLCache(maxsize=100, ttl=60)
+# Auth Cache (30 seconds - shorter TTL for multi-user support)
+auth_cache = TTLCache(maxsize=100, ttl=30)
 
 # --- 1. Initialize Core Systems ---
 bot_manager = BotManager()
@@ -68,26 +68,45 @@ class ConfigUpdate(BaseModel):
 
 # --- 2. Auth Helper ---
 def verify_token_sync(token):
-    if token in auth_cache: return auth_cache[token]
-    user = supabase.auth.get_user(token)
-    if user and user.user:
-        auth_cache[token] = user
-        return user
+    """
+    Verify Supabase token with short-term caching.
+    Cache by token for 30 seconds to reduce API calls while allowing multiple users.
+    """
+    if token in auth_cache: 
+        return auth_cache[token]
+    
+    try:
+        user = supabase.auth.get_user(token)
+        if user and user.user:
+            auth_cache[token] = user
+            return user
+    except Exception as e:
+        print(f"[AUTH] Token validation error: {e}")
+        # Remove from cache if validation failed
+        if token in auth_cache:
+            del auth_cache[token]
     return None
 
 async def get_current_bot(request: Request):
+    """
+    Get or create bot instance for the authenticated user.
+    Each user gets their own isolated bot instance.
+    """
     auth_header = request.headers.get('Authorization')
-    if not auth_header: raise HTTPException(401, "Missing token")
+    if not auth_header: 
+        raise HTTPException(401, "Missing token")
     
     try:
-        user = await asyncio.to_thread(verify_token_sync, auth_header.split(" ")[1])
+        token = auth_header.split(" ")[1]
+        user = await asyncio.to_thread(verify_token_sync, token)
     except Exception as e:
-        print(f"⚠️ Auth Check Failed: {e}")
+        print(f"[AUTH] Check Failed: {e}")
         raise HTTPException(401, "Auth Validation Failed")
 
-    if not user: raise HTTPException(401, "Invalid Token")
+    if not user: 
+        raise HTTPException(401, "Invalid Token")
     
-    # Allow this to propagate validation/logic errors as 500, not 401
+    # Each user gets their own bot instance (multi-tenant support)
     return await bot_manager.get_or_create_bot(user.user.id)
 
 # --- 3. API Routes (Defined BEFORE Static Mount) ---
