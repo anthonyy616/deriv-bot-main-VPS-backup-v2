@@ -1,0 +1,9 @@
+aiohttp
+python-dotenv
+fastapi
+uvicorn
+ta-lib
+schedule
+MetaTrader5
+requests
+pydantic

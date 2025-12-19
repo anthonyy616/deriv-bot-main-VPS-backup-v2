@@ -1,0 +1,132 @@
+# Weltrade MT5 Trading Bot - Project Context
+
+## Overview
+An automated grid trading bot for MetaTrader 5 (MT5) that implements an "Infinite Ladder Grid" strategy with leapfrog mechanics. The bot manages multiple trading pairs across various synthetic indices (FX Vol, SFX Vol, FlipX, PainX, GainX, etc.).
+
+## Core Architecture
+
+### Files Structure
+```
+trade-bot-deriv/
+├── main.py                    # Entry point, starts FastAPI server
+├── api/server.py              # FastAPI endpoints for UI control
+├── core/
+│   ├── strategy_engine.py     # Main trading logic (LadderGridStrategy)
+│   ├── bot_manager.py         # Manages multiple symbol strategies
+│   └── config_manager.py      # Configuration persistence
+├── static/index.html          # Web UI (Supabase auth + trading controls)
+└── state/                     # Persisted strategy states per symbol
+```
+
+### Key Class: `LadderGridStrategy`
+
+Located in `core/strategy_engine.py`. Implements the grid trading logic.
+
+**Phases:**
+1. `INIT` - Execute B0 immediately at market, set up S0 pending
+2. `WAITING_CENTER` - Wait for both B0 and S0 to fill
+3. `EXPANDING` - Create pairs up to `max_pairs`
+4. `RUNNING` - Monitor triggers, execute trades, handle TP/SL
+
+**Data Structures:**
+- `GridPair` - Represents one grid level with buy/sell prices, fill status, trade count
+- `TradeLog` - Debug logging for each trade event
+
+## The Grid Structure (CRITICAL)
+
+```
+Pair Index | BUY Price  | SELL Price | Relationship
+-----------|------------|------------|-------------
+    +3     |   120      |   100      | S[3] = B[2]
+    +2     |   100      |    80      | S[2] = B[1]
+    +1     |    80      |    60      | S[1] = B[0]
+     0     |    60      |    40      | S[0] = B[-1]
+    -1     |    40      |    20      | S[-1] = B[-2]
+    -2     |    20      |     0      | 
+```
+
+**Key Invariant:** `S[N] = B[N-1]` for all N. Adjacent pairs share a price level.
+
+## Chain Execution Rule (MANDATORY)
+
+When ANY order triggers at a price level, the opposite order from the adjacent pair at the SAME price MUST also trigger.
+
+**Example:** When B[-3] @ 112864 triggers → S[-2] @ 112864 MUST also trigger.
+
+This ensures that at ANY random time, looking at MT5:
+- The TOP line has BOTH buy and sell
+- The BOTTOM line has BOTH buy and sell
+
+## Known Bugs Fixed
+
+1. **Race Condition / Ghost Close Loop** - Fixed by debouncing position closure detection (3 consecutive missing ticks required)
+2. **Nuclear Reset on Network Error** - Fixed by checking `None` return from `mt5.positions_get()`
+3. **Lot Size Continuity on Re-open** - Fixed by resetting `trade_count` to 0 on pair reset
+4. **Missing Chain Execution** - Fixed by adding bidirectional chain logic
+
+## Configuration (from UI)
+
+Per-symbol settings:
+- `spread` - Grid spacing in points (e.g., 24)
+- `max_pairs` - Odd number 1-9 (total grid levels)
+- `max_positions` - Trades per pair 1-20
+- `lot_sizes` - Array of lot sizes for trade sequence
+- `buy_stop_tp/sl` - TP/SL for buy orders
+- `sell_stop_tp/sl` - TP/SL for sell orders
+
+## API Endpoints
+
+- `GET /status` - Current bot state, positions, phase
+- `GET /config` - Current configuration
+- `POST /config` - Update configuration
+- `POST /control/start/{symbol}` - Start trading a symbol
+- `POST /control/stop/{symbol}` - Stop trading a symbol
+- `GET /env` - Returns Supabase credentials for frontend auth
+
+## Debugging Tips
+
+1. Check `trade_debug_{symbol}.txt` for trade history
+2. The terminal shows emoji-coded events:
+   - ⚡ = Trigger fired
+   - 🟢 = Order opened
+   - ⛓️ = Chain execution
+   - 💥 = Nuclear reset
+   - 📝 = Virtual pending order placed
+
+## Last Updated
+2025-12-19 14:57 - FEATURE VERIFIED AND COMPLETE
+
+### Chain Execution Implementation
+- Bidirectional: BUY triggers S[idx+1], SELL triggers B[idx-1] for ALL pairs
+- Guard: Expansion skips if chain already filled the target order
+- Chain from Expansion: After creating new pair, chains adjacent order at same price
+- Result: NO missed orders, NO duplicates at shared price levels
+
+### Edge Case Scenarios (Expected Behavior)
+
+**Why TOP/BOTTOM lines may not show BOTH BUY and SELL on MT5:**
+
+| Scenario | What You'll See | Why |
+|----------|-----------------|-----|
+| Edge pair just created via expansion | One side filled, one pending | Expansion executes "inside" order; "outside" awaits price |
+| Strong trending market (price UP) | Top pair: only SELL visible | BUY at higher price hasn't triggered yet |
+| Strong trending market (price DOWN) | Bottom pair: only BUY visible | SELL at lower price hasn't triggered yet |
+| Price reverses after edge expansion | Edge has one position | Opposite side is armed but untriggered |
+
+**Key Insight:** Chain execution ensures orders at the SAME price level fire together.
+But the absolute EDGE pair (top or bottom) will always have one side pending until price reaches its trigger level.
+
+**Visual Example:**
+```
+Price @ 112850 (rising)
+┌─────────────────────────────────────────┐
+│ Pair 5:  S5 ✅ FILLED @ 112836          │  ← TOP LINE (only SELL, B5 pending @ 112860)
+│ Pair 4:  B4 ✅ + S4 ✅ @ 112812/112836  │  ← Both filled (chain worked)
+│ Pair 3:  B3 ✅ + S3 ✅ @ 112788/112812  │
+│ ...                                      │
+│ Pair -2: (pending, price never reached) │  ← BOTTOM LINE (no MT5 positions)
+└─────────────────────────────────────────┘
+```
+
+This is mathematically correct for an infinite expanding grid.
+

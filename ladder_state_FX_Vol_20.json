@@ -1,0 +1,95 @@
+{
+  "phase": "RUNNING",
+  "center_price": 112740.04,
+  "pairs": {
+    "0": {
+      "index": 0,
+      "buy_price": 112740.04,
+      "sell_price": 112716.04,
+      "buy_ticket": 215875601,
+      "sell_ticket": 0,
+      "buy_filled": true,
+      "sell_filled": false,
+      "buy_pending_ticket": -1,
+      "sell_pending_ticket": -2
+    },
+    "-1": {
+      "index": -1,
+      "buy_price": 112716.04,
+      "sell_price": 112692.04,
+      "buy_ticket": 0,
+      "sell_ticket": 0,
+      "buy_filled": false,
+      "sell_filled": false,
+      "buy_pending_ticket": 999,
+      "sell_pending_ticket": 998
+    },
+    "1": {
+      "index": 1,
+      "buy_price": 112764.04,
+      "sell_price": 112740.04,
+      "buy_ticket": 215877521,
+      "sell_ticket": 215877415,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": -1001,
+      "sell_pending_ticket": -1002
+    },
+    "2": {
+      "index": 2,
+      "buy_price": 112788.04,
+      "sell_price": 112764.04,
+      "buy_ticket": 215880590,
+      "sell_ticket": 215880312,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": -2001,
+      "sell_pending_ticket": -2002
+    },
+    "-2": {
+      "index": -2,
+      "buy_price": 112692.04,
+      "sell_price": 112668.04,
+      "buy_ticket": 0,
+      "sell_ticket": 0,
+      "buy_filled": false,
+      "sell_filled": false,
+      "buy_pending_ticket": 1999,
+      "sell_pending_ticket": 1998
+    },
+    "3": {
+      "index": 3,
+      "buy_price": 112812.04,
+      "sell_price": 112788.04,
+      "buy_ticket": 215882831,
+      "sell_ticket": 215882790,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": -3001,
+      "sell_pending_ticket": -3002
+    },
+    "4": {
+      "index": 4,
+      "buy_price": 112836.04,
+      "sell_price": 112812.04,
+      "buy_ticket": 215885413,
+      "sell_ticket": 215883564,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": 0,
+      "sell_pending_ticket": -4002
+    },
+    "5": {
+      "index": 5,
+      "buy_price": 112860.04,
+      "sell_price": 112836.04,
+      "buy_ticket": 0,
+      "sell_ticket": 215879249,
+      "buy_filled": false,
+      "sell_filled": true,
+      "buy_pending_ticket": -5001,
+      "sell_pending_ticket": -5002
+    }
+  },
+  "iteration": 1
+}

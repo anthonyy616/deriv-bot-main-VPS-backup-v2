@@ -1,0 +1,488 @@
+{
+    "global": {
+        "max_runtime_minutes": 0,
+        "max_drawdown_usd": 50.0
+    },
+    "symbols": {
+        "FX Vol 20": {
+            "enabled": true,
+            "spread": 8,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 16,
+            "buy_stop_sl": 24,
+            "sell_stop_tp": 16,
+            "sell_stop_sl": 24
+        },
+        "FX Vol 40": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FX Vol 60": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FX Vol 80": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FX Vol 99": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SFX Vol 20": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SFX Vol 40": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SFX Vol 60": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SFX Vol 80": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SFX Vol 99": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FlipX 1": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FlipX 2": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FlipX 3": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FlipX 4": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "FlipX 5": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "PainX 400": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "PainX 600": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "PainX 800": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "PainX 999": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "PainX 1200": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "GainX 400": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "GainX 600": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "GainX 800": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "GainX 999": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "GainX 1200": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SwitchX 600": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SwitchX 1200": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "SwitchX 1800": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "BreakX 1200": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        },
+        "BreakX 1800": {
+            "enabled": false,
+            "spread": 20.0,
+            "max_positions": 5,
+            "lot_sizes": [
+                0.01,
+                0.01,
+                0.01,
+                0.01,
+                0.01
+            ],
+            "buy_stop_tp": 50.0,
+            "buy_stop_sl": 75.0,
+            "sell_stop_tp": 50.0,
+            "sell_stop_sl": 75.0
+        }
+    }
+}
