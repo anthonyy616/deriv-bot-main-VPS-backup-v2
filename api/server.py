@@ -172,16 +172,39 @@ async def stop_symbol(symbol: str, bot = Depends(get_current_bot)):
     await bot.stop_symbol(symbol)
     return {"status": "stopped", "symbol": symbol}
 
+@app.post("/control/terminate/{symbol}")
+async def terminate_symbol(symbol: str, bot = Depends(get_current_bot)):
+    """Nuclear reset - close all positions for a symbol immediately"""
+    await bot.terminate_symbol(symbol)
+    return {"status": "terminated", "symbol": symbol}
 
-# --- Status Endpoint ---
+@app.post("/control/terminate-all")
+async def terminate_all(bot = Depends(get_current_bot)):
+    """Nuclear reset - close all positions for all symbols"""
+    await bot.terminate_all()
+    return {"status": "terminated_all"}
 
 @app.get("/status")
 async def get_status(bot = Depends(get_current_bot)):
     """Get status for all active strategies"""
     return bot.get_status()
 
+# --- History Endpoints ---
 
-# --- 4. Static & Root Routes ---
+@app.get("/history")
+async def get_history(bot = Depends(get_current_bot)):
+    """Get list of session history files for this user"""
+    sessions = bot.session_logger.get_sessions()
+    return sessions
+
+@app.get("/history/{session_id}")
+async def get_session_log(session_id: str, bot = Depends(get_current_bot)):
+    """Get contents of a specific session log"""
+    content = bot.session_logger.get_session_content(session_id)
+    if content:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content)
+    raise HTTPException(404, "Session not found")
 
 # Mount static folder for assets (css/js images)
 app.mount("/static", StaticFiles(directory="static"), name="static")

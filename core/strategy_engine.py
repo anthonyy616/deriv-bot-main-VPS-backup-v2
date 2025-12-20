@@ -132,6 +132,9 @@ class LadderGridStrategy:
         self.global_trade_counter: int = 0               # Total trades across all pairs
         self.debug_log_file = f"trade_debug_{self.symbol.replace(' ', '_')}.txt"
         
+        # --- Graceful Stop ---
+        self.graceful_stop: bool = False    # When True, complete open pairs before stopping
+        
         # --- Persistence ---
         self.state_file = f"ladder_state_{self.symbol.replace(' ', '_')}.json"
         
@@ -195,12 +198,75 @@ class LadderGridStrategy:
             os.remove(self.state_file)
             print(f" {self.symbol}: Cleared old state file.")
         
-        print(f" {self.symbol}: LadderGridStrategy Started (Fresh Start - B0 will execute)")
+        print(f"[START] {self.symbol}: LadderGridStrategy Started (Fresh Start - B0 will execute)")
     
     async def stop(self):
-        self.running = False
+        """
+        Graceful stop - sets flag to complete open pairs to max_positions before stopping.
+        """
+        print(f"[STOP] {self.symbol}: Graceful stop initiated. Completing open pairs...")
+        self.graceful_stop = True
+        # Don't set self.running = False here; let _check_graceful_stop_complete handle it
         self.save_state()
-        print(f" {self.symbol}: LadderGridStrategy Stopped.")
+    
+    def _check_graceful_stop_complete(self) -> bool:
+        """
+        Check if graceful stop is complete (all open pairs at max_positions).
+        Returns True if we should fully stop now.
+        """
+        if not self.graceful_stop:
+            return False
+        
+        # Check each pair that has any trades
+        for idx, pair in self.pairs.items():
+            # If this pair has any active positions (buy or sell filled)
+            if pair.buy_filled or pair.sell_filled:
+                if pair.trade_count < self.max_positions:
+                    # Still has trades to complete
+                    return False
+        
+        # All active pairs have reached max_positions - fully stop now
+        self.running = False
+        self.graceful_stop = False
+        print(f"[STOP] {self.symbol}: Graceful stop complete. All pairs at max_positions.")
+        self.save_state()
+        return True
+    
+    async def terminate(self):
+        """
+        Nuclear reset - close ALL positions for this symbol immediately.
+        Resets all pair states and lot counters.
+        """
+        print(f"[TERMINATE] {self.symbol}: Closing ALL positions immediately...")
+        
+        # Close all open positions for this symbol
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions:
+            for pos in positions:
+                self._close_position(pos.ticket)
+            print(f"[TERMINATE] {self.symbol}: Closed {len(positions)} positions.")
+        
+        # Reset all pairs
+        for idx, pair in self.pairs.items():
+            pair.buy_filled = False
+            pair.sell_filled = False
+            pair.buy_ticket = 0
+            pair.sell_ticket = 0
+            pair.trade_count = 0
+            pair.buy_in_zone = False
+            pair.sell_in_zone = False
+        
+        # Stop the strategy
+        self.running = False
+        self.phase = self.PHASE_INIT
+        self.pairs = {}
+        self.center_price = 0.0
+        
+        # Clear state file
+        if os.path.exists(self.state_file):
+            os.remove(self.state_file)
+        
+        print(f"[TERMINATE] {self.symbol}: Grid reset complete.")
     
     # ========================================================================
     # MAIN TICK HANDLER
@@ -210,6 +276,10 @@ class LadderGridStrategy:
         if not self.running:
             return
         if self.is_busy:
+            return
+        
+        # Check if graceful stop is complete
+        if self.graceful_stop and self._check_graceful_stop_complete():
             return
             
         ask = float(tick_data['ask'])
@@ -883,8 +953,42 @@ class LadderGridStrategy:
                         time.sleep(0.2) # Short pause to let quotes refresh
                     
                     else:
-                        print(f" {self.symbol}: Order send failed. Retrying...")
+                        print(f"[CLOSE] {self.symbol}: Order send failed. Retrying...")
                         time.sleep(0.2)
+    
+    def _close_position(self, ticket: int):
+        """
+        Close a single position by ticket number.
+        Used by terminate() for nuclear reset.
+        """
+        position = mt5.positions_get(ticket=ticket)
+        if not position:
+            return False
+        
+        pos = position[0]
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return False
+        
+        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": self.symbol,
+            "position": ticket,
+            "volume": pos.volume,
+            "type": close_type,
+            "price": close_price,
+            "deviation": 50,
+            "magic": pos.magic,
+            "comment": "Terminate",
+        }
+        
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return True
+        return False
                             
     def _count_triggered_pairs(self) -> int:
         """Count pairs that have executed at least one trade (trade_count > 0)."""
@@ -918,6 +1022,9 @@ class LadderGridStrategy:
         if not pair:
             return
         
+        # [FIX] Reset trade_count to 0 so lot sizes restart from first value
+        pair.trade_count = 0
+        
         # Re-arm buy trigger
         pair.buy_pending_ticket = self._place_pending_order(
             self._get_order_type("buy", pair.buy_price),
@@ -928,7 +1035,7 @@ class LadderGridStrategy:
             self._get_order_type("sell", pair.sell_price),
             pair.sell_price, pair_index
         )
-        print(f" {self.symbol}: Pair {pair_index} re-armed at same levels (B@{pair.buy_price:.2f}, S@{pair.sell_price:.2f})")
+        print(f"[REOPEN] {self.symbol}: Pair {pair_index} re-armed at same levels (B@{pair.buy_price:.2f}, S@{pair.sell_price:.2f}) - lot reset to first")
     
     def _create_next_positive_pair(self, edge_idx: int):
         """

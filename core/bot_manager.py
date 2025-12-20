@@ -18,11 +18,11 @@ class BotManager:
             return self.bots[user_id]
         
         # 2. Re-initialize bot for this user (restores config from DB/File)
-        print(f" Restoring/Creating bot session for User: {user_id}")
+        print(f"[BOT] Restoring/Creating bot session for User: {user_id}")
         config_manager = ConfigManager(user_id=user_id)
         
-        # Initialize Strategy Orchestrator
-        orchestrator = StrategyOrchestrator(config_manager)
+        # Initialize Strategy Orchestrator with user_id for session logging
+        orchestrator = StrategyOrchestrator(config_manager, user_id=user_id)
         
         # Start Ticker (Passive) - Actually for Orchestrator this syncs strategies
         await orchestrator.start_ticker()
