@@ -105,9 +105,10 @@ class LadderGridStrategy:
     PHASE_EXPANDING = "EXPANDING"
     PHASE_RUNNING = "RUNNING"
     
-    def __init__(self, config_manager, symbol: str):
+    def __init__(self, config_manager, symbol: str, session_logger=None):
         self.config_manager = config_manager
         self.symbol = symbol
+        self.session_logger = session_logger
         self.running = False
         
         # --- Grid State ---
@@ -241,10 +242,14 @@ class LadderGridStrategy:
         
         # Close all open positions for this symbol
         positions = mt5.positions_get(symbol=self.symbol)
+        closed_count = 0
         if positions:
             for pos in positions:
-                self._close_position(pos.ticket)
-            print(f"[TERMINATE] {self.symbol}: Closed {len(positions)} positions.")
+                if self._close_position(pos.ticket):
+                    closed_count += 1
+                else:
+                    print(f"[ERROR] Failed to close position {pos.ticket}")
+            print(f"[TERMINATE] {self.symbol}: Closed {closed_count}/{len(positions)} positions.")
         
         # Reset all pairs
         for idx, pair in self.pairs.items():
@@ -2035,6 +2040,18 @@ class LadderGridStrategy:
         }.get(event_type, "")
         
         print(f"{icon} #{self.global_trade_counter:03d} {log_entry}")
+        
+        # [FIX] Log to Session Logger for UI visibility
+        if self.session_logger:
+            self.session_logger.log_trade(
+                symbol=self.symbol,
+                pair_idx=pair_index,
+                direction=direction,
+                price=price,
+                lot=lot_size,
+                trade_num=trade_num,
+                ticket=ticket
+            )
         
         # Append to debug file
         try:

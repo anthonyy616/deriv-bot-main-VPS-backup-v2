@@ -1118,8 +1118,31 @@
             `).join('');
         }
 
+        // Helper for fetching text content (since apiCall expects JSON)
+        async function fetchText(endpoint) {
+            const { data } = await supabaseClient.auth.getSession();
+            const token = data.session?.access_token;
+            if (!token) return null;
+
+            try {
+                const res = await fetch(BASE_URL + endpoint, {
+                    headers: { 'Authorization': `Bearer ${token}` }
+                });
+                if (res.status === 401) {
+                    supabaseClient.auth.signOut();
+                    setLoggedOutState();
+                    return null;
+                }
+                if (!res.ok) return null;
+                return await res.text();
+            } catch (e) {
+                console.error("Text Fetch Error:", e);
+                return null;
+            }
+        }
+
         async function viewSession(sessionId) {
-            const content = await apiCall(`/history/${sessionId}`);
+            const content = await fetchText(`/history/${sessionId}`);
             if (content) {
                 const win = window.open('', '_blank', 'width=800,height=600');
                 win.document.write(`<html><head><title>Session Log</title><style>body{background:#1e293b;color:#94a3b8;font-family:monospace;padding:20px;white-space:pre-wrap;}</style></head><body>${content}</body></html>`);
@@ -1127,7 +1150,7 @@
         }
 
         async function downloadSession(sessionId, filename) {
-            const content = await apiCall(`/history/${sessionId}`);
+            const content = await fetchText(`/history/${sessionId}`);
             if (content) {
                 const blob = new Blob([content], { type: 'text/plain' });
                 const url = URL.createObjectURL(blob);
@@ -1135,6 +1158,7 @@
                 a.href = url;
                 a.download = filename || `${sessionId}.txt`;
                 a.click();
+                a.remove();
                 URL.revokeObjectURL(url);
             }
         }

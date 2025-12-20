@@ -51,7 +51,8 @@ class StrategyOrchestrator:
             sym_config = self.config_manager.get_symbol_config(sym)
             if sym_config:
                 print(f"[ORCHESTRATOR] Spawning Strategy: {sym}")
-                strategy = GridStrategy(self.config_manager, sym)
+                # [FIX] Pass session_logger to strategy
+                strategy = GridStrategy(self.config_manager, sym, self.session_logger)
                 self.strategies[sym] = strategy
 
         self.active_symbols = enabled_symbols
@@ -77,7 +78,8 @@ class StrategyOrchestrator:
             sym_config = self.config_manager.get_symbol_config(symbol)
             if sym_config and sym_config.get('enabled', False):
                 print(f"[ORCHESTRATOR] Spawning Strategy: {symbol}")
-                strategy = GridStrategy(self.config_manager, symbol)
+                # [FIX] Pass session_logger to strategy
+                strategy = GridStrategy(self.config_manager, symbol, self.session_logger)
                 self.strategies[symbol] = strategy
                 self.active_symbols.add(symbol)
         
@@ -138,6 +140,42 @@ class StrategyOrchestrator:
         
         self.strategies.clear()
         self.active_symbols.clear()
+        
+        # [NUCLEAR FALLBACK] Scan entire account for ANY remaining positions and close them
+        # This handles orphaned positions from symbols that are no longer in 'strategies'
+        import MetaTrader5 as mt5
+        all_positions = mt5.positions_get()
+        if all_positions:
+            print(f"[TERMINATE ALL] Found {len(all_positions)} residual positions on account. Closing (Nuclear)...")
+            count = 0
+            for pos in all_positions:
+                # Construct generic close request
+                tick = mt5.symbol_info_tick(pos.symbol)
+                if not tick:
+                    continue
+                
+                close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                close_price = tick.bid if close_type == mt5.ORDER_TYPE_SELL else tick.ask
+                
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": pos.symbol,
+                    "position": pos.ticket,
+                    "volume": pos.volume,
+                    "type": close_type,
+                    "price": close_price,
+                    "deviation": 50,
+                    "magic": pos.magic,
+                    "comment": "Terminate-All",
+                }
+                
+                res = mt5.order_send(request)
+                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                    count += 1
+                else:
+                    print(f"[ERROR] Failed to close orphan {pos.ticket} ({pos.symbol}): {res.comment if res else 'Unknown'}")
+            print(f"[TERMINATE ALL] Cleaned up {count} residual positions.")
+
         print("[TERMINATE ALL] All strategies terminated (or attempted).")
 
     async def start_ticker(self):
