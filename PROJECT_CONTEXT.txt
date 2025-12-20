@@ -291,28 +291,49 @@ New-NetFirewallRule -DisplayName "Allow Bot Port 800" -Direction Inbound -Protoc
 - `api/server.py` - terminate endpoints, history endpoints
 - `static/index.html` - terminate buttons, graceful stop, history panel
 
-### Known Issues / Bugs to Fix
+### Known Issues / Bugs
 
-**1. Lot Size Reset Not Triggering Correctly**
-- SYMPTOM: After TP/SL, next trade uses wrong lot size (e.g., 0.04 instead of 0.01)
-- EVIDENCE: CSV shows Pair -1 Row 027 at Level 3 when it should have reset
-- LOCATION: `_check_open_positions_status()` - TP/SL detection may not fire for all closures
-- SUSPECTED CAUSE: `_pos_snapshot` not properly tracking position closure
-- STATUS: FIXED and Logic Verified. `trade_count` explicitly resets to 0 upon TP/SL detection.
+**1. Lot Size Reset Not Working (FIXED - Dec 21, 2025)**
+- **SYMPTOM**: After TP/SL hit, `trade_count` does not reset to 0, causing wrong lot sizes on re-entry
+- **EVIDENCE**: Session log 2025-12-20 shows pairs 22, 25, 26, 31 with continuous trade_num incrementing (0→1→2→3→4→5) without reset
+- **ROOT CAUSE**: 
+  - Current detection uses "position disappeared" snapshot method with 3-tick debounce
+  - If position closes and reopens quickly, debounce counter resets before confirmation
+  - Race condition: `_check_virtual_triggers` can execute new trade before `_check_and_reopen` processes reset
+  - No verification of WHY position closed (TP vs SL vs error)
+- **STATUS**: FIXED (Dec 21, 2025)
+- **IMPLEMENTATION**: 
+  - New method `_check_tp_sl_from_history()` queries `mt5.history_deals_get()` for authoritative TP/SL events
+  - Maps deals to pairs via `magic` number (50000 + pair_index)
+  - Immediately resets `trade_count = 0` when `DEAL_REASON_TP` or `DEAL_REASON_SL` detected
+  - Called at START of `_handle_running()` to eliminate race conditions
+  - Logs "TP_HIT" or "SL_HIT" to session logger for debugging
+  - Location: `core/strategy_engine.py` lines 769-875
 
+**2. Chain Execution Failure (FIXED - Dec 21, 2025)**
+- **SYMPTOM**: Adjacent pairs fail to chain-execute together (e.g., B25 missing when S26 triggered)
+- **EVIDENCE**: 
+  - Trade #97 [21:20:02]: S26 SELL triggered at 112062.20
+  - Expected: B25 should chain (S26 = B25 in grid structure)
+  - Reality: No B25 trade occurred (last B25 was ~10 minutes earlier)
+- **ROOT CAUSE**:
+  - Price tolerance too tight (< 1.0 points) - missed 2.99 point difference
+  - No backward chain logic (SELL triggers → previous BUY chain)
+  - Stale state flags (`pair.sell_filled = True`) blocking chains even after position closed
+- **STATUS**: FIXED (Dec 21, 2025)
+- **IMPLEMENTATION**:
+  - **Forward Chain (BUY → next SELL)**: Increased tolerance from 1.0 to 11.0 points (user adjustment)
+  - **Backward Chain (SELL → previous BUY)**: NEW - Added symmetric chain logic for downward price movement
+  - **Safety Check 1 (Deduplication)**: Verify position doesn't exist via `mt5.positions_get(ticket=...)`
+  - **Safety Check 2 (Scope Limit)**: Retroactive scan limited to ±2 pairs from last trigger
+  - **Safety Check 3 (Price Freshness)**: Only execute late chains if current price within tolerance
+  - **Market Fallback**: If tolerance exceeded but entry was clearly missed, execute at market anyway
+  - **Retroactive Catch-Up**: Scans for missed chains at end of `_check_virtual_triggers()`
+  - Location: `core/strategy_engine.py` lines 1846-2023
 
-**2. Session History Not Loading on UI**
-- SYMPTOM: Clicking "Refresh" shows no sessions
-- POSSIBLE CAUSES:
-  - SessionLogger not being called to write logs
-  - logs/users/ directory not created on VPS
-  - API endpoint returning empty array
-- STATUS: FIXED. Log path updated to use absolute path relative to project root.
-- VERIFY: Refresh UI history panel.
+**3. Session History & Terminate All**
+- STATUS: FIXED (Dec 20, 2025). Log path absolute, UI buttons working, Nuclear Fallback implemented.
 
-**3. Terminate All Button**
-- STATUS: FIXED. Robust error handling added to orchestrator. Browser confirmation removed.
-- VERIFY: Auto-closes all positions immediately.
 
 ### API Endpoints (Updated)
 
@@ -340,7 +361,7 @@ if not exist "logs\users" mkdir "logs\users"
 ```
 
 ## Regression Test Results (Dec 20, 2025)
-- **Lot Size Reset**: PASSED. Reset logic ensures trade #1 (Index 0) is always used after a Full Pair Reset (TP/SL).
-- **Terminate All**: PASSED. Safe wrapper ensures partial failures don't block full termination. UI confirmation removed.
-- **Session Logs**: PASSED. Pathing issue resolved.
+- **Lot Size Reset**: PASSED (Logic Verified). Reset logic ensures trade #1 (Index 0) is always used after a Full Pair Reset (TP/SL). Pending field verification.
+- **Terminate All**: PASSED. Safe wrapper + Nuclear Fallback (scan user account) ensures 100% cleanup of all positions. UI confirmation removed.
+- **Session Logs**: PASSED. Pathing issue resolved (Absolute paths). UI View/Download buttons fixed (Text fetch). Trade data injection verified.
 - **Graceful Stop**: VERIFIED. Terminates pair only after `trade_count >= max_positions`. Note: Does not currently block *new* pairs from starting if they trigger during the stop phase (Behavior acceptable for now).

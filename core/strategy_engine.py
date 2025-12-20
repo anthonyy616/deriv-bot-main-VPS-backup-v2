@@ -136,6 +136,9 @@ class LadderGridStrategy:
         # --- Graceful Stop ---
         self.graceful_stop: bool = False    # When True, complete open pairs before stopping
         
+        # --- History-Based TP/SL Detection ---
+        self.last_deal_check_time: float = time.time()  # Track last history query time
+        
         # --- Persistence ---
         self.state_file = f"ladder_state_{self.symbol.replace(' ', '_')}.json"
         
@@ -626,6 +629,9 @@ class LadderGridStrategy:
                     self.save_state()
                     return  # Exit, next tick will run _handle_init
         
+        # [FIX] Check TP/SL from MT5 history FIRST (before triggers/reopen)
+        await self._check_tp_sl_from_history()
+        
         # 1. Check virtual triggers (monitor prices and fire market orders)
         self._check_virtual_triggers(ask, bid)
         
@@ -759,6 +765,111 @@ class LadderGridStrategy:
                             self.save_state()
                             return
     
+
+    async def _check_tp_sl_from_history(self):
+        """
+        [FIX] History-based TP/SL detection using MT5 deal history.
+        Queries authoritative MT5 records to detect when TP or SL was hit.
+        This eliminates race conditions from snapshot-based detection.
+        """
+        try:
+            # Query deals since last check
+            from_time = datetime.fromtimestamp(self.last_deal_check_time)
+            deals = mt5.history_deals_get(from_time, datetime.now(), symbol=self.symbol)
+            
+            if not deals:
+                # No new deals or query failed
+                return
+            
+            for deal in deals:
+                # Check if this was a TP or SL closure
+                if deal.reason == mt5.DEAL_REASON_TP:
+                    reason = "TP"
+                elif deal.reason == mt5.DEAL_REASON_SL:
+                    reason = "SL"
+                else:
+                    continue  # Not a TP/SL close, skip
+                
+                # Map deal to pair using magic number
+                if deal.magic < 50000:
+                    continue  # Not our order
+                
+                pair_idx = deal.magic - 50000
+                pair = self.pairs.get(pair_idx)
+                
+                if not pair:
+                    continue  # Pair no longer exists
+                
+                print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
+                
+                # Log to session
+                if self.session_logger:
+                    self.session_logger.log_tp_sl(
+                        symbol=self.symbol,
+                        pair_idx=pair_idx,
+                        direction="BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL",
+                        result="tp" if reason == "TP" else "sl",
+                        profit=deal.profit
+                    )
+                
+                # [CRITICAL FIX] Reset trade count to 0
+                old_count = pair.trade_count
+                pair.trade_count = 0
+                print(f"   [RESET] Pair {pair_idx} trade_count reset to 0 (was {old_count})")
+                
+                # Nuclear reset: Close opposite side if still open
+                if deal.type == mt5.DEAL_TYPE_SELL:  # Closed a BUY position
+                    pair.buy_filled = False
+                    pair.buy_ticket = 0
+                    
+                    # Close opposite SELL if open
+                    if pair.sell_filled and pair.sell_ticket:
+                        print(f"   [PAIR RESET] Closing opposite Sell {pair.sell_ticket}...")
+                        self._close_position(pair.sell_ticket)
+                        pair.sell_filled = False
+                        pair.sell_ticket = 0
+                
+                elif deal.type == mt5.DEAL_TYPE_BUY:  # Closed a SELL position
+                    pair.sell_filled = False
+                    pair.sell_ticket = 0
+                    
+                    # Close opposite BUY if open
+                    if pair.buy_filled and pair.buy_ticket:
+                        print(f"   [PAIR RESET] Closing opposite Buy {pair.buy_ticket}...")
+                        self._close_position(pair.buy_ticket)
+                        pair.buy_filled = False
+                        pair.buy_ticket = 0
+                
+                # Reset flags
+                pair.buy_in_zone = False
+                pair.sell_in_zone = False
+                pair.first_fill_direction = ""
+                
+                # Cancel any existing pending orders
+                if pair.buy_pending_ticket:
+                    self._cancel_order(pair.buy_pending_ticket)
+                if pair.sell_pending_ticket:
+                    self._cancel_order(pair.sell_pending_ticket)
+                
+                # Re-place triggers for both sides
+                pair.buy_pending_ticket = self._place_pending_order(
+                    self._get_order_type("buy", pair.buy_price),
+                    pair.buy_price, pair_idx
+                )
+                pair.sell_pending_ticket = self._place_pending_order(
+                    self._get_order_type("sell", pair.sell_price),
+                    pair.sell_price, pair_idx
+                )
+                
+                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
+                self.save_state()
+            
+            # Update last check time
+            self.last_deal_check_time = time.time()
+            
+        except Exception as e:
+            print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
+            # Don't crash, just skip this tick
 
     async def _check_and_reopen(self):
         """
@@ -1737,15 +1848,30 @@ class LadderGridStrategy:
                         next_idx = idx + 1
                         next_pair = self.pairs.get(next_idx)
                         if next_pair and not next_pair.sell_filled:
-                            # Check if next SELL is at same price as this BUY
-                            if abs(next_pair.sell_price - pair.buy_price) < 1.0:
-                                print(f" {self.symbol}: CHAIN S{next_idx} @ {next_pair.sell_price:.2f}")
-                                chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                                if chain_ticket:
-                                    next_pair.sell_filled = True
-                                    next_pair.sell_ticket = chain_ticket
-                                    next_pair.sell_pending_ticket = 0
-                                    next_pair.advance_toggle()
+                            # [FIX] Safety Check 1: Verify position doesn't already exist in MT5
+                            existing_pos = mt5.positions_get(ticket=next_pair.sell_ticket) if next_pair.sell_ticket else None
+                            if existing_pos:
+                                print(f" {self.symbol}: CHAIN SKIP S{next_idx} - already exists (ticket {next_pair.sell_ticket})")
+                            else:
+                                # Check price match with increased tolerance
+                                price_diff = abs(next_pair.sell_price - pair.buy_price)
+                                if price_diff < 11.0:
+                                    print(f" {self.symbol}: CHAIN S{next_idx} @ {next_pair.sell_price:.2f} (diff: {price_diff:.2f})")
+                                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                                    if chain_ticket:
+                                        next_pair.sell_filled = True
+                                        next_pair.sell_ticket = chain_ticket
+                                        next_pair.sell_pending_ticket = 0
+                                        next_pair.advance_toggle()
+                                else:
+                                    # Beyond tolerance but entry was missed - execute at market anyway
+                                    print(f" {self.symbol}: CHAIN S{next_idx} @ MARKET (diff {price_diff:.2f} > 7.0)")
+                                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                                    if chain_ticket:
+                                        next_pair.sell_filled = True
+                                        next_pair.sell_ticket = chain_ticket
+                                        next_pair.sell_pending_ticket = 0
+                                        next_pair.advance_toggle()
                         
                         # Expand Grid Up
                         indices = sorted(self.pairs.keys())
@@ -1792,20 +1918,35 @@ class LadderGridStrategy:
                         
                         #For downwards expansion 
 
-                        # [CHAIN FIX] BIDIRECTIONAL: Execute previous pair's BUY at SAME price (for ALL pairs)
+                        # [CHAIN FIX] BACKWARD: Execute previous pair's BUY at SAME price (for ALL pairs)
                         # Grid structure: S[N] = B[N-1], so when S[N] triggers, B[N-1] should also trigger
                         prev_idx = idx - 1
                         prev_pair = self.pairs.get(prev_idx)
                         if prev_pair and not prev_pair.buy_filled:
-                            # Check if prev BUY is at same price as this SELL
-                            if abs(prev_pair.buy_price - pair.sell_price) < 1.0:
-                                print(f" {self.symbol}: CHAIN B{prev_idx} @ {prev_pair.buy_price:.2f}")
-                                chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                                if chain_ticket:
-                                    prev_pair.buy_filled = True
-                                    prev_pair.buy_ticket = chain_ticket
-                                    prev_pair.buy_pending_ticket = 0
-                                    prev_pair.advance_toggle()
+                            # [FIX] Safety Check 1: Verify position doesn't already exist in MT5
+                            existing_pos = mt5.positions_get(ticket=prev_pair.buy_ticket) if prev_pair.buy_ticket else None
+                            if existing_pos:
+                                print(f" {self.symbol}: CHAIN SKIP B{prev_idx} - already exists (ticket {prev_pair.buy_ticket})")
+                            else:
+                                # Check price match with increased tolerance
+                                price_diff = abs(prev_pair.buy_price - pair.sell_price)
+                                if price_diff < 7.0:
+                                    print(f" {self.symbol}: CHAIN B{prev_idx} @ {prev_pair.buy_price:.2f} (diff: {price_diff:.2f})")
+                                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                                    if chain_ticket:
+                                        prev_pair.buy_filled = True
+                                        prev_pair.buy_ticket = chain_ticket
+                                        prev_pair.buy_pending_ticket = 0
+                                        prev_pair.advance_toggle()
+                                else:
+                                    # Beyond tolerance but entry was missed - execute at market anyway
+                                    print(f" {self.symbol}: CHAIN B{prev_idx} @ MARKET (diff {price_diff:.2f} > 7.0)")
+                                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                                    if chain_ticket:
+                                        prev_pair.buy_filled = True
+                                        prev_pair.buy_ticket = chain_ticket
+                                        prev_pair.buy_pending_ticket = 0
+                                        prev_pair.advance_toggle()
                         
                         # Expand Grid Down
                         indices = sorted(self.pairs.keys())
@@ -1820,6 +1961,62 @@ class LadderGridStrategy:
 
             if not sell_attempt_failed:
                 pair.sell_in_zone = sell_in_zone_now
+        
+        # [FIX] Retroactive Catch-Up Scan: Check for missed chains
+        # Safety Check 2: Limit scope to recently touched pairs (avoid scanning entire grid every tick)
+        # We'll check the last triggered pair ± 2 levels
+        if sorted_items:
+            last_idx = sorted_items[-1][0]  # Last processed pair index
+            tick = mt5.symbol_info_tick(self.symbol)
+            
+            for offset in range(-2, 3):  # -2, -1, 0, +1, +2
+                check_idx = last_idx + offset
+                check_pair = self.pairs.get(check_idx)
+                
+                if not check_pair:
+                    continue
+                
+                # Check if BUY side should have chained but didn't
+                if not check_pair.buy_filled:
+                    prev_idx = check_idx - 1
+                    prev_pair = self.pairs.get(prev_idx)
+                    if prev_pair and prev_pair.sell_filled:
+                        # S[prev] filled, but B[check] NOT filled
+                        # They should be at same price - check if this was a missed chain
+                        price_diff = abs(check_pair.buy_price - prev_pair.sell_price)
+                        if price_diff < 7.0:
+                            # Safety Check 3: Price freshness - only execute if current price is within tolerance
+                            current_price_diff = abs(tick.ask - check_pair.buy_price)
+                            if current_price_diff < 7.0:
+                                print(f" {self.symbol}: LATE CHAIN B{check_idx} @ {check_pair.buy_price:.2f} (missed earlier)")
+                                chain_ticket = self._execute_market_order("buy", check_pair.buy_price, check_idx)
+                                if chain_ticket:
+                                    check_pair.buy_filled = True
+                                    check_pair.buy_ticket = chain_ticket
+                                    check_pair.buy_pending_ticket = 0
+                                    check_pair.advance_toggle()
+                                    self.save_state()
+                
+                # Check if SELL side should have chained but didn't
+                if not check_pair.sell_filled:
+                    next_idx = check_idx + 1
+                    next_pair = self.pairs.get(next_idx)
+                    if next_pair and next_pair.buy_filled:
+                        # B[next] filled, but S[check] NOT filled
+                        # They should be at same price - check if this was a missed chain
+                        price_diff = abs(check_pair.sell_price - next_pair.buy_price)
+                        if price_diff < 7.0:
+                            # Safety Check 3: Price freshness - only execute if current price is within tolerance
+                            current_price_diff = abs(tick.bid - check_pair.sell_price)
+                            if current_price_diff < 7.0:
+                                print(f" {self.symbol}: LATE CHAIN S{check_idx} @ {check_pair.sell_price:.2f} (missed earlier)")
+                                chain_ticket = self._execute_market_order("sell", check_pair.sell_price, check_idx)
+                                if chain_ticket:
+                                    check_pair.sell_filled = True
+                                    check_pair.sell_ticket = chain_ticket
+                                    check_pair.sell_pending_ticket = 0
+                                    check_pair.advance_toggle()
+                                    self.save_state()
 
     def _execute_market_order(self, direction: str, price: float, index: int) -> int:
         """Execute a market order and return the position ticket.
