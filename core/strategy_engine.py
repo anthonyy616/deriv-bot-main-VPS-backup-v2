@@ -1843,10 +1843,42 @@ class LadderGridStrategy:
                         pair.buy_pending_ticket = 0
                         pair.advance_toggle()
                         
-                        # [CHAIN FIX] BIDIRECTIONAL: Execute next pair's SELL at SAME price (for ALL pairs)
+                        # [CRITICAL FIX] FORWARD: Check if next pair exists, if not CREATE it first
                         # Grid structure: S[N] = B[N-1], so when B[N] triggers, S[N+1] should also trigger
                         next_idx = idx + 1
                         next_pair = self.pairs.get(next_idx)
+                        
+                        # If next pair doesn't exist, we need to expand the grid upward
+                        if not next_pair:
+                            print(f" {self.symbol}: B{idx} triggered, but S{next_idx} doesn't exist. Creating Pair {next_idx}...")
+                            # Create new pair above
+                            new_sell_price = pair.buy_price  # S[next_idx] = B[idx]
+                            new_buy_price = new_sell_price + self.spread
+                            
+                            new_pair = GridPair(
+                                index=next_idx,
+                                buy_price=new_buy_price,
+                                sell_price=new_sell_price
+                            )
+                            new_pair.next_action = "sell"
+                            self.pairs[next_idx] = new_pair
+                            
+                            # Execute SELL immediately at market
+                            print(f" {self.symbol}: Executing S{next_idx} @ {new_sell_price:.2f} (expansion + chain)")
+                            chain_ticket = self._execute_market_order("sell", new_sell_price, next_idx)
+                            if chain_ticket:
+                                new_pair.sell_filled = True
+                                new_pair.sell_ticket = chain_ticket
+                                new_pair.sell_in_zone = True
+                                new_pair.advance_toggle()
+                                
+                                # Arm BUY trigger for this new pair
+                                new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", new_buy_price, next_idx)
+                                print(f" {self.symbol}: Pair {next_idx} created with S filled, B pending @ {new_buy_price:.2f}")
+                            
+                            next_pair = new_pair  # Update reference
+                        
+                        # Now execute normal forward chain (if pair exists and SELL not filled)
                         if next_pair and not next_pair.sell_filled:
                             # [FIX] Safety Check 1: Verify position doesn't already exist in MT5
                             existing_pos = mt5.positions_get(ticket=next_pair.sell_ticket) if next_pair.sell_ticket else None
@@ -1865,7 +1897,7 @@ class LadderGridStrategy:
                                         next_pair.advance_toggle()
                                 else:
                                     # Beyond tolerance but entry was missed - execute at market anyway
-                                    print(f" {self.symbol}: CHAIN S{next_idx} @ MARKET (diff {price_diff:.2f} > 7.0)")
+                                    print(f" {self.symbol}: CHAIN S{next_idx} @ MARKET (diff {price_diff:.2f} > 11.0)")
                                     chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
                                     if chain_ticket:
                                         next_pair.sell_filled = True
@@ -1873,7 +1905,7 @@ class LadderGridStrategy:
                                         next_pair.sell_pending_ticket = 0
                                         next_pair.advance_toggle()
                         
-                        # Expand Grid Up
+                        # Expand Grid Up (legacy check - should mostly be handled above now)
                         indices = sorted(self.pairs.keys())
                         if idx == indices[-1] and idx >= 0:
                             self._create_next_positive_pair(idx)
@@ -1918,10 +1950,42 @@ class LadderGridStrategy:
                         
                         #For downwards expansion 
 
-                        # [CHAIN FIX] BACKWARD: Execute previous pair's BUY at SAME price (for ALL pairs)
+                        # [CRITICAL FIX] BACKWARD: Check if previous pair exists, if not CREATE it first
                         # Grid structure: S[N] = B[N-1], so when S[N] triggers, B[N-1] should also trigger
                         prev_idx = idx - 1
                         prev_pair = self.pairs.get(prev_idx)
+                        
+                        # If previous pair doesn't exist, we need to expand the grid downward
+                        if not prev_pair:
+                            print(f" {self.symbol}: S{idx} triggered, but B{prev_idx} doesn't exist. Creating Pair {prev_idx}...")
+                            # Create new pair below
+                            new_buy_price = pair.sell_price  # B[prev_idx] = S[idx]
+                            new_sell_price = new_buy_price - self.spread
+                            
+                            new_pair = GridPair(
+                                index=prev_idx,
+                                buy_price=new_buy_price,
+                                sell_price=new_sell_price
+                            )
+                            new_pair.next_action = "buy"
+                            self.pairs[prev_idx] = new_pair
+                            
+                            # Execute BUY immediately at market
+                            print(f" {self.symbol}: Executing B{prev_idx} @ {new_buy_price:.2f} (expansion + chain)")
+                            chain_ticket = self._execute_market_order("buy", new_buy_price, prev_idx)
+                            if chain_ticket:
+                                new_pair.buy_filled = True
+                                new_pair.buy_ticket = chain_ticket
+                                new_pair.buy_in_zone = True
+                                new_pair.advance_toggle()
+                                
+                                # Arm SELL trigger for this new pair
+                                new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, prev_idx)
+                                print(f" {self.symbol}: Pair {prev_idx} created with B filled, S pending @ {new_sell_price:.2f}")
+                            
+                            prev_pair = new_pair  # Update reference
+                        
+                        # Now execute normal backward chain (if pair exists and BUY not filled)
                         if prev_pair and not prev_pair.buy_filled:
                             # [FIX] Safety Check 1: Verify position doesn't already exist in MT5
                             existing_pos = mt5.positions_get(ticket=prev_pair.buy_ticket) if prev_pair.buy_ticket else None
@@ -1930,7 +1994,7 @@ class LadderGridStrategy:
                             else:
                                 # Check price match with increased tolerance
                                 price_diff = abs(prev_pair.buy_price - pair.sell_price)
-                                if price_diff < 7.0:
+                                if price_diff < 11.0:
                                     print(f" {self.symbol}: CHAIN B{prev_idx} @ {prev_pair.buy_price:.2f} (diff: {price_diff:.2f})")
                                     chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
                                     if chain_ticket:
@@ -1940,7 +2004,7 @@ class LadderGridStrategy:
                                         prev_pair.advance_toggle()
                                 else:
                                     # Beyond tolerance but entry was missed - execute at market anyway
-                                    print(f" {self.symbol}: CHAIN B{prev_idx} @ MARKET (diff {price_diff:.2f} > 7.0)")
+                                    print(f" {self.symbol}: CHAIN B{prev_idx} @ MARKET (diff {price_diff:.2f} > 11.0)")
                                     chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
                                     if chain_ticket:
                                         prev_pair.buy_filled = True
@@ -1948,7 +2012,7 @@ class LadderGridStrategy:
                                         prev_pair.buy_pending_ticket = 0
                                         prev_pair.advance_toggle()
                         
-                        # Expand Grid Down
+                        # Expand Grid Down (legacy check - should mostly be handled above now)
                         indices = sorted(self.pairs.keys())
                         if idx == indices[0] and idx <= 0:
                             self._create_next_negative_pair(idx)
