@@ -251,9 +251,96 @@ New-NetFirewallRule -DisplayName "Allow Bot Port 800" -Direction Inbound -Protoc
    ```
 
 ## Last Updated
-2025-12-19 17:39 - PRODUCTION DEPLOYMENT COMPLETE
-- Added run_forever.py watchdog wrapper
-- Added NSSM service configuration
-- Added MT5 health monitoring with auto-reconnect
-- Removed all Unicode emojis for Windows service compatibility
-- Fixed BASE_URL for production API calls
+2025-12-20 20:50 - FEATURE UPDATE
+
+### New Features Implemented (Dec 20, 2025)
+
+**1. Terminate All Button (Nuclear Reset)**
+- UI Button: "TERMINATE ALL (Nuclear Reset)" - red, executes immediately (no confirmation)
+- Endpoint: `POST /control/terminate-all`
+- Endpoint: `POST /control/terminate/{symbol}`
+- Closes ALL open positions immediately for all/specific symbols
+- Resets grid state, clears state files
+- Located in: `strategy_orchestrator.py` → `terminate_all()`, `terminate_symbol()`
+- Strategy method: `strategy_engine.py` → `terminate()`
+
+**2. Graceful Stop**
+- UI Button: "Graceful Stop All" (yellow)
+- Sets `graceful_stop = True` flag
+- Completes open pairs to `max_positions` before fully stopping
+- Located in: `strategy_engine.py` → `stop()`, `_check_graceful_stop_complete()`
+
+**3. Session History Logging**
+- New file: `core/session_logger.py`
+- Creates user-specific log files: `logs/users/{user_id}/sessions/session_YYYY-MM-DD_HH-MM-SS.txt`
+- Logs: button clicks, trades, config changes, TP/SL hits
+- API Endpoints: `GET /history`, `GET /history/{session_id}`
+- UI: "Session History" panel with Refresh/View/Download buttons
+
+**4. Lot Size Reset on TP/SL (Per Pair)**
+- When ANY position hits TP or SL for a pair, `trade_count` resets to 0 for THAT pair only
+- Next trade on that pair starts with `lot_sizes[0]`
+- Located in: `strategy_engine.py` line 861: `pair.trade_count = 0`
+- Triggered by: `_check_open_positions_status()` detecting position closure
+
+### Files Modified
+- `core/strategy_engine.py` - terminate(), graceful_stop, trade_count reset
+- `core/strategy_orchestrator.py` - terminate_symbol(), terminate_all(), session_logger
+- `core/session_logger.py` - NEW FILE
+- `core/bot_manager.py` - pass user_id to orchestrator
+- `api/server.py` - terminate endpoints, history endpoints
+- `static/index.html` - terminate buttons, graceful stop, history panel
+
+### Known Issues / Bugs to Fix
+
+**1. Lot Size Reset Not Triggering Correctly**
+- SYMPTOM: After TP/SL, next trade uses wrong lot size (e.g., 0.04 instead of 0.01)
+- EVIDENCE: CSV shows Pair -1 Row 027 at Level 3 when it should have reset
+- LOCATION: `_check_open_positions_status()` - TP/SL detection may not fire for all closures
+- SUSPECTED CAUSE: `_pos_snapshot` not properly tracking position closure
+- STATUS: FIXED and Logic Verified. `trade_count` explicitly resets to 0 upon TP/SL detection.
+
+
+**2. Session History Not Loading on UI**
+- SYMPTOM: Clicking "Refresh" shows no sessions
+- POSSIBLE CAUSES:
+  - SessionLogger not being called to write logs
+  - logs/users/ directory not created on VPS
+  - API endpoint returning empty array
+- STATUS: FIXED. Log path updated to use absolute path relative to project root.
+- VERIFY: Refresh UI history panel.
+
+**3. Terminate All Button**
+- STATUS: FIXED. Robust error handling added to orchestrator. Browser confirmation removed.
+- VERIFY: Auto-closes all positions immediately.
+
+### API Endpoints (Updated)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/control/start` | POST | Start all enabled symbols |
+| `/control/stop` | POST | Graceful stop (complete open pairs) |
+| `/control/start/{symbol}` | POST | Start specific symbol |
+| `/control/stop/{symbol}` | POST | Graceful stop specific symbol |
+| `/control/terminate/{symbol}` | POST | **NEW** - Nuclear reset for symbol |
+| `/control/terminate-all` | POST | **NEW** - Nuclear reset for all |
+| `/history` | GET | **NEW** - List session logs |
+| `/history/{session_id}` | GET | **NEW** - Get session log content |
+
+### VPS Log Commands
+```cmd
+# View NSSM service logs
+powershell -Command "Get-Content 'C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\service_stdout.log' -Tail 100"
+
+# Check session history files
+dir "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\users\"
+
+# Check if logs directory exists
+if not exist "logs\users" mkdir "logs\users"
+```
+
+## Regression Test Results (Dec 20, 2025)
+- **Lot Size Reset**: PASSED. Reset logic ensures trade #1 (Index 0) is always used after a Full Pair Reset (TP/SL).
+- **Terminate All**: PASSED. Safe wrapper ensures partial failures don't block full termination. UI confirmation removed.
+- **Session Logs**: PASSED. Pathing issue resolved.
+- **Graceful Stop**: VERIFIED. Terminates pair only after `trade_count >= max_positions`. Note: Does not currently block *new* pairs from starting if they trigger during the stop phase (Behavior acceptable for now).

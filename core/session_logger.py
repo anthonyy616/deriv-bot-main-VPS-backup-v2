@@ -29,11 +29,18 @@ class SessionLogger:
     def __init__(self, user_id: str):
         self.user_id = user_id
         self.session_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.log_dir = Path("logs/users") / user_id / "sessions"
+        
+        # [FIX] Use absolute path relative to project root to avoid CWD issues
+        # core/session_logger.py -> core -> root -> logs
+        root_dir = Path(__file__).resolve().parent.parent
+        self.log_dir = root_dir / "logs" / "users" / user_id / "sessions"
+        
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_file = self.log_dir / f"session_{self.session_id}.txt"
         self.trade_count = 0
         self.session_started = False
+        
+        print(f"[SESSION] Logging to: {self.log_file}")
     
     def _write(self, text: str):
         """Append text to the log file."""

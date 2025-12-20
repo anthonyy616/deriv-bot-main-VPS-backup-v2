@@ -462,6 +462,10 @@ class LadderGridStrategy:
             pair.buy_filled = False
             pair.buy_ticket = 0
             pair.first_fill_direction = ""  # Reset first fill tracking
+            
+            # [FIX] Reset trade count to 0 so next trade starts at Lot 0
+            pair.trade_count = 0
+            
             # Place new virtual buy trigger
             pair.buy_pending_ticket = self._place_pending_order(
                 self._get_order_type("buy", pair.buy_price),
@@ -476,6 +480,10 @@ class LadderGridStrategy:
             print(f" {self.symbol}: Pair 0 Sell hit TP/SL, re-opening @ {pair.sell_price:.2f}")
             pair.sell_filled = False
             pair.sell_ticket = 0
+            
+            # [FIX] Reset trade count to 0 so next trade starts at Lot 0
+            pair.trade_count = 0
+            
             # Place new virtual sell trigger
             pair.sell_pending_ticket = self._place_pending_order(
                 self._get_order_type("sell", pair.sell_price),
@@ -793,11 +801,88 @@ class LadderGridStrategy:
         for ticket in closed_tickets:
             self._missing_pos_counters[ticket] += 1
             # Require 3 consecutive confirmations (approx 0.5-1.5s) to believe it's closed
+            # Require 3 consecutive confirmations (approx 0.5-1.5s) to believe it's closed
             if self._missing_pos_counters[ticket] >= 3:
                 confirmed_closed_tickets.append(ticket)
         
         # Reset counters for tickets that reappeared (false alarm)
         for ticket in list(self._missing_pos_counters.keys()):
+            if ticket not in closed_tickets:
+                del self._missing_pos_counters[ticket]
+        
+        # 4. Handle Confirmed Closed Tickets
+        for ticket in confirmed_closed_tickets:
+            # Get info about the closed ticket from snapshot
+            info = self._pos_snapshot.get(ticket)
+            if not info:
+                continue
+                
+            pair_idx = info['pair_index']
+            pair = self.pairs.get(pair_idx)
+            
+            if pair:
+                print(f" {self.symbol}: Detected TP/SL Close for Position {ticket} (Pair {pair_idx})")
+                
+                # CRITICAL FIX: Reset trade count to 0 so next trade starts at Lot 0
+                print(f"   [RESET] Pair {pair_idx} trade_count reset to 0 (was {pair.trade_count})")
+                pair.trade_count = 0
+                
+                # Close the other side if open (Nuclear Reset for this pair)
+                # But FIRST, mark the closed side as NOT filled
+                if pair.buy_ticket == ticket:
+                    pair.buy_filled = False
+                    pair.buy_ticket = 0
+                    
+                    # If sell is still open, close it
+                    if pair.sell_filled and pair.sell_ticket:
+                        print(f"   [PAIR RESET] Closing opposite Sell {pair.sell_ticket}...")
+                        self._close_position(pair.sell_ticket)
+                        pair.sell_filled = False
+                        pair.sell_ticket = 0
+                
+                elif pair.sell_ticket == ticket:
+                    pair.sell_filled = False
+                    pair.sell_ticket = 0
+                    
+                    # If buy is still open, close it
+                    if pair.buy_filled and pair.buy_ticket:
+                        print(f"   [PAIR RESET] Closing opposite Buy {pair.buy_ticket}...")
+                        self._close_position(pair.buy_ticket)
+                        pair.buy_filled = False
+                        pair.buy_ticket = 0
+                
+                # Reset flags
+                pair.buy_in_zone = False
+                pair.sell_in_zone = False
+                pair.first_fill_direction = ""
+                
+                # Re-place triggers for this pair (both sides)
+                # Since we reset trade_count to 0, next trade will be trade #1 (index 0)
+                
+                # Remove any existing pending orders for this pair
+                if pair.buy_pending_ticket:
+                    self._cancel_order(pair.buy_pending_ticket)
+                if pair.sell_pending_ticket:
+                    self._cancel_order(pair.sell_pending_ticket)
+                
+                # Place new triggers
+                pair.buy_pending_ticket = self._place_pending_order(
+                    self._get_order_type("buy", pair.buy_price),
+                    pair.buy_price, pair_idx
+                )
+                pair.sell_pending_ticket = self._place_pending_order(
+                    self._get_order_type("sell", pair.sell_price),
+                    pair.sell_price, pair_idx
+                )
+                
+                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
+                self.save_state()
+            
+            # Remove from snapshot and counters
+            del self._pos_snapshot[ticket]
+            if ticket in self._missing_pos_counters:
+                del self._missing_pos_counters[ticket]
+
             if ticket in current_map:
                 del self._missing_pos_counters[ticket]
 
