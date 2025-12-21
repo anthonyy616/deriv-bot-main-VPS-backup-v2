@@ -893,13 +893,13 @@ class LadderGridStrategy:
                 if pair.sell_pending_ticket:
                     self._cancel_order(pair.sell_pending_ticket)
                 
-                # Re-place triggers for both sides
+                # Re-place triggers for both sides (FLIPPED order types for re-open)
                 pair.buy_pending_ticket = self._place_pending_order(
-                    self._get_order_type("buy", pair.buy_price),
+                    self._get_reopen_order_type("buy", pair_idx),
                     pair.buy_price, pair_idx
                 )
                 pair.sell_pending_ticket = self._place_pending_order(
-                    self._get_order_type("sell", pair.sell_price),
+                    self._get_reopen_order_type("sell", pair_idx),
                     pair.sell_price, pair_idx
                 )
                 
@@ -1790,6 +1790,30 @@ class LadderGridStrategy:
                 return "sell_stop"
             else:
                 return "sell_limit"
+    
+    def _get_reopen_order_type(self, direction: str, pair_idx: int) -> str:
+        """
+        Determine order type for RE-OPENED positions after TP/SL hits.
+        FLIPS the order types so pending orders are on opposite side of current price.
+        
+        NEGATIVE GRID (idx < 0):
+        - Original: BUY LIMIT + SELL STOP
+        - After TP/SL: BUY STOP + SELL LIMIT (flipped)
+        
+        POSITIVE GRID (idx >= 0):
+        - Original: BUY STOP + SELL LIMIT
+        - After TP/SL: BUY LIMIT + SELL STOP (flipped)
+        """
+        if pair_idx < 0:  # Negative grid
+            if direction == "buy":
+                return "buy_stop"  # Was buy_limit, now buy_stop
+            else:
+                return "sell_limit"  # Was sell_stop, now sell_limit
+        else:  # Positive grid (including pair 0)
+            if direction == "buy":
+                return "buy_limit"  # Was buy_stop, now buy_limit
+            else:
+                return "sell_stop"  # Was sell_limit, now sell_stop
     
     def _get_filling_mode(self):
         """Get the correct filling mode for this symbol."""
