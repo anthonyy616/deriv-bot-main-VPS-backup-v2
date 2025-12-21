@@ -825,7 +825,28 @@ class LadderGridStrategy:
                     # Close opposite SELL if open
                     if pair.sell_filled and pair.sell_ticket:
                         print(f"   [PAIR RESET] Closing opposite Sell {pair.sell_ticket}...")
-                        self._close_position(pair.sell_ticket)
+                        # Get position and close it properly
+                        sell_pos = mt5.positions_get(ticket=pair.sell_ticket)
+                        if sell_pos:
+                            pos = sell_pos[0]
+                            tick = mt5.symbol_info_tick(self.symbol)
+                            if tick:
+                                close_request = {
+                                    "action": mt5.TRADE_ACTION_DEAL,
+                                    "symbol": self.symbol,
+                                    "position": pair.sell_ticket,
+                                    "volume": pos.volume,
+                                    "type": mt5.ORDER_TYPE_BUY,  # Buy to close sell
+                                    "price": tick.ask,
+                                    "deviation": 50,
+                                    "magic": pos.magic,
+                                    "comment": "Nuclear Reset (TP/SL)",
+                                }
+                                result = mt5.order_send(close_request)
+                                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                                    print(f"   [SUCCESS] Closed Sell {pair.sell_ticket}")
+                                else:
+                                    print(f"   [FAILED] Could not close Sell {pair.sell_ticket}")
                         pair.sell_filled = False
                         pair.sell_ticket = 0
                 
@@ -836,7 +857,28 @@ class LadderGridStrategy:
                     # Close opposite BUY if open
                     if pair.buy_filled and pair.buy_ticket:
                         print(f"   [PAIR RESET] Closing opposite Buy {pair.buy_ticket}...")
-                        self._close_position(pair.buy_ticket)
+                        # Get position and close it properly
+                        buy_pos = mt5.positions_get(ticket=pair.buy_ticket)
+                        if buy_pos:
+                            pos = buy_pos[0]
+                            tick = mt5.symbol_info_tick(self.symbol)
+                            if tick:
+                                close_request = {
+                                    "action": mt5.TRADE_ACTION_DEAL,
+                                    "symbol": self.symbol,
+                                    "position": pair.buy_ticket,
+                                    "volume": pos.volume,
+                                    "type": mt5.ORDER_TYPE_SELL,  # Sell to close buy
+                                    "price": tick.bid,
+                                    "deviation": 50,
+                                    "magic": pos.magic,
+                                    "comment": "Nuclear Reset (TP/SL)",
+                                }
+                                result = mt5.order_send(close_request)
+                                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                                    print(f"   [SUCCESS] Closed Buy {pair.buy_ticket}")
+                                else:
+                                    print(f"   [FAILED] Could not close Buy {pair.buy_ticket}")
                         pair.buy_filled = False
                         pair.buy_ticket = 0
                 
