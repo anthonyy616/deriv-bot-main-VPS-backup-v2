@@ -14,7 +14,7 @@ import json
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Optional, List, Any
-from collections import defaultdict
+from collections import defaultdict, deque
 import MetaTrader5 as mt5
 from datetime import datetime
 
@@ -138,7 +138,7 @@ class LadderGridStrategy:
         
         # --- History-Based TP/SL Detection ---
         self.last_deal_check_time: float = time.time()  # Track last history query time
-        self.processed_deals: set = set()  # Track processed deal tickets to avoid infinite loop
+        self.processed_deals: deque = deque(maxlen=1000)  # Auto-cleanup: keeps last 1000 deals only
         
         # --- Persistence ---
         self.state_file = f"ladder_state_{self.symbol.replace(' ', '_')}.json"
@@ -1882,6 +1882,7 @@ class LadderGridStrategy:
         1. Prevents 'Latching' on failed trades (retries immediately).
         2. ALWAYS allows the 'Hedge' trade (2nd leg) to open even if Max Positions is reached,
            preventing 'Naked' positions.
+        3. Acts as BACKUP for re-opened positions if pending orders fail (Feature 4 robustness).
         """
         sorted_items = sorted(self.pairs.items(), key=lambda x: x[0])
         
