@@ -138,6 +138,7 @@ class LadderGridStrategy:
         
         # --- History-Based TP/SL Detection ---
         self.last_deal_check_time: float = time.time()  # Track last history query time
+        self.processed_deals: set = set()  # Track processed deal tickets to avoid infinite loop
         
         # --- Persistence ---
         self.state_file = f"ladder_state_{self.symbol.replace(' ', '_')}.json"
@@ -782,6 +783,10 @@ class LadderGridStrategy:
                 return
             
             for deal in deals:
+                # [CRITICAL FIX] Skip already processed deals
+                if deal.ticket in self.processed_deals:
+                    continue
+                
                 # Check if this was a TP or SL closure
                 if deal.reason == mt5.DEAL_REASON_TP:
                     reason = "TP"
@@ -799,6 +804,9 @@ class LadderGridStrategy:
                 
                 if not pair:
                     continue  # Pair no longer exists
+                
+                # Mark as processed IMMEDIATELY
+                self.processed_deals.add(deal.ticket)
                 
                 print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
                 
@@ -882,10 +890,17 @@ class LadderGridStrategy:
                         pair.buy_filled = False
                         pair.buy_ticket = 0
                 
-                # Reset flags
+                # Reset flags AND toggle direction
                 pair.buy_in_zone = False
                 pair.sell_in_zone = False
                 pair.first_fill_direction = ""
+                
+                # [CRITICAL] Reset next_action based on grid direction
+                # Negative grid starts with BUY, Positive grid starts with SELL
+                if pair_idx < 0:
+                    pair.next_action = "buy"
+                else:
+                    pair.next_action = "sell"
                 
                 # Cancel any existing pending orders
                 if pair.buy_pending_ticket:
