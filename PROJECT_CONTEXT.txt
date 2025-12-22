@@ -365,3 +365,45 @@ if not exist "logs\users" mkdir "logs\users"
 - **Terminate All**: PASSED. Safe wrapper + Nuclear Fallback (scan user account) ensures 100% cleanup of all positions. UI confirmation removed.
 - **Session Logs**: PASSED. Pathing issue resolved (Absolute paths). UI View/Download buttons fixed (Text fetch). Trade data injection verified.
 - **Graceful Stop**: VERIFIED. Terminates pair only after `trade_count >= max_positions`. Note: Does not currently block *new* pairs from starting if they trigger during the stop phase (Behavior acceptable for now).
+
+## Last Updated
+2025-12-22 16:30 - CRITICAL FIXES
+
+### Fixes Implemented (Dec 22, 2025)
+
+**1. Fix 4: Deduplicate TP/SL Detection**
+- PROBLEM: Both `_check_tp_sl_from_history()` and `_check_and_reopen()` independently detected TP/SL hits, causing race conditions and duplicate processing
+- SOLUTION: Added check at start of `_check_and_reopen()` loop to skip tickets already in `processed_deals`
+- LOCATION: `core/strategy_engine.py` lines 987-993
+
+**2. Fix 1: Merge Dual Loop in `_check_and_reopen()`**
+- PROBLEM: Two separate loops processed `confirmed_closed_tickets`. The first loop deleted from snapshot, then the second loop tried to access deleted items (KeyError). This prevented leapfrog logic and `next_action` reset from executing.
+- SOLUTION: Merged all unique logic from loop 2 into loop 1, removed duplicate loop 2. Added:
+  - `next_action` reset based on grid polarity
+  - TP detection for leapfrog decision
+  - Leapfrog scheduling via `asyncio.create_task()`
+  - Call to `_reopen_pair_at_same_level()` instead of duplicate inline code
+- LOCATION: `core/strategy_engine.py` lines 1033-1088
+
+**3. Fix 3: Immediate Execution on Reopen**
+- PROBLEM: After TP/SL reset, `_reopen_pair_at_same_level()` only placed pending orders. If price was already at trigger level, the zone logic prevented re-triggering because it requires price to LEAVE and RETURN.
+- SOLUTION: After placing pending triggers, check if current price is at trigger level using grid polarity logic. If conditions met, execute market order immediately and set appropriate flags.
+- LOCATION: `core/strategy_engine.py` lines 1260-1332
+
+**4. Fix 2: Separate Lot Index Per Direction**
+- PROBLEM: Single `trade_count` was used for BOTH BUY and SELL lot sizing. If BUY executed first, SELL would use lot_sizes[1] instead of lot_sizes[0].
+- SOLUTION: Added separate `buy_lot_index` and `sell_lot_index` counters to `GridPair`. Updated:
+  - `GridPair.get_next_lot()` to accept direction parameter
+  - `GridPair.advance_lot_index(direction)` method
+  - `GridPair.reset_lot_indices()` method
+  - All 22+ `advance_toggle()` call sites to also call `advance_lot_index(direction)`
+  - `save_state()` and `load_state()` for persistence
+- LOCATION: `core/strategy_engine.py` lines 42-117 (GridPair), multiple call sites throughout
+
+### Files Modified
+- `core/strategy_engine.py` - All 4 fixes
+
+### Potential Issues to Monitor
+1. **Leapfrog Async Scheduling**: Uses `asyncio.create_task()` - ensure event loop is running
+2. **Backwards Compatibility**: Old state files will load with `buy_lot_index=0` and `sell_lot_index=0` defaults - this is correct behavior
+3. **Immediate Execution Race**: Immediate execution sets `in_zone=True` to prevent double execution on same tick
