@@ -407,3 +407,64 @@ if not exist "logs\users" mkdir "logs\users"
 1. **Leapfrog Async Scheduling**: Uses `asyncio.create_task()` - ensure event loop is running
 2. **Backwards Compatibility**: Old state files will load with `buy_lot_index=0` and `sell_lot_index=0` defaults - this is correct behavior
 3. **Immediate Execution Race**: Immediate execution sets `in_zone=True` to prevent double execution on same tick
+
+## Last Updated
+2025-12-22 19:10 - CHAIN EXECUTION FIX
+
+### Fix 5: Chain Execution After TP/SL Reset (Dec 22, 2025)
+
+**PROBLEM**: After TP/SL reset, immediate execution in `_reopen_pair_at_same_level()` did NOT chain to adjacent pairs. For example, B[0] would execute but S[1] would stay pending.
+
+**EXPECTED BEHAVIOR**: 
+- B[n] triggers → S[n+1] must also trigger (same price)
+- S[n] triggers → B[n-1] must also trigger (same price)
+
+**SOLUTION**: Added chain execution logic to 6 key functions:
+1. `_reopen_pair_at_same_level()` - forward/backward chain after immediate execution
+2. `_do_leapfrog_up()` - backward chain (S[new] → B[new-1])
+3. `_do_leapfrog_down()` - forward chain (B[new] → S[new+1])  
+4. `_do_leapfrog_untriggered_up()` - backward chain
+5. `_do_leapfrog_untriggered_down()` - forward chain
+
+**KEY RULE**: Chain logic now works for ALL scenarios:
+- Normal trigger (in `_check_virtual_triggers`)
+- After TP/SL reset (in `_reopen_pair_at_same_level`)
+- After leapfrog (in all 4 leapfrog functions)
+
+## Last Updated
+2025-12-22 20:15 - LOT SIZE LOGIC CLARIFICATION
+
+### CRITICAL: Lot Size Logic (Per Pair, Sequential by Toggle Order)
+
+**CORRECT Implementation:**
+Lot sizes follow `trade_count` which increments with each trade via `advance_toggle()`.
+
+| Trade # | trade_count | Lot Size (if [0.01, 0.02, 0.03]) |
+|---------|-------------|-----------------------------------|
+| 1st trade | 0 | 0.01 |
+| 2nd trade | 1 | 0.02 |
+| 3rd trade | 2 | 0.03 |
+| 4th trade | 3 | 0.01 (wraps) |
+
+**Key Rules:**
+1. Use ONLY `trade_count` for lot sizing. NO separate buy/sell indices.
+2. `trade_count` is per-pair, advanced by `advance_toggle()`.
+3. After TP/SL, reset `trade_count = 0` so next trade uses `lot_sizes[0]`.
+4. Toggle alternates direction: buy→sell→buy→sell, but lot sizing is sequential.
+
+**Example Pair 0:**
+- B0 opens first (trade_count=0) → 0.01
+- S0 opens second (trade_count=1) → 0.02
+- B0 opens again (trade_count=2) → 0.03
+- S0 opens again (trade_count=3) → wraps to 0.01
+
+**Chain Execution Lot Size:**
+When B[n] chains to S[n+1], the S[n+1] uses ITS OWN pair's trade_count, not B[n]'s.
+
+### Fix 2 REVERTED (Was Wrong):
+The separate `buy_lot_index` / `sell_lot_index` was INCORRECT.
+It made BUY always use 0.01 and SELL always start at 0.01 independently.
+This has been reverted to use single `trade_count` per pair.
+
+
+

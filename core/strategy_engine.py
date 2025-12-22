@@ -45,9 +45,10 @@ class GridPair:
     Represents a Buy/Sell pair at a specific grid level.
     
     Each pair has its own "brain" / memory:
-    - trade_count: How many trades executed for THIS pair (used for toggle/cycle)
-    - buy_lot_index/sell_lot_index: Separate lot counters per direction
+    - trade_count: How many trades executed for THIS pair (used for lot sizing AND toggle)
     - next_action: Toggle state for buy→sell→buy sequence
+    
+    IMPORTANT: Lot sizing uses trade_count directly (sequential per pair, NOT per direction).
     """
     index: int                      # ..., -2, -1, 0, 1, 2, ...
     buy_price: float = 0.0          # Entry price for Buy order
@@ -60,14 +61,9 @@ class GridPair:
     sell_pending_ticket: int = 0    # Pending order ticket for sell
     
     # Per-pair memory (THE "BRAIN")
-    trade_count: int = 0            # Total trades executed in THIS pair (for toggle/cycle logic)
+    trade_count: int = 0            # Total trades executed in THIS pair (for LOT SIZING and toggle)
     next_action: str = "buy"        # Toggle: "buy" → "sell" → "buy" → ...
     first_fill_direction: str = ""  # Legacy: "buy" or "sell" - whichever filled first
-    
-    # [FIX 2] Separate lot index counters per direction
-    # Each direction starts at lot_sizes[0] independently
-    buy_lot_index: int = 0          # Current lot index for BUY trades
-    sell_lot_index: int = 0         # Current lot index for SELL trades
     
     # Zone tracking for re-trigger (price must LEAVE and RETURN to re-trigger)
     buy_in_zone: bool = False       # True if price is currently at buy trigger level
@@ -78,41 +74,24 @@ class GridPair:
     pair_tp: float = 0.0            # Shared TP level (set by first trade of cycle)
     pair_sl: float = 0.0            # Shared SL level (set by first trade of cycle)
     
-    def get_next_lot(self, lot_sizes: list, direction: str = None) -> float:
+    def get_next_lot(self, lot_sizes: list) -> float:
         """
-        Get the next lot size for a trade.
+        Get the next lot size for a trade based on trade_count.
         
-        [FIX 2] Uses direction-specific lot index if direction is provided.
-        Falls back to trade_count for backwards compatibility.
+        Lot sizing is SEQUENTIAL per pair:
+        - 1st trade (trade_count=0) → lot_sizes[0]
+        - 2nd trade (trade_count=1) → lot_sizes[1]
+        - 3rd trade (trade_count=2) → lot_sizes[2]
+        - etc. (wraps using modulo)
         """
         if not lot_sizes:
             return 0.01
         
-        # Use direction-specific index if provided
-        if direction == "buy":
-            idx = self.buy_lot_index % len(lot_sizes)
-        elif direction == "sell":
-            idx = self.sell_lot_index % len(lot_sizes)
-        else:
-            # Fallback for backwards compatibility
-            idx = self.trade_count % len(lot_sizes)
-        
+        idx = self.trade_count % len(lot_sizes)
         return float(lot_sizes[idx])
     
-    def advance_lot_index(self, direction: str):
-        """[FIX 2] Advance the lot index for a specific direction."""
-        if direction == "buy":
-            self.buy_lot_index += 1
-        elif direction == "sell":
-            self.sell_lot_index += 1
-    
-    def reset_lot_indices(self):
-        """[FIX 2] Reset both lot indices to 0 (on TP/SL hit)."""
-        self.buy_lot_index = 0
-        self.sell_lot_index = 0
-    
     def advance_toggle(self):
-        """Advance to next action in toggle sequence"""
+        """Advance to next action in toggle sequence AND increment trade_count for lot sizing."""
         self.trade_count += 1
         self.next_action = "sell" if self.next_action == "buy" else "buy"
 
@@ -383,7 +362,6 @@ class LadderGridStrategy:
             pair.buy_ticket = ticket
             pair.buy_in_zone = True  # Mark as in zone
             pair.advance_toggle()  # Advance to next action (sell)
-            pair.advance_lot_index("buy")  # [FIX 2]
             self.last_trade_time = time.time()  # Start the auto-restart timer
             
             # Set up virtual S0 trigger (S0 is BELOW B0, so it's a sell_stop)
@@ -836,7 +814,7 @@ class LadderGridStrategy:
                     continue  # Pair no longer exists
                 
                 # Mark as processed IMMEDIATELY
-                self.processed_deals.add(deal.ticket)
+                self.processed_deals.append(deal.ticket)
                 
                 print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
                 
@@ -1061,7 +1039,6 @@ class LadderGridStrategy:
                 pair.sell_in_zone = False
                 pair.first_fill_direction = ""
                 pair.trade_count = 0
-                pair.reset_lot_indices()  # [FIX 2] Reset both lot indices
                 pair.pair_tp = 0.0
                 pair.pair_sl = 0.0
                 
@@ -1268,7 +1245,6 @@ class LadderGridStrategy:
         # If not, reset it here as safety
         if pair.trade_count != 0:
             pair.trade_count = 0
-            pair.reset_lot_indices()  # [FIX 2] Also reset lot indices
         
         # Get current tick to check if we should execute immediately
         tick = mt5.symbol_info_tick(self.symbol)
@@ -1306,7 +1282,23 @@ class LadderGridStrategy:
                         pair.buy_pending_ticket = 0
                         pair.buy_in_zone = True  # Prevent re-trigger
                         pair.advance_toggle()
-                        pair.advance_lot_index("buy")  # [FIX 2]
+                        
+                        # [CHAIN FIX] Forward chain: B[n] triggers → S[n+1] must also trigger
+                        next_idx = pair_index + 1
+                        next_pair = self.pairs.get(next_idx)
+                        if next_pair and not next_pair.sell_filled:
+                            # Check if S[next] is at same price as B[current] (chain condition)
+                            price_diff = abs(next_pair.sell_price - pair.buy_price)
+                            if price_diff < 11.0:  # Same tolerance as main chain logic
+                                print(f"[REOPEN CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{pair_index})")
+                                chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                                if chain_ticket:
+                                    next_pair.sell_filled = True
+                                    next_pair.sell_ticket = chain_ticket
+                                    next_pair.sell_pending_ticket = 0
+                                    next_pair.sell_in_zone = True
+                                    next_pair.advance_toggle()
+                        
                         return  # Exit after immediate execution
             
             elif pair.next_action == "sell":
@@ -1327,7 +1319,23 @@ class LadderGridStrategy:
                         pair.sell_pending_ticket = 0
                         pair.sell_in_zone = True  # Prevent re-trigger
                         pair.advance_toggle()
-                        pair.advance_lot_index("sell")  # [FIX 2]
+                        
+                        # [CHAIN FIX] Backward chain: S[n] triggers → B[n-1] must also trigger
+                        prev_idx = pair_index - 1
+                        prev_pair = self.pairs.get(prev_idx)
+                        if prev_pair and not prev_pair.buy_filled:
+                            # Check if B[prev] is at same price as S[current] (chain condition)
+                            price_diff = abs(prev_pair.buy_price - pair.sell_price)
+                            if price_diff < 11.0:  # Same tolerance as main chain logic
+                                print(f"[REOPEN CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{pair_index})")
+                                chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                                if chain_ticket:
+                                    prev_pair.buy_filled = True
+                                    prev_pair.buy_ticket = chain_ticket
+                                    prev_pair.buy_pending_ticket = 0
+                                    prev_pair.buy_in_zone = True
+                                    prev_pair.advance_toggle()
+                        
                         return  # Exit after immediate execution
         
         print(f"[REOPEN] {self.symbol}: Pair {pair_index} re-armed at same levels (B@{pair.buy_price:.2f}, S@{pair.sell_price:.2f}) - lot reset to first")
@@ -1379,7 +1387,6 @@ class LadderGridStrategy:
             # FIX: Increment trade count (0 -> 1) and toggle to 'buy'
             # This ensures the NEXT trade (Buy) uses the 2nd lot size (0.02)
             new_pair.advance_toggle() 
-            new_pair.advance_lot_index("sell")  # [FIX 2]
             
             # Arm the BUY trigger (Buy Stop)
             new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
@@ -1394,7 +1401,6 @@ class LadderGridStrategy:
                         edge_pair.buy_ticket = chain_ticket
                         edge_pair.buy_pending_ticket = 0
                         edge_pair.advance_toggle()
-                        edge_pair.advance_lot_index("buy")  # [FIX 2]
             
             print(f" {self.symbol}: Pair {new_idx} Active. S filled (0.01), B pending (0.02) @ {new_buy_price:.2f}")
         else:
@@ -1451,7 +1457,6 @@ class LadderGridStrategy:
             # FIX: Increment trade count (0 -> 1) and toggle to 'sell'
             # This ensures the NEXT trade (Sell) uses the 2nd lot size (0.02)
             new_pair.advance_toggle()
-            new_pair.advance_lot_index("buy")  # [FIX 2]
             
             # Arm the SELL trigger (Sell Stop)
             new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
@@ -1466,7 +1471,6 @@ class LadderGridStrategy:
                         edge_pair.sell_ticket = chain_ticket
                         edge_pair.sell_pending_ticket = 0
                         edge_pair.advance_toggle()
-                        edge_pair.advance_lot_index("sell")  # [FIX 2]
             
             print(f" {self.symbol}: Pair {new_idx} Active. B filled (0.01), S pending (0.02) @ {new_sell_price:.2f}")
         else:
@@ -1518,7 +1522,21 @@ class LadderGridStrategy:
             new_pair.sell_ticket = ticket
             new_pair.sell_in_zone = True
             new_pair.advance_toggle()  # Now next_action = "buy"
-            new_pair.advance_lot_index("sell")  # [FIX 2]
+            
+            # [CHAIN FIX] Backward chain: S[new] triggers → B[new-1] must also trigger
+            prev_idx = new_idx - 1
+            prev_pair = self.pairs.get(prev_idx)
+            if prev_pair and not prev_pair.buy_filled:
+                price_diff = abs(prev_pair.buy_price - exec_sell_price)
+                if price_diff < 11.0:
+                    print(f"[LEAPFROG CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{new_idx})")
+                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                    if chain_ticket:
+                        prev_pair.buy_filled = True
+                        prev_pair.buy_ticket = chain_ticket
+                        prev_pair.buy_pending_ticket = 0
+                        prev_pair.buy_in_zone = True
+                        prev_pair.advance_toggle()
             
             # Arm BUY trigger
             new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
@@ -1575,7 +1593,21 @@ class LadderGridStrategy:
             new_pair.buy_ticket = ticket
             new_pair.buy_in_zone = True
             new_pair.advance_toggle()  # Now next_action = "sell"
-            new_pair.advance_lot_index("buy")  # [FIX 2]
+            
+            # [CHAIN FIX] Forward chain: B[new] triggers → S[new+1] must also trigger
+            next_idx = new_idx + 1
+            next_pair = self.pairs.get(next_idx)
+            if next_pair and not next_pair.sell_filled:
+                price_diff = abs(next_pair.sell_price - exec_buy_price)
+                if price_diff < 11.0:
+                    print(f"[LEAPFROG CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{new_idx})")
+                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                    if chain_ticket:
+                        next_pair.sell_filled = True
+                        next_pair.sell_ticket = chain_ticket
+                        next_pair.sell_pending_ticket = 0
+                        next_pair.sell_in_zone = True
+                        next_pair.advance_toggle()
             
             # Arm SELL trigger
             new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
@@ -1643,7 +1675,22 @@ class LadderGridStrategy:
             new_pair.sell_ticket = ticket
             new_pair.sell_in_zone = True
             new_pair.advance_toggle()  # Now next_action = "buy"
-            new_pair.advance_lot_index("sell")  # [FIX 2]
+            
+            # [CHAIN FIX] Backward chain: S[new] triggers → B[new-1] must also trigger  
+            prev_idx = new_idx - 1
+            prev_pair = self.pairs.get(prev_idx)
+            if prev_pair and not prev_pair.buy_filled:
+                price_diff = abs(prev_pair.buy_price - exec_sell_price)
+                if price_diff < 11.0:
+                    print(f"[LEAPFROG CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{new_idx})")
+                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                    if chain_ticket:
+                        prev_pair.buy_filled = True
+                        prev_pair.buy_ticket = chain_ticket
+                        prev_pair.buy_pending_ticket = 0
+                        prev_pair.buy_in_zone = True
+                        prev_pair.advance_toggle()
+            
             # Arm BUY trigger at spread above
             new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
             
@@ -1722,7 +1769,22 @@ class LadderGridStrategy:
             new_pair.buy_ticket = ticket
             new_pair.buy_in_zone = True
             new_pair.advance_toggle()  # Now next_action = "sell"
-            new_pair.advance_lot_index("buy")  # [FIX 2]
+            
+            # [CHAIN FIX] Forward chain: B[new] triggers → S[new+1] must also trigger
+            next_idx = new_idx + 1
+            next_pair = self.pairs.get(next_idx)
+            if next_pair and not next_pair.sell_filled:
+                price_diff = abs(next_pair.sell_price - exec_buy_price)
+                if price_diff < 11.0:
+                    print(f"[LEAPFROG CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{new_idx})")
+                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                    if chain_ticket:
+                        next_pair.sell_filled = True
+                        next_pair.sell_ticket = chain_ticket
+                        next_pair.sell_pending_ticket = 0
+                        next_pair.sell_in_zone = True
+                        next_pair.advance_toggle()
+            
             # Arm SELL trigger at spread below
             new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
             
@@ -1893,18 +1955,22 @@ class LadderGridStrategy:
             # Just use FOK as default for Deriv synthetics
             return mt5.ORDER_FILLING_FOK
     
-    def _get_lot_size(self, index: int, direction: str) -> float:
+    def _get_lot_size(self, index: int, direction: str = None) -> float:
         """
-        [FIX 2] Get lot size using per-direction lot counter.
-        Each direction (buy/sell) has its own lot index.
+        Get lot size for a trade based on the pair's trade_count.
+        
+        Lot sizing is SEQUENTIAL per pair (NOT per direction):
+        - 1st trade uses lot_sizes[0]
+        - 2nd trade uses lot_sizes[1]
+        - etc.
         """
         pair = self.pairs.get(index)
         if not pair:
             # Pair not found, use first lot
             return self.lot_sizes[0] if self.lot_sizes else 0.01
         
-        # Use direction-specific lot counter
-        return pair.get_next_lot(self.lot_sizes, direction)
+        # Use trade_count based lot sizing
+        return pair.get_next_lot(self.lot_sizes)
 
     
     def _place_pending_order(self, order_type: str, price: float, index: int) -> int:
@@ -1968,7 +2034,6 @@ class LadderGridStrategy:
                         pair.buy_ticket = ticket
                         pair.buy_pending_ticket = 0
                         pair.advance_toggle()
-                        pair.advance_lot_index("buy")  # [FIX 2]
                         # [CRITICAL FIX] FORWARD: Check if next pair exists, if not CREATE it first
                         # Grid structure: S[N] = B[N-1], so when B[N] triggers, S[N+1] should also trigger
                         next_idx = idx + 1
@@ -1997,7 +2062,6 @@ class LadderGridStrategy:
                                 new_pair.sell_ticket = chain_ticket
                                 new_pair.sell_in_zone = True
                                 new_pair.advance_toggle()
-                                new_pair.advance_lot_index("sell")  # [FIX 2]
                                 # Arm BUY trigger for this new pair
                                 new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", new_buy_price, next_idx)
                                 print(f" {self.symbol}: Pair {next_idx} created with S filled, B pending @ {new_buy_price:.2f}")
@@ -2021,7 +2085,6 @@ class LadderGridStrategy:
                                         next_pair.sell_ticket = chain_ticket
                                         next_pair.sell_pending_ticket = 0
                                         next_pair.advance_toggle()
-                                        next_pair.advance_lot_index("sell")  # [FIX 2]
                                 else:
                                     # Beyond tolerance but entry was missed - execute at market anyway
                                     print(f" {self.symbol}: CHAIN S{next_idx} @ MARKET (diff {price_diff:.2f} > 11.0)")
@@ -2031,7 +2094,6 @@ class LadderGridStrategy:
                                         next_pair.sell_ticket = chain_ticket
                                         next_pair.sell_pending_ticket = 0
                                         next_pair.advance_toggle()
-                                        next_pair.advance_lot_index("sell")  # [FIX 2]
                         
                         # Expand Grid Up (legacy check - should mostly be handled above now)
                         indices = sorted(self.pairs.keys())
@@ -2075,7 +2137,6 @@ class LadderGridStrategy:
                         pair.sell_ticket = ticket
                         pair.sell_pending_ticket = 0
                         pair.advance_toggle()
-                        pair.advance_lot_index("sell")  # [FIX 2]
                         #For downwards expansion 
 
                         # [CRITICAL FIX] BACKWARD: Check if previous pair exists, if not CREATE it first
@@ -2106,7 +2167,6 @@ class LadderGridStrategy:
                                 new_pair.buy_ticket = chain_ticket
                                 new_pair.buy_in_zone = True
                                 new_pair.advance_toggle()
-                                new_pair.advance_lot_index("buy")  # [FIX 2]
                                 
                                 # Arm SELL trigger for this new pair
                                 new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, prev_idx)
@@ -2131,7 +2191,6 @@ class LadderGridStrategy:
                                         prev_pair.buy_ticket = chain_ticket
                                         prev_pair.buy_pending_ticket = 0
                                         prev_pair.advance_toggle()
-                                        prev_pair.advance_lot_index("buy")  # [FIX 2]
                                 else:
                                     # Beyond tolerance but entry was missed - execute at market anyway
                                     print(f" {self.symbol}: CHAIN B{prev_idx} @ MARKET (diff {price_diff:.2f} > 11.0)")
@@ -2141,7 +2200,6 @@ class LadderGridStrategy:
                                         prev_pair.buy_ticket = chain_ticket
                                         prev_pair.buy_pending_ticket = 0
                                         prev_pair.advance_toggle()
-                                        prev_pair.advance_lot_index("buy")  # [FIX 2]
                         
                         # Expand Grid Down (legacy check - should mostly be handled above now)
                         indices = sorted(self.pairs.keys())
@@ -2190,7 +2248,6 @@ class LadderGridStrategy:
                                     check_pair.buy_ticket = chain_ticket
                                     check_pair.buy_pending_ticket = 0
                                     check_pair.advance_toggle()
-                                    check_pair.advance_lot_index("buy")  # [FIX 2]
                                     self.save_state()
                 
                 # Check if SELL side should have chained but didn't
@@ -2212,7 +2269,6 @@ class LadderGridStrategy:
                                     check_pair.sell_ticket = chain_ticket
                                     check_pair.sell_pending_ticket = 0
                                     check_pair.advance_toggle()
-                                    check_pair.advance_lot_index("sell")  # [FIX 2]
                                     self.save_state()
 
     def _execute_market_order(self, direction: str, price: float, index: int) -> int:
@@ -2557,11 +2613,9 @@ class LadderGridStrategy:
                 "sell_filled": pair.sell_filled,
                 "buy_pending_ticket": pair.buy_pending_ticket,
                 "sell_pending_ticket": pair.sell_pending_ticket,
-                # [FIX 2] Add lot index fields for per-direction lot tracking
+                # [LOT SIZE] Save trade_count for lot sizing
                 "trade_count": pair.trade_count,
                 "next_action": pair.next_action,
-                "buy_lot_index": pair.buy_lot_index,
-                "sell_lot_index": pair.sell_lot_index,
             }
         
         state = {
@@ -2604,11 +2658,9 @@ class LadderGridStrategy:
                     sell_filled=pair_data.get("sell_filled", False),
                     buy_pending_ticket=pair_data.get("buy_pending_ticket", 0),
                     sell_pending_ticket=pair_data.get("sell_pending_ticket", 0),
-                    # [FIX 2] Load lot index fields with defaults for backwards compatibility
+                    # [LOT SIZE] Load trade_count for lot sizing
                     trade_count=pair_data.get("trade_count", 0),
                     next_action=pair_data.get("next_action", "buy"),
-                    buy_lot_index=pair_data.get("buy_lot_index", 0),
-                    sell_lot_index=pair_data.get("sell_lot_index", 0),
                 )
             
             print(f" {self.symbol}: Loaded state. Phase: {self.phase}, Pairs: {len(self.pairs)}")
