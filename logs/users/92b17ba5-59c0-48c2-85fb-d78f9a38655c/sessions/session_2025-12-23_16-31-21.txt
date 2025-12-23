@@ -1,0 +1,252 @@
+=====================================
+SESSION: 2025-12-23 16:39:09
+USER ID: 92b17ba5-59c0-48c2-85fb-d78f9a38655c
+=====================================
+
+[16:39:09] BUTTON: Start All
+[16:39:09] TRADE #1
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Price: 160563.07
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 219007790
+
+[16:39:10] TRADE #2
+  Symbol: FX Vol 20
+  Pair: 0
+  Direction: BUY
+  Price: 111871.47
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 219007792
+
+[16:39:10] TRADE #3
+  Symbol: FX Vol 40
+  Pair: 0
+  Direction: BUY
+  Price: 97743.23
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 219007793
+
+[16:39:10] TRADE #4
+  Symbol: FX Vol 60
+  Pair: 0
+  Direction: BUY
+  Price: 43759.53
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 219007795
+
+[16:39:10] SL HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: $-102.56
+
+[16:39:10] TRADE #5
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Price: 160563.07
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 219007799
+
+[16:39:11] TRADE #6
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: SELL
+  Price: 160515.88
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 219007804
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: SELL
+  Profit: $-25.35
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: +$50.59
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: +$50.59
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: +$15.17
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: +$20.39
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: +$7.45
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: +$7.53
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: +$7.83
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: +$15.04
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: $-128.61
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: SELL
+  Profit: $-77.17
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: +$81.24
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-20.27
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: SELL
+  Profit: +$25.99
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-20.02
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-20.02
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-20.02
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-29.59
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: $-45.36
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: $-73.92
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: +$20.44
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: +$40.03
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-25.30
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: +$10.80
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-25.31
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: +$22.01
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: +$20.76
+
+[16:39:11] TP HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Profit: +$20.76
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Profit: $-49.59
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: $-9.33
+
+[16:39:11] SL HIT
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Profit: $-19.81
+
