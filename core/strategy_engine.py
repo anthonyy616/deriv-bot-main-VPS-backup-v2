@@ -916,17 +916,17 @@ class LadderGridStrategy:
                 if pair.sell_pending_ticket:
                     self._cancel_order(pair.sell_pending_ticket)
                 
-                # Re-place triggers for both sides (FLIPPED order types for re-open)
-                pair.buy_pending_ticket = self._place_pending_order(
-                    self._get_reopen_order_type("buy", pair_idx),
-                    pair.buy_price, pair_idx
-                )
-                pair.sell_pending_ticket = self._place_pending_order(
-                    self._get_reopen_order_type("sell", pair_idx),
-                    pair.sell_price, pair_idx
-                )
+                # Reset TP/SL alignment values for new cycle
+                pair.pair_tp = 0.0
+                pair.pair_sl = 0.0
                 
-                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
+                # [CRITICAL] Use _reopen_pair_at_same_level() which handles:
+                # 1. Re-placing pending orders with flipped types
+                # 2. Immediate execution if price is already at trigger level
+                # 3. Chain execution (B[n-1] from S[n], S[n+1] from B[n])
+                self._reopen_pair_at_same_level(pair_idx)
+                
+                print(f"   [PAIR RESET] Pair {pair_idx} fully reset via _reopen_pair_at_same_level().")
                 self.save_state()
             
             # Update last check time
@@ -938,8 +938,11 @@ class LadderGridStrategy:
 
     async def _check_and_reopen(self):
         """
-        Monitor for ANY closed position in a pair. 
-        If detected, Trigger 'Pair Nuclear Reset': Close ALL other positions for that pair immediately.
+        [SIMPLIFIED] Only maintains position snapshot for tracking.
+        All TP/SL processing is now handled by _check_tp_sl_from_history() to prevent duplicates.
+        
+        This function serves as a BACKUP detector only - if history-based detection misses something,
+        this will log a warning so we can investigate.
         """
         # 1. Snapshot Init
         if not hasattr(self, "_pos_snapshot"):
@@ -954,11 +957,8 @@ class LadderGridStrategy:
         # 2. Get Current State
         current_positions = mt5.positions_get(symbol=self.symbol)
         
-        # [FIX] Safety check: If positions_get returns None (error/disconnect), 
-        # DO NOT assume positions are closed. Abort check this tick.
+        # Safety check: If positions_get returns None (error/disconnect), abort
         if current_positions is None:
-            # Optional: Print warning only if it persists, to avoid log spam
-            # print(f" {self.symbol}: Connection issue? positions_get returned None.")
             return
 
         current_map = {}
@@ -970,129 +970,37 @@ class LadderGridStrategy:
         # 3. Detect Closed Tickets (In snapshot but not in current)
         closed_tickets = set(self._pos_snapshot.keys()) - set(current_map.keys())
         
-        # [FIX] Debounce: Don't trust a single 'missing' signal.
-        # Initialize a counter map if it doesn't exist
+        # Initialize debounce counter if needed
         if not hasattr(self, "_missing_pos_counters"):
             self._missing_pos_counters = defaultdict(int)
 
-        # Update counters
-        confirmed_closed_tickets = []
-        
-        # Check newly missing tickets
+        # Update counters and check for confirmed closures
         for ticket in closed_tickets:
             self._missing_pos_counters[ticket] += 1
-            # Require 3 consecutive confirmations (approx 0.5-1.5s) to believe it's closed
-            # Require 3 consecutive confirmations (approx 0.5-1.5s) to believe it's closed
+            
+            # After 3 consecutive missing confirmations, check if already processed
             if self._missing_pos_counters[ticket] >= 3:
-                confirmed_closed_tickets.append(ticket)
+                # DEDUPLICATION: Skip if already handled by history-based detection
+                if ticket not in self.processed_deals:
+                    # Not processed yet - log warning (history-based handler should have caught this)
+                    info = self._pos_snapshot.get(ticket)
+                    if info:
+                        print(f" {self.symbol}: [BACKUP] Position {ticket} (Pair {info['pair_index']}) closed but not in processed_deals - adding to queue")
+                        # Add to processed_deals so history handler can pick it up
+                        self.processed_deals.append(ticket)
+                
+                # Clean up tracking
+                if ticket in self._pos_snapshot:
+                    del self._pos_snapshot[ticket]
+                if ticket in self._missing_pos_counters:
+                    del self._missing_pos_counters[ticket]
         
         # Reset counters for tickets that reappeared (false alarm)
         for ticket in list(self._missing_pos_counters.keys()):
             if ticket not in closed_tickets:
                 del self._missing_pos_counters[ticket]
-        
-        # 4. Handle Confirmed Closed Tickets
-        for ticket in confirmed_closed_tickets:
-            # [FIX 4] Deduplicate: Skip if already handled by history-based detection
-            if ticket in self.processed_deals:
-                if ticket in self._pos_snapshot:
-                    del self._pos_snapshot[ticket]
-                if ticket in self._missing_pos_counters:
-                    del self._missing_pos_counters[ticket]
-                continue
-            
-            # Get info about the closed ticket from snapshot
-            info = self._pos_snapshot.get(ticket)
-            if not info:
-                continue
-                
-            pair_idx = info['pair_index']
-            pair = self.pairs.get(pair_idx)
-            
-            if pair:
-                print(f" {self.symbol}: Detected TP/SL Close for Position {ticket} (Pair {pair_idx})")
-                
-                # Determine if TP was hit (for leapfrog decision)
-                tp_hit = self._check_if_tp_hit(ticket, "")
-                
-                # Close the other side if open (Nuclear Reset for this pair)
-                if pair.buy_ticket == ticket:
-                    pair.buy_filled = False
-                    pair.buy_ticket = 0
-                    if pair.sell_filled and pair.sell_ticket:
-                        print(f"   [PAIR RESET] Closing opposite Sell {pair.sell_ticket}...")
-                        self._close_position(pair.sell_ticket)
-                        pair.sell_filled = False
-                        pair.sell_ticket = 0
-                
-                elif pair.sell_ticket == ticket:
-                    pair.sell_filled = False
-                    pair.sell_ticket = 0
-                    if pair.buy_filled and pair.buy_ticket:
-                        print(f"   [PAIR RESET] Closing opposite Buy {pair.buy_ticket}...")
-                        self._close_position(pair.buy_ticket)
-                        pair.buy_filled = False
-                        pair.buy_ticket = 0
-                
-                # Reset all pair state
-                pair.buy_in_zone = False
-                pair.sell_in_zone = False
-                pair.first_fill_direction = ""
-                pair.trade_count = 0
-                pair.pair_tp = 0.0
-                pair.pair_sl = 0.0
-                
-                # [FIX 1] Reset next_action based on grid polarity
-                # Negative Pairs -> Buy first, Positive Pairs -> Sell first
-                if pair_idx > 0:
-                    pair.next_action = "sell"
-                else:
-                    pair.next_action = "buy"
-                
-                # Remove any existing pending orders
-                if pair.buy_pending_ticket:
-                    self._cancel_order(pair.buy_pending_ticket)
-                if pair.sell_pending_ticket:
-                    self._cancel_order(pair.sell_pending_ticket)
-                
-                # Log the TP/SL event
-                self._log_trade(
-                    event_type="TP_HIT" if tp_hit else "SL_HIT",
-                    pair_index=pair_idx,
-                    direction="BOTH",
-                    price=0, lot_size=0, ticket=ticket,
-                    notes="Pair Reset Triggered"
-                )
-                
-                # [FIX 1] Leapfrog on TP (schedule async to avoid blocking)
-                if tp_hit:
-                    tick = mt5.symbol_info_tick(self.symbol)
-                    if tick:
-                        if tick.bid > pair.buy_price:
-                            untriggered = self._find_furthest_untriggered("up")
-                            if untriggered is not None:
-                                import asyncio
-                                asyncio.create_task(self._do_leapfrog_untriggered_up(untriggered))
-                        elif tick.ask < pair.sell_price:
-                            untriggered = self._find_furthest_untriggered("down")
-                            if untriggered is not None:
-                                import asyncio
-                                asyncio.create_task(self._do_leapfrog_untriggered_down(untriggered))
-                
-                # Re-arm triggers at same levels
-                self._reopen_pair_at_same_level(pair_idx)
-                
-                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
-                self.save_state()
-            
-            # Remove from snapshot and counters
-            if ticket in self._pos_snapshot:
-                del self._pos_snapshot[ticket]
-            if ticket in self._missing_pos_counters:
-                del self._missing_pos_counters[ticket]
 
-
-        # 5. Update Snapshot
+        # 4. Update Snapshot
         self._pos_snapshot = current_map
 
     def _check_if_tp_hit(self, ticket: int, direction: str) -> bool:
@@ -1249,14 +1157,14 @@ class LadderGridStrategy:
         # Get current tick to check if we should execute immediately
         tick = mt5.symbol_info_tick(self.symbol)
         
-        # Re-arm buy trigger
+        # Re-arm buy trigger (with FLIPPED order types for re-open)
         pair.buy_pending_ticket = self._place_pending_order(
-            self._get_order_type("buy", pair.buy_price),
+            self._get_reopen_order_type("buy", pair_index),
             pair.buy_price, pair_index
         )
-        # Re-arm sell trigger
+        # Re-arm sell trigger (with FLIPPED order types for re-open)
         pair.sell_pending_ticket = self._place_pending_order(
-            self._get_order_type("sell", pair.sell_price),
+            self._get_reopen_order_type("sell", pair_index),
             pair.sell_price, pair_index
         )
         
@@ -1514,7 +1422,7 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute SELL immediately
-        volume = new_pair.get_next_lot(self.lot_sizes, "sell")
+        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
         
         if ticket:
@@ -1585,7 +1493,7 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute BUY immediately
-        volume = new_pair.get_next_lot(self.lot_sizes, "buy")
+        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
         
         if ticket:
@@ -1667,7 +1575,7 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute SELL immediately at market
-        volume = new_pair.get_next_lot(self.lot_sizes, "sell")
+        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
         
         if ticket:
@@ -1761,7 +1669,7 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute BUY immediately at market
-        volume = new_pair.get_next_lot(self.lot_sizes, "buy")
+        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
         
         if ticket:
