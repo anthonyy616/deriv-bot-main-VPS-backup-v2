@@ -78,16 +78,16 @@
                 pair.first_fill_direction = ""
                 
                 # Cancel any existing pending orders
-                if pair.buy_pending_ticket:
-                    self._cancel_order(pair.buy_pending_ticket)
-                if pair.sell_pending_ticket:
-                    self._cancel_order(pair.sell_pending_ticket)
+                if pair.buy_pending_ticket: self._cancel_order(pair.buy_pending_ticket)
+                if pair.sell_pending_ticket: self._cancel_order(pair.sell_pending_ticket)
                 
-                # Re-place triggers for both sides
-                pair.buy_pending_ticket = self._place_pending_order(
-                    self._get_order_type("buy", pair.buy_price),
-                    pair.buy_price, pair_idx
-                )
+                # SET PERSISTENT FLAGS
+                pair.pending_reopen_buy = True
+                pair.pending_reopen_sell = True
+                
+                print(f"   [PAIR RESET] Pair {pair_idx} flagged for Reopen. Waiting for retracement...")
+                self.save_state()
+                
                 pair.sell_pending_ticket = self._place_pending_order(
                     self._get_order_type("sell", pair.sell_price),
                     pair.sell_price, pair_idx

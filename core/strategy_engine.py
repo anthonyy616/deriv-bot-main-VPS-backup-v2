@@ -43,12 +43,6 @@ class TradeLog:
 class GridPair:
     """
     Represents a Buy/Sell pair at a specific grid level.
-    
-    Each pair has its own "brain" / memory:
-    - trade_count: How many trades executed for THIS pair (used for lot sizing AND toggle)
-    - next_action: Toggle state for buy→sell→buy sequence
-    
-    IMPORTANT: Lot sizing uses trade_count directly (sequential per pair, NOT per direction).
     """
     index: int                      # ..., -2, -1, 0, 1, 2, ...
     buy_price: float = 0.0          # Entry price for Buy order
@@ -57,45 +51,35 @@ class GridPair:
     sell_ticket: int = 0            # MT5 order/position ticket
     buy_filled: bool = False        # True if buy order has executed
     sell_filled: bool = False       # True if sell order has executed
-    buy_pending_ticket: int = 0     # Pending order ticket for buy
-    sell_pending_ticket: int = 0    # Pending order ticket for sell
+    buy_pending_ticket: int = 0     # Virtual pending order ticket
+    sell_pending_ticket: int = 0    # Virtual pending order ticket
     
-    # Per-pair memory (THE "BRAIN")
-    trade_count: int = 0            # Total trades executed in THIS pair (for LOT SIZING and toggle)
-    next_action: str = "buy"        # Toggle: "buy" → "sell" → "buy" → ...
-    first_fill_direction: str = ""  # Legacy: "buy" or "sell" - whichever filled first
+    # Per-pair memory
+    trade_count: int = 0            # Total trades executed in THIS pair
+    next_action: str = "buy"        # Toggle: "buy" -> "sell"
+    first_fill_direction: str = ""  # Legacy
     
-    # Zone tracking for re-trigger (price must LEAVE and RETURN to re-trigger)
-    buy_in_zone: bool = False       # True if price is currently at buy trigger level
-    sell_in_zone: bool = False      # True if price is currently at sell trigger level
+    # Zone tracking
+    buy_in_zone: bool = False       
+    sell_in_zone: bool = False      
     
-    # TP/SL Alignment: First trade of each 2-trade cycle sets these, second trade uses them inversely
-    # Buy TP = Sell SL, Buy SL = Sell TP (determined by trade_count % 2)
-    pair_tp: float = 0.0            # Shared TP level (set by first trade of cycle)
-    pair_sl: float = 0.0            # Shared SL level (set by first trade of cycle)
+    # TP/SL Alignment
+    pair_tp: float = 0.0            
+    pair_sl: float = 0.0   
     
+    # --- NEW ROBUST REOPEN FLAGS ---
+    # These persist until the reopen order is successfully executed
+    pending_reopen_buy: bool = False
+    pending_reopen_sell: bool = False         
+
     def get_next_lot(self, lot_sizes: list) -> float:
-        """
-        Get the next lot size for a trade based on trade_count.
-        
-        Lot sizing is SEQUENTIAL per pair:
-        - 1st trade (trade_count=0) → lot_sizes[0]
-        - 2nd trade (trade_count=1) → lot_sizes[1]
-        - 3rd trade (trade_count=2) → lot_sizes[2]
-        - etc. (wraps using modulo)
-        """
-        if not lot_sizes:
-            return 0.01
-        
+        if not lot_sizes: return 0.01
         idx = self.trade_count % len(lot_sizes)
         return float(lot_sizes[idx])
     
     def advance_toggle(self):
-        """Advance to next action in toggle sequence AND increment trade_count for lot sizing."""
         self.trade_count += 1
         self.next_action = "sell" if self.next_action == "buy" else "buy"
-
-    
 
 class LadderGridStrategy:
     """
@@ -642,14 +626,16 @@ class LadderGridStrategy:
                     self.save_state()
                     return  # Exit, next tick will run _handle_init
         
-        # [FIX] Check TP/SL from MT5 history FIRST (before triggers/reopen)
+        # 1. DETECT: Check history for TP/SL and set persistent flags
         await self._check_tp_sl_from_history()
         
-        # 1. Check virtual triggers (monitor prices and fire market orders)
-        self._check_virtual_triggers(ask, bid)
+        # 2. MAINTAIN: Check flags and execute reopens (The Fix)
+        self._maintain_reopen_logic(ask, bid)
         
-        # 2. Check for closed positions (TP/SL hit) and re-open
-        await self._check_and_reopen()
+        # 3. EXPAND: Check virtual triggers for new grid levels
+        self._check_virtual_triggers(ask, bid)
+
+    
     
     async def _update_fill_status(self):
         """Check MT5 positions and update fill status in pairs - BIDIRECTIONAL SYNC."""
@@ -954,72 +940,106 @@ class LadderGridStrategy:
             print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
             # Don't crash, just skip this tick
 
-    async def _check_and_reopen(self):
+
+    def _maintain_reopen_logic(self, ask: float, bid: float):
         """
-        [SIMPLIFIED] Only maintains position snapshot for tracking.
-        All TP/SL processing is now handled by _check_tp_sl_from_history() to prevent duplicates.
-        
-        This function serves as a BACKUP detector only - if history-based detection misses something,
-        this will log a warning so we can investigate.
+        Robustly checks persistent reopen flags every tick.
+        Executes Market Orders when price retraces to the target level.
+        Prevents logic from 'disappearing' by retrying until success.
         """
-        # 1. Snapshot Init
-        if not hasattr(self, "_pos_snapshot"):
-            self._pos_snapshot = {}
-            current_positions = mt5.positions_get(symbol=self.symbol)
-            if current_positions:
-                for p in current_positions:
-                    if p.magic >= 50000:
-                        self._pos_snapshot[p.ticket] = {"magic": p.magic, "pair_index": p.magic - 50000}
-            return
-
-        # 2. Get Current State
-        current_positions = mt5.positions_get(symbol=self.symbol)
-        
-        # Safety check: If positions_get returns None (error/disconnect), abort
-        if current_positions is None:
-            return
-
-        current_map = {}
-        if current_positions:
-            for p in current_positions:
-                if p.magic >= 50000:
-                    current_map[p.ticket] = {"magic": p.magic, "pair_index": p.magic - 50000}
-
-        # 3. Detect Closed Tickets (In snapshot but not in current)
-        closed_tickets = set(self._pos_snapshot.keys()) - set(current_map.keys())
-        
-        # Initialize debounce counter if needed
-        if not hasattr(self, "_missing_pos_counters"):
-            self._missing_pos_counters = defaultdict(int)
-
-        # Update counters and check for confirmed closures
-        for ticket in closed_tickets:
-            self._missing_pos_counters[ticket] += 1
+        for idx, pair in self.pairs.items():
             
-            # After 3 consecutive missing confirmations, check if already processed
-            if self._missing_pos_counters[ticket] >= 3:
-                # DEDUPLICATION: Skip if already handled by history-based detection
-                if ticket not in self.processed_deals:
-                    # Not processed yet - log warning (history-based handler should have caught this)
-                    info = self._pos_snapshot.get(ticket)
-                    if info:
-                        print(f" {self.symbol}: [BACKUP] Position {ticket} (Pair {info['pair_index']}) closed but not in processed_deals - adding to queue")
-                        # Add to processed_deals so history handler can pick it up
-                        self.processed_deals.append(ticket)
+            # --- BUY REOPEN LOGIC ---
+            if pair.pending_reopen_buy and not pair.buy_filled:
+                should_fire = False
                 
-                # Clean up tracking
-                if ticket in self._pos_snapshot:
-                    del self._pos_snapshot[ticket]
-                if ticket in self._missing_pos_counters:
-                    del self._missing_pos_counters[ticket]
-        
-        # Reset counters for tickets that reappeared (false alarm)
-        for ticket in list(self._missing_pos_counters.keys()):
-            if ticket not in closed_tickets:
-                del self._missing_pos_counters[ticket]
+                # POSITIVE GRID (Above Center): Retracement is DOWN -> Buy Limit logic
+                if idx >= 0:
+                    # Fire if price is AT or BELOW target (Limit)
+                    if ask <= pair.buy_price + 2.0: 
+                        print(f"[REOPEN] {self.symbol}: Price dropped to B{idx} ({pair.buy_price}) -> FIRING")
+                        should_fire = True
+                
+                # NEGATIVE GRID (Below Center): Retracement is UP -> Buy Stop logic
+                else:
+                    # Fire if price is AT or ABOVE target (Stop)
+                    if ask >= pair.buy_price - 2.0:
+                         print(f"[REOPEN] {self.symbol}: Price rose to B{idx} ({pair.buy_price}) -> FIRING")
+                         should_fire = True
+                
+                if should_fire:
+                    ticket = self._execute_market_order("buy", pair.buy_price, idx)
+                    if ticket:
+                        pair.buy_filled = True
+                        pair.buy_ticket = ticket
+                        pair.pending_reopen_buy = False # SUCCESS: Clear flag
+                        pair.advance_toggle()
+                        self.save_state()
+                        
+                        # FORCE CHAIN: S[N+1] must also fire if it exists
+                        next_idx = idx + 1
+                        if next_idx in self.pairs:
+                            next_pair = self.pairs[next_idx]
+                            if not next_pair.sell_filled:
+                                print(f"[CHAIN] Firing S{next_idx} due to B{idx} Reopen")
+                                self._force_execute_chain("sell", next_idx)
 
-        # 4. Update Snapshot
-        self._pos_snapshot = current_map
+            # --- SELL REOPEN LOGIC ---
+            if pair.pending_reopen_sell and not pair.sell_filled:
+                should_fire = False
+                
+                # POSITIVE GRID (Above Center): Retracement is DOWN -> Sell Stop logic
+                if idx >= 0:
+                    # Fire if price is AT or BELOW target (Stop)
+                    if bid <= pair.sell_price + 2.0:
+                        print(f"[REOPEN] {self.symbol}: Price dropped to S{idx} ({pair.sell_price}) -> FIRING")
+                        should_fire = True
+                        
+                # NEGATIVE GRID (Below Center): Retracement is UP -> Sell Limit logic
+                else:
+                    # Fire if price is AT or ABOVE target (Limit)
+                    if bid >= pair.sell_price - 2.0:
+                        print(f"[REOPEN] {self.symbol}: Price rose to S{idx} ({pair.sell_price}) -> FIRING")
+                        should_fire = True
+                        
+                if should_fire:
+                    ticket = self._execute_market_order("sell", pair.sell_price, idx)
+                    if ticket:
+                        pair.sell_filled = True
+                        pair.sell_ticket = ticket
+                        pair.pending_reopen_sell = False # SUCCESS: Clear flag
+                        pair.advance_toggle()
+                        self.save_state()
+                        
+                        # FORCE CHAIN: B[N-1] must also fire if it exists
+                        prev_idx = idx - 1
+                        if prev_idx in self.pairs:
+                            prev_pair = self.pairs[prev_idx]
+                            if not prev_pair.buy_filled:
+                                print(f"[CHAIN] Firing B{prev_idx} due to S{idx} Reopen")
+                                self._force_execute_chain("buy", prev_idx)
+
+    def _force_execute_chain(self, direction: str, idx: int):
+        """Helper to force execute a chained order immediately."""
+        pair = self.pairs.get(idx)
+        if not pair: return
+        price = pair.buy_price if direction == "buy" else pair.sell_price
+        
+        # Execute immediately
+        ticket = self._execute_market_order(direction, price, idx)
+        
+        if ticket:
+            if direction == "buy":
+                pair.buy_filled = True
+                pair.buy_ticket = ticket
+                pair.pending_reopen_buy = False # Prevent double fire
+            else:
+                pair.sell_filled = True
+                pair.sell_ticket = ticket
+                pair.pending_reopen_sell = False
+            
+            pair.advance_toggle()
+            self.save_state()
 
     def _check_if_tp_hit(self, ticket: int, direction: str) -> bool:
         """
@@ -1902,6 +1922,101 @@ class LadderGridStrategy:
         # The actual ticket will be assigned when the market order fires
         return -(index * 1000 + (1 if "buy" in order_type else 2))
     
+    def _maintain_reopen_logic(self, ask: float, bid: float):
+        """
+        Robustly checks persistent reopen flags every tick.
+        Executes Market Orders when price retraces to the target level.
+        Prevents logic from 'disappearing' by retrying until success.
+        """
+        for idx, pair in self.pairs.items():
+            
+            # --- BUY REOPEN LOGIC ---
+            if pair.pending_reopen_buy and not pair.buy_filled:
+                should_fire = False
+                
+                # POSITIVE GRID (Above Center): Retracement is DOWN
+                # We want to Buy when price drops to level (Limit-like)
+                if idx >= 0:
+                    if ask <= pair.buy_price + 2.0: # Tolerance buffer
+                        print(f"[REOPEN] {self.symbol}: Price dropped to B{idx} ({pair.buy_price}) -> FIRING")
+                        should_fire = True
+                
+                # NEGATIVE GRID (Below Center): Retracement is UP
+                # We want to Buy when price rises to level (Stop-like)
+                else:
+                    if ask >= pair.buy_price - 2.0:
+                         print(f"[REOPEN] {self.symbol}: Price rose to B{idx} ({pair.buy_price}) -> FIRING")
+                         should_fire = True
+                
+                if should_fire:
+                    ticket = self._execute_market_order("buy", pair.buy_price, idx)
+                    if ticket:
+                        pair.buy_filled = True
+                        pair.buy_ticket = ticket
+                        pair.pending_reopen_buy = False # SUCCESS: Clear flag
+                        pair.advance_toggle()
+                        self.save_state()
+                        
+                        # FORCE CHAIN: S[N+1] must also fire if it exists
+                        next_idx = idx + 1
+                        if next_idx in self.pairs:
+                            next_pair = self.pairs[next_idx]
+                            if not next_pair.sell_filled:
+                                print(f"[CHAIN] Firing S{next_idx} due to B{idx} Reopen")
+                                self._force_execute_chain("sell", next_idx)
+
+            # --- SELL REOPEN LOGIC ---
+            if pair.pending_reopen_sell and not pair.sell_filled:
+                should_fire = False
+                
+                # POSITIVE GRID (Above Center): Retracement is DOWN
+                # We want to Sell when price drops to level (Stop-like)
+                if idx >= 0:
+                    if bid <= pair.sell_price + 2.0:
+                        print(f"[REOPEN] {self.symbol}: Price dropped to S{idx} ({pair.sell_price}) -> FIRING")
+                        should_fire = True
+                        
+                # NEGATIVE GRID (Below Center): Retracement is UP
+                # We want to Sell when price rises to level (Limit-like)
+                else:
+                    if bid >= pair.sell_price - 2.0:
+                        print(f"[REOPEN] {self.symbol}: Price rose to S{idx} ({pair.sell_price}) -> FIRING")
+                        should_fire = True
+                        
+                if should_fire:
+                    ticket = self._execute_market_order("sell", pair.sell_price, idx)
+                    if ticket:
+                        pair.sell_filled = True
+                        pair.sell_ticket = ticket
+                        pair.pending_reopen_sell = False # SUCCESS: Clear flag
+                        pair.advance_toggle()
+                        self.save_state()
+                        
+                        # FORCE CHAIN: B[N-1] must also fire if it exists
+                        prev_idx = idx - 1
+                        if prev_idx in self.pairs:
+                            prev_pair = self.pairs[prev_idx]
+                            if not prev_pair.buy_filled:
+                                print(f"[CHAIN] Firing B{prev_idx} due to S{idx} Reopen")
+                                self._force_execute_chain("buy", prev_idx)
+
+    def _force_execute_chain(self, direction: str, idx: int):
+        """Helper to force execute a chained order immediately."""
+        pair = self.pairs.get(idx)
+        if not pair: return
+        price = pair.buy_price if direction == "buy" else pair.sell_price
+        ticket = self._execute_market_order(direction, price, idx)
+        if ticket:
+            if direction == "buy":
+                pair.buy_filled = True
+                pair.buy_ticket = ticket
+                pair.pending_reopen_buy = False # Prevent double fire
+            else:
+                pair.sell_filled = True
+                pair.sell_ticket = ticket
+                pair.pending_reopen_sell = False
+            pair.advance_toggle()
+    
     def _check_virtual_triggers(self, ask: float, bid: float):
         """
         Check triggers and fire market orders.
@@ -2533,6 +2648,8 @@ class LadderGridStrategy:
                 # [LOT SIZE] Save trade_count for lot sizing
                 "trade_count": pair.trade_count,
                 "next_action": pair.next_action,
+                "pending_reopen_buy": pair.pending_reopen_buy,
+                "pending_reopen_sell": pair.pending_reopen_sell,
             }
         
         state = {
@@ -2578,6 +2695,8 @@ class LadderGridStrategy:
                     # [LOT SIZE] Load trade_count for lot sizing
                     trade_count=pair_data.get("trade_count", 0),
                     next_action=pair_data.get("next_action", "buy"),
+                    pending_reopen_buy=pair_data.get("pending_reopen_buy", False),
+                    pending_reopen_sell=pair_data.get("pending_reopen_sell", False),
                 )
             
             print(f" {self.symbol}: Loaded state. Phase: {self.phase}, Pairs: {len(self.pairs)}")
