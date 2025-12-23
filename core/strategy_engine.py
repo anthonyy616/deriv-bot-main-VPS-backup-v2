@@ -43,6 +43,12 @@ class TradeLog:
 class GridPair:
     """
     Represents a Buy/Sell pair at a specific grid level.
+    
+    Each pair has its own "brain" / memory:
+    - trade_count: How many trades executed for THIS pair (used for lot sizing AND toggle)
+    - next_action: Toggle state for buy→sell→buy sequence
+    
+    IMPORTANT: Lot sizing uses trade_count directly (sequential per pair, NOT per direction).
     """
     index: int                      # ..., -2, -1, 0, 1, 2, ...
     buy_price: float = 0.0          # Entry price for Buy order
@@ -51,35 +57,46 @@ class GridPair:
     sell_ticket: int = 0            # MT5 order/position ticket
     buy_filled: bool = False        # True if buy order has executed
     sell_filled: bool = False       # True if sell order has executed
-    buy_pending_ticket: int = 0     # Virtual pending order ticket
-    sell_pending_ticket: int = 0    # Virtual pending order ticket
+    buy_pending_ticket: int = 0     # Pending order ticket for buy
+    sell_pending_ticket: int = 0    # Pending order ticket for sell
     
-    # Per-pair memory
-    trade_count: int = 0            # Total trades executed in THIS pair
-    next_action: str = "buy"        # Toggle: "buy" -> "sell"
-    first_fill_direction: str = ""  # Legacy
+    # Per-pair memory (THE "BRAIN")
+    trade_count: int = 0            # Total trades executed in THIS pair (for LOT SIZING and toggle)
+    next_action: str = "buy"        # Toggle: "buy" → "sell" → "buy" → ...
+    first_fill_direction: str = ""  # Legacy: "buy" or "sell" - whichever filled first
     
-    # Zone tracking
-    buy_in_zone: bool = False       
-    sell_in_zone: bool = False      
+    # Zone tracking for re-trigger (price must LEAVE and RETURN to re-trigger)
+    buy_in_zone: bool = False       # True if price is currently at buy trigger level
+    sell_in_zone: bool = False      # True if price is currently at sell trigger level
+    is_reopened: bool = False       # True after TP/SL reset - bypasses zone checks
     
-    # TP/SL Alignment
-    pair_tp: float = 0.0            
-    pair_sl: float = 0.0   
+    # TP/SL Alignment: First trade of each 2-trade cycle sets these, second trade uses them inversely
+    # Buy TP = Sell SL, Buy SL = Sell TP (determined by trade_count % 2)
+    pair_tp: float = 0.0            # Shared TP level (set by first trade of cycle)
+    pair_sl: float = 0.0            # Shared SL level (set by first trade of cycle)
     
-    # --- NEW ROBUST REOPEN FLAGS ---
-    # These persist until the reopen order is successfully executed
-    pending_reopen_buy: bool = False
-    pending_reopen_sell: bool = False         
-
     def get_next_lot(self, lot_sizes: list) -> float:
-        if not lot_sizes: return 0.01
+        """
+        Get the next lot size for a trade based on trade_count.
+        
+        Lot sizing is SEQUENTIAL per pair:
+        - 1st trade (trade_count=0) → lot_sizes[0]
+        - 2nd trade (trade_count=1) → lot_sizes[1]
+        - 3rd trade (trade_count=2) → lot_sizes[2]
+        - etc. (wraps using modulo)
+        """
+        if not lot_sizes:
+            return 0.01
+        
         idx = self.trade_count % len(lot_sizes)
         return float(lot_sizes[idx])
     
     def advance_toggle(self):
+        """Advance to next action in toggle sequence AND increment trade_count for lot sizing."""
         self.trade_count += 1
         self.next_action = "sell" if self.next_action == "buy" else "buy"
+
+    
 
 class LadderGridStrategy:
     """
@@ -118,10 +135,10 @@ class LadderGridStrategy:
         
         # --- Auto-restart tracking ---
         self.last_trade_time: float = 0         # Last time we had active trades
-        self.no_trade_timeout: float = 4.0    # Seconds before auto-restart (4 seconds)
+        self.no_trade_timeout: float = 10.0    # Seconds before auto-restart (10 seconds)
         
         # --- Debug Trade History ---
-        self.trade_history: deque = deque(maxlen=500)    # Auto-cleanup: keeps last 500 trades only
+        self.trade_history: List[TradeLog] = []          # All trade events in order
         self.global_trade_counter: int = 0               # Total trades across all pairs
         self.debug_log_file = f"trade_debug_{self.symbol.replace(' ', '_')}.txt"
         
@@ -594,19 +611,15 @@ class LadderGridStrategy:
         RUNNING: Monitor virtual triggers and check for TP/SL re-opens.
         Also auto-restart if no active trades for 5+ seconds.
         """
-        # Check for active positions in MT5
+        # Check for active positions
         positions = mt5.positions_get(symbol=self.symbol)
         active_count = len(positions) if positions else 0
         
-        # [FIX] Also check if any pair in our state has filled positions
-        # This prevents restart when MT5 shows 0 but we still have state tracking filled positions
-        pairs_with_fills = sum(1 for p in self.pairs.values() if p.buy_filled or p.sell_filled)
-        
-        if active_count > 0 or pairs_with_fills > 0:
+        if active_count > 0:
             # We have active trades - update last trade time
             self.last_trade_time = time.time()
         else:
-            # No active trades in MT5 AND no filled positions in state - check timeout for auto-restart
+            # No active trades - check timeout for auto-restart
             if self.last_trade_time > 0:
                 elapsed = time.time() - self.last_trade_time
                 if elapsed >= self.no_trade_timeout:
@@ -626,19 +639,17 @@ class LadderGridStrategy:
                     self.save_state()
                     return  # Exit, next tick will run _handle_init
         
-        # 1. DETECT: Check history for TP/SL and set persistent flags
+        # [FIX] Check TP/SL from MT5 history FIRST (before triggers/reopen)
         await self._check_tp_sl_from_history()
         
-        # 2. MAINTAIN: Check flags and execute reopens (The Fix)
-        self._maintain_reopen_logic(ask, bid)
-        
-        # 3. EXPAND: Check virtual triggers for new grid levels
+        # 1. Check virtual triggers (monitor prices and fire market orders)
         self._check_virtual_triggers(ask, bid)
-
-    
+        
+        # 2. Check for closed positions (TP/SL hit) and re-open
+        await self._check_and_reopen()
     
     async def _update_fill_status(self):
-        """Check MT5 positions and update fill status in pairs - BIDIRECTIONAL SYNC."""
+        """Check MT5 positions and update fill status in pairs."""
         positions = mt5.positions_get(symbol=self.symbol)
         position_map = {}
         if positions:
@@ -648,37 +659,23 @@ class LadderGridStrategy:
                     position_map[idx] = []
                 position_map[idx].append(pos)
         
-        # Update pairs based on actual positions - BIDIRECTIONAL
+        # Update pairs based on actual positions
         for idx, pair in self.pairs.items():
             idx_positions = position_map.get(idx, [])
             
             # Check if we have a buy position for this pair
             buys = [p for p in idx_positions if p.type == mt5.ORDER_TYPE_BUY]
             if buys and not pair.buy_filled:
-                # MT5 has position but we don't know about it - sync
                 pair.buy_filled = True
                 pair.buy_ticket = buys[0].ticket
                 pair.buy_pending_ticket = 0
-            elif not buys and pair.buy_filled:
-                # [FIX] WE think it's filled but MT5 doesn't have it - CLEAR stale state
-                print(f" [SYNC] {self.symbol}: Pair {idx} BUY was marked filled but MT5 has no position - clearing stale state")
-                pair.buy_filled = False
-                pair.buy_ticket = 0
-                pair.buy_in_zone = False  # Reset zone to allow re-trigger
             
             # Check if we have a sell position for this pair
             sells = [p for p in idx_positions if p.type == mt5.ORDER_TYPE_SELL]
             if sells and not pair.sell_filled:
-                # MT5 has position but we don't know about it - sync
                 pair.sell_filled = True
                 pair.sell_ticket = sells[0].ticket
                 pair.sell_pending_ticket = 0
-            elif not sells and pair.sell_filled:
-                # [FIX] WE think it's filled but MT5 doesn't have it - CLEAR stale state
-                print(f" [SYNC] {self.symbol}: Pair {idx} SELL was marked filled but MT5 has no position - clearing stale state")
-                pair.sell_filled = False
-                pair.sell_ticket = 0
-                pair.sell_in_zone = False  # Reset zone to allow re-trigger
     
     async def _check_and_expand(self):
         """
@@ -906,10 +903,11 @@ class LadderGridStrategy:
                 pair.buy_in_zone = False
                 pair.sell_in_zone = False
                 pair.first_fill_direction = ""
+                pair.is_reopened = True  # Mark as reopened to bypass zone checks
                 
                 # [CRITICAL] Reset next_action based on grid direction
-                # Negative grid starts with BUY, Positive grid starts with SELL
-                if pair_idx < 0:
+                # Pair 0 and negative pairs start with BUY, Positive pairs start with SELL
+                if pair_idx <= 0:
                     pair.next_action = "buy"
                 else:
                     pair.next_action = "sell"
@@ -920,17 +918,17 @@ class LadderGridStrategy:
                 if pair.sell_pending_ticket:
                     self._cancel_order(pair.sell_pending_ticket)
                 
-                # Reset TP/SL alignment values for new cycle
-                pair.pair_tp = 0.0
-                pair.pair_sl = 0.0
+                # Re-place triggers for both sides (FLIPPED order types for re-open)
+                pair.buy_pending_ticket = self._place_pending_order(
+                    self._get_reopen_order_type("buy", pair_idx),
+                    pair.buy_price, pair_idx
+                )
+                pair.sell_pending_ticket = self._place_pending_order(
+                    self._get_reopen_order_type("sell", pair_idx),
+                    pair.sell_price, pair_idx
+                )
                 
-                # [CRITICAL] Use _reopen_pair_at_same_level() which handles:
-                # 1. Re-placing pending orders with flipped types
-                # 2. Immediate execution if price is already at trigger level
-                # 3. Chain execution (B[n-1] from S[n], S[n+1] from B[n])
-                self._reopen_pair_at_same_level(pair_idx)
-                
-                print(f"   [PAIR RESET] Pair {pair_idx} fully reset via _reopen_pair_at_same_level().")
+                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
                 self.save_state()
             
             # Update last check time
@@ -940,106 +938,165 @@ class LadderGridStrategy:
             print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
             # Don't crash, just skip this tick
 
-
-    def _maintain_reopen_logic(self, ask: float, bid: float):
+    async def _check_and_reopen(self):
         """
-        Robustly checks persistent reopen flags every tick.
-        Executes Market Orders when price retraces to the target level.
-        Prevents logic from 'disappearing' by retrying until success.
+        Monitor for ANY closed position in a pair. 
+        If detected, Trigger 'Pair Nuclear Reset': Close ALL other positions for that pair immediately.
         """
-        for idx, pair in self.pairs.items():
-            
-            # --- BUY REOPEN LOGIC ---
-            if pair.pending_reopen_buy and not pair.buy_filled:
-                should_fire = False
-                
-                # POSITIVE GRID (Above Center): Retracement is DOWN -> Buy Limit logic
-                if idx >= 0:
-                    # Fire if price is AT or BELOW target (Limit)
-                    if ask <= pair.buy_price + 2.0: 
-                        print(f"[REOPEN] {self.symbol}: Price dropped to B{idx} ({pair.buy_price}) -> FIRING")
-                        should_fire = True
-                
-                # NEGATIVE GRID (Below Center): Retracement is UP -> Buy Stop logic
-                else:
-                    # Fire if price is AT or ABOVE target (Stop)
-                    if ask >= pair.buy_price - 2.0:
-                         print(f"[REOPEN] {self.symbol}: Price rose to B{idx} ({pair.buy_price}) -> FIRING")
-                         should_fire = True
-                
-                if should_fire:
-                    ticket = self._execute_market_order("buy", pair.buy_price, idx)
-                    if ticket:
-                        pair.buy_filled = True
-                        pair.buy_ticket = ticket
-                        pair.pending_reopen_buy = False # SUCCESS: Clear flag
-                        pair.advance_toggle()
-                        self.save_state()
-                        
-                        # FORCE CHAIN: S[N+1] must also fire if it exists
-                        next_idx = idx + 1
-                        if next_idx in self.pairs:
-                            next_pair = self.pairs[next_idx]
-                            if not next_pair.sell_filled:
-                                print(f"[CHAIN] Firing S{next_idx} due to B{idx} Reopen")
-                                self._force_execute_chain("sell", next_idx)
+        # 1. Snapshot Init
+        if not hasattr(self, "_pos_snapshot"):
+            self._pos_snapshot = {}
+            current_positions = mt5.positions_get(symbol=self.symbol)
+            if current_positions:
+                for p in current_positions:
+                    if p.magic >= 50000:
+                        self._pos_snapshot[p.ticket] = {"magic": p.magic, "pair_index": p.magic - 50000}
+            return
 
-            # --- SELL REOPEN LOGIC ---
-            if pair.pending_reopen_sell and not pair.sell_filled:
-                should_fire = False
-                
-                # POSITIVE GRID (Above Center): Retracement is DOWN -> Sell Stop logic
-                if idx >= 0:
-                    # Fire if price is AT or BELOW target (Stop)
-                    if bid <= pair.sell_price + 2.0:
-                        print(f"[REOPEN] {self.symbol}: Price dropped to S{idx} ({pair.sell_price}) -> FIRING")
-                        should_fire = True
-                        
-                # NEGATIVE GRID (Below Center): Retracement is UP -> Sell Limit logic
-                else:
-                    # Fire if price is AT or ABOVE target (Limit)
-                    if bid >= pair.sell_price - 2.0:
-                        print(f"[REOPEN] {self.symbol}: Price rose to S{idx} ({pair.sell_price}) -> FIRING")
-                        should_fire = True
-                        
-                if should_fire:
-                    ticket = self._execute_market_order("sell", pair.sell_price, idx)
-                    if ticket:
-                        pair.sell_filled = True
-                        pair.sell_ticket = ticket
-                        pair.pending_reopen_sell = False # SUCCESS: Clear flag
-                        pair.advance_toggle()
-                        self.save_state()
-                        
-                        # FORCE CHAIN: B[N-1] must also fire if it exists
-                        prev_idx = idx - 1
-                        if prev_idx in self.pairs:
-                            prev_pair = self.pairs[prev_idx]
-                            if not prev_pair.buy_filled:
-                                print(f"[CHAIN] Firing B{prev_idx} due to S{idx} Reopen")
-                                self._force_execute_chain("buy", prev_idx)
+        # 2. Get Current State
+        current_positions = mt5.positions_get(symbol=self.symbol)
+        
+        # [FIX] Safety check: If positions_get returns None (error/disconnect), 
+        # DO NOT assume positions are closed. Abort check this tick.
+        if current_positions is None:
+            # Optional: Print warning only if it persists, to avoid log spam
+            # print(f" {self.symbol}: Connection issue? positions_get returned None.")
+            return
 
-    def _force_execute_chain(self, direction: str, idx: int):
-        """Helper to force execute a chained order immediately."""
-        pair = self.pairs.get(idx)
-        if not pair: return
-        price = pair.buy_price if direction == "buy" else pair.sell_price
+        current_map = {}
+        if current_positions:
+            for p in current_positions:
+                if p.magic >= 50000:
+                    current_map[p.ticket] = {"magic": p.magic, "pair_index": p.magic - 50000}
+
+        # 3. Detect Closed Tickets (In snapshot but not in current)
+        closed_tickets = set(self._pos_snapshot.keys()) - set(current_map.keys())
         
-        # Execute immediately
-        ticket = self._execute_market_order(direction, price, idx)
+        # [FIX] Debounce: Don't trust a single 'missing' signal.
+        # Initialize a counter map if it doesn't exist
+        if not hasattr(self, "_missing_pos_counters"):
+            self._missing_pos_counters = defaultdict(int)
+
+        # Update counters
+        confirmed_closed_tickets = []
         
-        if ticket:
-            if direction == "buy":
-                pair.buy_filled = True
-                pair.buy_ticket = ticket
-                pair.pending_reopen_buy = False # Prevent double fire
-            else:
-                pair.sell_filled = True
-                pair.sell_ticket = ticket
-                pair.pending_reopen_sell = False
+        # Check newly missing tickets
+        for ticket in closed_tickets:
+            self._missing_pos_counters[ticket] += 1
+            # Require 3 consecutive confirmations (approx 0.5-1.5s) to believe it's closed
+            # Require 3 consecutive confirmations (approx 0.5-1.5s) to believe it's closed
+            if self._missing_pos_counters[ticket] >= 3:
+                confirmed_closed_tickets.append(ticket)
+        
+        # Reset counters for tickets that reappeared (false alarm)
+        for ticket in list(self._missing_pos_counters.keys()):
+            if ticket not in closed_tickets:
+                del self._missing_pos_counters[ticket]
+        
+        # 4. Handle Confirmed Closed Tickets
+        for ticket in confirmed_closed_tickets:
+            # [FIX 4] Deduplicate: Skip if already handled by history-based detection
+            if ticket in self.processed_deals:
+                if ticket in self._pos_snapshot:
+                    del self._pos_snapshot[ticket]
+                if ticket in self._missing_pos_counters:
+                    del self._missing_pos_counters[ticket]
+                continue
             
-            pair.advance_toggle()
-            self.save_state()
+            # Get info about the closed ticket from snapshot
+            info = self._pos_snapshot.get(ticket)
+            if not info:
+                continue
+                
+            pair_idx = info['pair_index']
+            pair = self.pairs.get(pair_idx)
+            
+            if pair:
+                print(f" {self.symbol}: Detected TP/SL Close for Position {ticket} (Pair {pair_idx})")
+                
+                # Determine if TP was hit (for leapfrog decision)
+                tp_hit = self._check_if_tp_hit(ticket, "")
+                
+                # Close the other side if open (Nuclear Reset for this pair)
+                if pair.buy_ticket == ticket:
+                    pair.buy_filled = False
+                    pair.buy_ticket = 0
+                    if pair.sell_filled and pair.sell_ticket:
+                        print(f"   [PAIR RESET] Closing opposite Sell {pair.sell_ticket}...")
+                        self._close_position(pair.sell_ticket)
+                        pair.sell_filled = False
+                        pair.sell_ticket = 0
+                
+                elif pair.sell_ticket == ticket:
+                    pair.sell_filled = False
+                    pair.sell_ticket = 0
+                    if pair.buy_filled and pair.buy_ticket:
+                        print(f"   [PAIR RESET] Closing opposite Buy {pair.buy_ticket}...")
+                        self._close_position(pair.buy_ticket)
+                        pair.buy_filled = False
+                        pair.buy_ticket = 0
+                
+                # Reset all pair state
+                pair.buy_in_zone = False
+                pair.sell_in_zone = False
+                pair.first_fill_direction = ""
+                pair.trade_count = 0
+                pair.pair_tp = 0.0
+                pair.pair_sl = 0.0
+                pair.is_reopened = True  # Mark as reopened to bypass zone checks
+                
+                # [FIX 1] Reset next_action based on grid polarity
+                # Pair 0 and negative pairs -> Buy first, Positive Pairs -> Sell first
+                if pair_idx > 0:
+                    pair.next_action = "sell"
+                else:
+                    pair.next_action = "buy"
+                
+                # Remove any existing pending orders
+                if pair.buy_pending_ticket:
+                    self._cancel_order(pair.buy_pending_ticket)
+                if pair.sell_pending_ticket:
+                    self._cancel_order(pair.sell_pending_ticket)
+                
+                # Log the TP/SL event
+                self._log_trade(
+                    event_type="TP_HIT" if tp_hit else "SL_HIT",
+                    pair_index=pair_idx,
+                    direction="BOTH",
+                    price=0, lot_size=0, ticket=ticket,
+                    notes="Pair Reset Triggered"
+                )
+                
+                # [FIX 1] Leapfrog on TP (schedule async to avoid blocking)
+                if tp_hit:
+                    tick = mt5.symbol_info_tick(self.symbol)
+                    if tick:
+                        if tick.bid > pair.buy_price:
+                            untriggered = self._find_furthest_untriggered("up")
+                            if untriggered is not None:
+                                import asyncio
+                                asyncio.create_task(self._do_leapfrog_untriggered_up(untriggered))
+                        elif tick.ask < pair.sell_price:
+                            untriggered = self._find_furthest_untriggered("down")
+                            if untriggered is not None:
+                                import asyncio
+                                asyncio.create_task(self._do_leapfrog_untriggered_down(untriggered))
+                
+                # Re-arm triggers at same levels
+                self._reopen_pair_at_same_level(pair_idx)
+                
+                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
+                self.save_state()
+            
+            # Remove from snapshot and counters
+            if ticket in self._pos_snapshot:
+                del self._pos_snapshot[ticket]
+            if ticket in self._missing_pos_counters:
+                del self._missing_pos_counters[ticket]
+
+
+        # 5. Update Snapshot
+        self._pos_snapshot = current_map
 
     def _check_if_tp_hit(self, ticket: int, direction: str) -> bool:
         """
@@ -1195,85 +1252,102 @@ class LadderGridStrategy:
         # Get current tick to check if we should execute immediately
         tick = mt5.symbol_info_tick(self.symbol)
         
-        # Re-arm buy trigger (with FLIPPED order types for re-open)
+        # Re-arm buy trigger
         pair.buy_pending_ticket = self._place_pending_order(
-            self._get_reopen_order_type("buy", pair_index),
+            self._get_order_type("buy", pair.buy_price),
             pair.buy_price, pair_index
         )
-        # Re-arm sell trigger (with FLIPPED order types for re-open)
+        # Re-arm sell trigger
         pair.sell_pending_ticket = self._place_pending_order(
-            self._get_reopen_order_type("sell", pair_index),
+            self._get_order_type("sell", pair.sell_price),
             pair.sell_price, pair_index
         )
         
-        # [BIDIRECTIONAL FIX] Check BOTH triggers, not just next_action
-        # After TP/SL reset, price may be at either trigger level - check both
-        if tick:
-            # Check BUY trigger (regardless of next_action)
-            if pair_index > 0:
-                buy_triggered = tick.ask >= pair.buy_price
-            elif pair_index < 0:
-                buy_triggered = tick.bid <= pair.buy_price
-            else:  # pair_index == 0
-                buy_triggered = tick.ask >= pair.buy_price
+        # [FIX 3] Check if price is already at trigger level and execute immediately
+        # This prevents the scenario where price is in zone but trigger won't fire
+        # because the zone logic requires price to LEAVE and RETURN
+        if tick and pair.next_action:
+            if pair.next_action == "buy":
+                # Check if price at buy level using grid polarity logic
+                if pair_index > 0:
+                    buy_triggered = tick.ask >= pair.buy_price
+                elif pair_index < 0:
+                    buy_triggered = tick.bid <= pair.buy_price
+                else:  # pair_index == 0
+                    buy_triggered = tick.ask >= pair.buy_price
+                
+                if buy_triggered and not pair.buy_filled:
+                    print(f"[REOPEN] {self.symbol}: Price at BUY level - executing immediately")
+                    ticket = self._execute_market_order("buy", pair.buy_price, pair_index)
+                    if ticket:
+                        pair.buy_filled = True
+                        pair.buy_ticket = ticket
+                        pair.buy_pending_ticket = 0
+                        pair.buy_in_zone = True  # Prevent re-trigger
+                        pair.advance_toggle()
+                        
+                        # [CHAIN FIX] Forward chain: B[n] triggers → S[n+1] must also trigger
+                        # But ONLY if next pair's toggle allows it
+                        next_idx = pair_index + 1
+                        next_pair = self.pairs.get(next_idx)
+                        if next_pair and not next_pair.sell_filled and next_pair.next_action == "sell":
+                            # Check if within max_positions
+                            if next_pair.trade_count < self.max_positions:
+                                # Check if S[next] is at same price as B[current] (chain condition)
+                                price_diff = abs(next_pair.sell_price - pair.buy_price)
+                                if price_diff < 11.0:  # Same tolerance as main chain logic
+                                    print(f"[REOPEN CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{pair_index})")
+                                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                                    if chain_ticket:
+                                        next_pair.sell_filled = True
+                                        next_pair.sell_ticket = chain_ticket
+                                        next_pair.sell_pending_ticket = 0
+                                        next_pair.sell_in_zone = True
+                                        next_pair.is_reopened = True  # Mark chained pair as reopened
+                                        next_pair.advance_toggle()
+                        
+                        return  # Exit after immediate execution
             
-            if buy_triggered and not pair.buy_filled:
-                print(f"[REOPEN] {self.symbol}: Price at BUY level - executing immediately")
-                ticket = self._execute_market_order("buy", pair.buy_price, pair_index)
-                if ticket:
-                    pair.buy_filled = True
-                    pair.buy_ticket = ticket
-                    pair.buy_pending_ticket = 0
-                    pair.buy_in_zone = True  # Prevent re-trigger
-                    pair.advance_toggle()
-                    
-                    # [CHAIN FIX] Forward chain: B[n] triggers → S[n+1] must also trigger
-                    next_idx = pair_index + 1
-                    next_pair = self.pairs.get(next_idx)
-                    if next_pair and not next_pair.sell_filled:
-                        price_diff = abs(next_pair.sell_price - pair.buy_price)
-                        if price_diff < 11.0:
-                            print(f"[REOPEN CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{pair_index})")
-                            chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                            if chain_ticket:
-                                next_pair.sell_filled = True
-                                next_pair.sell_ticket = chain_ticket
-                                next_pair.sell_pending_ticket = 0
-                                next_pair.sell_in_zone = True
-                                next_pair.advance_toggle()
-            
-            # Check SELL trigger (regardless of next_action)
-            if pair_index > 0:
-                sell_triggered = tick.ask >= pair.sell_price
-            elif pair_index < 0:
-                sell_triggered = tick.bid <= pair.sell_price
-            else:  # pair_index == 0
-                sell_triggered = tick.bid <= pair.sell_price
-            
-            if sell_triggered and not pair.sell_filled:
-                print(f"[REOPEN] {self.symbol}: Price at SELL level - executing immediately")
-                ticket = self._execute_market_order("sell", pair.sell_price, pair_index)
-                if ticket:
-                    pair.sell_filled = True
-                    pair.sell_ticket = ticket
-                    pair.sell_pending_ticket = 0
-                    pair.sell_in_zone = True  # Prevent re-trigger
-                    pair.advance_toggle()
-                    
-                    # [CHAIN FIX] Backward chain: S[n] triggers → B[n-1] must also trigger
-                    prev_idx = pair_index - 1
-                    prev_pair = self.pairs.get(prev_idx)
-                    if prev_pair and not prev_pair.buy_filled:
-                        price_diff = abs(prev_pair.buy_price - pair.sell_price)
-                        if price_diff < 11.0:
-                            print(f"[REOPEN CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{pair_index})")
-                            chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                            if chain_ticket:
-                                prev_pair.buy_filled = True
-                                prev_pair.buy_ticket = chain_ticket
-                                prev_pair.buy_pending_ticket = 0
-                                prev_pair.buy_in_zone = True
-                                prev_pair.advance_toggle()
+            elif pair.next_action == "sell":
+                # Check if price at sell level using grid polarity logic
+                if pair_index > 0:
+                    sell_triggered = tick.ask >= pair.sell_price
+                elif pair_index < 0:
+                    sell_triggered = tick.bid <= pair.sell_price
+                else:  # pair_index == 0
+                    sell_triggered = tick.bid <= pair.sell_price
+                
+                if sell_triggered and not pair.sell_filled:
+                    print(f"[REOPEN] {self.symbol}: Price at SELL level - executing immediately")
+                    ticket = self._execute_market_order("sell", pair.sell_price, pair_index)
+                    if ticket:
+                        pair.sell_filled = True
+                        pair.sell_ticket = ticket
+                        pair.sell_pending_ticket = 0
+                        pair.sell_in_zone = True  # Prevent re-trigger
+                        pair.advance_toggle()
+                        
+                        # [CHAIN FIX] Backward chain: S[n] triggers → B[n-1] must also trigger
+                        # But ONLY if prev pair's toggle allows it
+                        prev_idx = pair_index - 1
+                        prev_pair = self.pairs.get(prev_idx)
+                        if prev_pair and not prev_pair.buy_filled and prev_pair.next_action == "buy":
+                            # Check if within max_positions
+                            if prev_pair.trade_count < self.max_positions:
+                                # Check if B[prev] is at same price as S[current] (chain condition)
+                                price_diff = abs(prev_pair.buy_price - pair.sell_price)
+                                if price_diff < 11.0:  # Same tolerance as main chain logic
+                                    print(f"[REOPEN CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{pair_index})")
+                                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                                    if chain_ticket:
+                                        prev_pair.buy_filled = True
+                                        prev_pair.buy_ticket = chain_ticket
+                                        prev_pair.buy_pending_ticket = 0
+                                        prev_pair.buy_in_zone = True
+                                        prev_pair.is_reopened = True  # Mark chained pair as reopened
+                                        prev_pair.advance_toggle()
+                        
+                        return  # Exit after immediate execution
         
         print(f"[REOPEN] {self.symbol}: Pair {pair_index} re-armed at same levels (B@{pair.buy_price:.2f}, S@{pair.sell_price:.2f}) - lot reset to first")
     
@@ -1451,7 +1525,6 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute SELL immediately
-        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
         
         if ticket:
@@ -1522,7 +1595,6 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute BUY immediately
-        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
         
         if ticket:
@@ -1604,7 +1676,6 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute SELL immediately at market
-        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
         
         if ticket:
@@ -1698,7 +1769,6 @@ class LadderGridStrategy:
         self.pairs[new_idx] = new_pair
         
         # Execute BUY immediately at market
-        volume = new_pair.get_next_lot(self.lot_sizes)
         ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
         
         if ticket:
@@ -1922,101 +1992,6 @@ class LadderGridStrategy:
         # The actual ticket will be assigned when the market order fires
         return -(index * 1000 + (1 if "buy" in order_type else 2))
     
-    def _maintain_reopen_logic(self, ask: float, bid: float):
-        """
-        Robustly checks persistent reopen flags every tick.
-        Executes Market Orders when price retraces to the target level.
-        Prevents logic from 'disappearing' by retrying until success.
-        """
-        for idx, pair in self.pairs.items():
-            
-            # --- BUY REOPEN LOGIC ---
-            if pair.pending_reopen_buy and not pair.buy_filled:
-                should_fire = False
-                
-                # POSITIVE GRID (Above Center): Retracement is DOWN
-                # We want to Buy when price drops to level (Limit-like)
-                if idx >= 0:
-                    if ask <= pair.buy_price + 2.0: # Tolerance buffer
-                        print(f"[REOPEN] {self.symbol}: Price dropped to B{idx} ({pair.buy_price}) -> FIRING")
-                        should_fire = True
-                
-                # NEGATIVE GRID (Below Center): Retracement is UP
-                # We want to Buy when price rises to level (Stop-like)
-                else:
-                    if ask >= pair.buy_price - 2.0:
-                         print(f"[REOPEN] {self.symbol}: Price rose to B{idx} ({pair.buy_price}) -> FIRING")
-                         should_fire = True
-                
-                if should_fire:
-                    ticket = self._execute_market_order("buy", pair.buy_price, idx)
-                    if ticket:
-                        pair.buy_filled = True
-                        pair.buy_ticket = ticket
-                        pair.pending_reopen_buy = False # SUCCESS: Clear flag
-                        pair.advance_toggle()
-                        self.save_state()
-                        
-                        # FORCE CHAIN: S[N+1] must also fire if it exists
-                        next_idx = idx + 1
-                        if next_idx in self.pairs:
-                            next_pair = self.pairs[next_idx]
-                            if not next_pair.sell_filled:
-                                print(f"[CHAIN] Firing S{next_idx} due to B{idx} Reopen")
-                                self._force_execute_chain("sell", next_idx)
-
-            # --- SELL REOPEN LOGIC ---
-            if pair.pending_reopen_sell and not pair.sell_filled:
-                should_fire = False
-                
-                # POSITIVE GRID (Above Center): Retracement is DOWN
-                # We want to Sell when price drops to level (Stop-like)
-                if idx >= 0:
-                    if bid <= pair.sell_price + 2.0:
-                        print(f"[REOPEN] {self.symbol}: Price dropped to S{idx} ({pair.sell_price}) -> FIRING")
-                        should_fire = True
-                        
-                # NEGATIVE GRID (Below Center): Retracement is UP
-                # We want to Sell when price rises to level (Limit-like)
-                else:
-                    if bid >= pair.sell_price - 2.0:
-                        print(f"[REOPEN] {self.symbol}: Price rose to S{idx} ({pair.sell_price}) -> FIRING")
-                        should_fire = True
-                        
-                if should_fire:
-                    ticket = self._execute_market_order("sell", pair.sell_price, idx)
-                    if ticket:
-                        pair.sell_filled = True
-                        pair.sell_ticket = ticket
-                        pair.pending_reopen_sell = False # SUCCESS: Clear flag
-                        pair.advance_toggle()
-                        self.save_state()
-                        
-                        # FORCE CHAIN: B[N-1] must also fire if it exists
-                        prev_idx = idx - 1
-                        if prev_idx in self.pairs:
-                            prev_pair = self.pairs[prev_idx]
-                            if not prev_pair.buy_filled:
-                                print(f"[CHAIN] Firing B{prev_idx} due to S{idx} Reopen")
-                                self._force_execute_chain("buy", prev_idx)
-
-    def _force_execute_chain(self, direction: str, idx: int):
-        """Helper to force execute a chained order immediately."""
-        pair = self.pairs.get(idx)
-        if not pair: return
-        price = pair.buy_price if direction == "buy" else pair.sell_price
-        ticket = self._execute_market_order(direction, price, idx)
-        if ticket:
-            if direction == "buy":
-                pair.buy_filled = True
-                pair.buy_ticket = ticket
-                pair.pending_reopen_buy = False # Prevent double fire
-            else:
-                pair.sell_filled = True
-                pair.sell_ticket = ticket
-                pair.pending_reopen_sell = False
-            pair.advance_toggle()
-    
     def _check_virtual_triggers(self, ask: float, bid: float):
         """
         Check triggers and fire market orders.
@@ -2050,7 +2025,13 @@ class LadderGridStrategy:
 
             # Zone ENTRY
             buy_attempt_failed = False
-            if buy_in_zone_now and not pair.buy_in_zone and not pair.buy_filled:
+            # Reopened pairs bypass zone checks - MUST trigger when price reaches level
+            if pair.is_reopened:
+                should_trigger_buy = buy_in_zone_now and pair.next_action == "buy"
+            else:
+                should_trigger_buy = buy_in_zone_now and not pair.buy_in_zone and pair.next_action == "buy"
+            
+            if should_trigger_buy:
                 # LOGIC FIX: Allow trade if under limit OR if completing a pair (odd count)
                 # trade_count is 0-based. 
                 # 0 (New) -> check limit. 
@@ -2065,6 +2046,7 @@ class LadderGridStrategy:
                         pair.buy_filled = True
                         pair.buy_ticket = ticket
                         pair.buy_pending_ticket = 0
+                        pair.is_reopened = False  # Clear reopen flag after first successful trade
                         pair.advance_toggle()
                         # [CRITICAL FIX] FORWARD: Check if next pair exists, if not CREATE it first
                         # Grid structure: S[N] = B[N-1], so when B[N] triggers, S[N+1] should also trigger
@@ -2100,13 +2082,24 @@ class LadderGridStrategy:
                             
                             next_pair = new_pair  # Update reference
                         
-                        # Now execute normal forward chain (if pair exists and SELL not filled)
-                        if next_pair and not next_pair.sell_filled:
-                            # [FIX] Safety Check 1: Verify position doesn't already exist in MT5
+                        # Now execute normal forward chain (if pair exists)
+                        if next_pair:
+                            # [FIX] Check if position ACTUALLY exists in MT5, not just flag
                             existing_pos = mt5.positions_get(ticket=next_pair.sell_ticket) if next_pair.sell_ticket else None
+                            
                             if existing_pos:
+                                # Position actually exists, skip chain
                                 print(f" {self.symbol}: CHAIN SKIP S{next_idx} - already exists (ticket {next_pair.sell_ticket})")
-                            else:
+                            elif next_pair.sell_filled:
+                                # Flag says filled but position doesn't exist - position was closed!
+                                # Reset the flag and allow chaining
+                                print(f" {self.symbol}: S{next_idx} position closed (stale flag), resetting...")
+                                next_pair.sell_filled = False
+                                next_pair.sell_ticket = 0
+                                # Fall through to chain logic below
+                            
+                            # Now chain if not filled
+                            if not next_pair.sell_filled:
                                 # Check price match with increased tolerance
                                 price_diff = abs(next_pair.sell_price - pair.buy_price)
                                 if price_diff < 11.0:
@@ -2157,7 +2150,13 @@ class LadderGridStrategy:
 
             # Zone ENTRY
             sell_attempt_failed = False
-            if sell_in_zone_now and not pair.sell_in_zone and not pair.sell_filled:
+            # Reopened pairs bypass zone checks - MUST trigger when price reaches level
+            if pair.is_reopened:
+                should_trigger_sell = sell_in_zone_now and pair.next_action == "sell"
+            else:
+                should_trigger_sell = sell_in_zone_now and not pair.sell_in_zone and pair.next_action == "sell"
+            
+            if should_trigger_sell:
                 # LOGIC FIX: Allow trade if under limit OR if completing a pair (odd count)
                 is_hedge_trade = (pair.trade_count % 2 != 0)
                 
@@ -2168,6 +2167,7 @@ class LadderGridStrategy:
                         pair.sell_filled = True
                         pair.sell_ticket = ticket
                         pair.sell_pending_ticket = 0
+                        pair.is_reopened = False  # Clear reopen flag after first successful trade
                         pair.advance_toggle()
                         #For downwards expansion 
 
@@ -2206,13 +2206,24 @@ class LadderGridStrategy:
                             
                             prev_pair = new_pair  # Update reference
                         
-                        # Now execute normal backward chain (if pair exists and BUY not filled)
-                        if prev_pair and not prev_pair.buy_filled:
-                            # [FIX] Safety Check 1: Verify position doesn't already exist in MT5
+                        # Now execute normal backward chain (if pair exists)
+                        if prev_pair:
+                            # [FIX] Check if position ACTUALLY exists in MT5, not just flag
                             existing_pos = mt5.positions_get(ticket=prev_pair.buy_ticket) if prev_pair.buy_ticket else None
+                            
                             if existing_pos:
+                                # Position actually exists, skip chain
                                 print(f" {self.symbol}: CHAIN SKIP B{prev_idx} - already exists (ticket {prev_pair.buy_ticket})")
-                            else:
+                            elif prev_pair.buy_filled:
+                                # Flag says filled but position doesn't exist - position was closed!
+                                # Reset the flag and allow chaining
+                                print(f" {self.symbol}: B{prev_idx} position closed (stale flag), resetting...")
+                                prev_pair.buy_filled = False
+                                prev_pair.buy_ticket = 0
+                                # Fall through to chain logic below
+                            
+                            # Now chain if not filled
+                            if not prev_pair.buy_filled:
                                 # Check price match with increased tolerance
                                 price_diff = abs(prev_pair.buy_price - pair.sell_price)
                                 if price_diff < 11.0:
@@ -2648,8 +2659,7 @@ class LadderGridStrategy:
                 # [LOT SIZE] Save trade_count for lot sizing
                 "trade_count": pair.trade_count,
                 "next_action": pair.next_action,
-                "pending_reopen_buy": pair.pending_reopen_buy,
-                "pending_reopen_sell": pair.pending_reopen_sell,
+                "is_reopened": pair.is_reopened,
             }
         
         state = {
@@ -2695,8 +2705,7 @@ class LadderGridStrategy:
                     # [LOT SIZE] Load trade_count for lot sizing
                     trade_count=pair_data.get("trade_count", 0),
                     next_action=pair_data.get("next_action", "buy"),
-                    pending_reopen_buy=pair_data.get("pending_reopen_buy", False),
-                    pending_reopen_sell=pair_data.get("pending_reopen_sell", False),
+                    is_reopened=pair_data.get("is_reopened", False),
                 )
             
             print(f" {self.symbol}: Loaded state. Phase: {self.phase}, Pairs: {len(self.pairs)}")
