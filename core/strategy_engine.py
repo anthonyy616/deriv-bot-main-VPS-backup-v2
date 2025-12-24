@@ -2297,11 +2297,19 @@ class LadderGridStrategy:
         - First trade in a pair: Use UI input to set TP and SL normally
         - Second trade in same pair: Buy TP = Sell SL, Buy SL = Sell TP
         - This ensures both positions share the same exit levels
+        
+        GRID PRICE FIX:
+        - Use the GRID price (passed as 'price' parameter) for TP/SL calculations and logging
+        - This ensures B(n) and S(n) are always exactly 'spread' pips apart
+        - Actual execution happens at market price, but TP/SL reference the grid level
         """
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
             return 0
         
+        # GRID PRICE FIX: Use the grid price for TP/SL calculations
+        # This is the intended price level, not the current market quote
+        grid_price = price
         exec_price = tick.ask if direction == "buy" else tick.bid
         order_type = mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL
         
@@ -2317,15 +2325,16 @@ class LadderGridStrategy:
         pair = self.pairs.get(index)
         
         # Always calculate default TP/SL from UI first
+        # FIX: Use GRID price for TP/SL, not market price
         tp_pips = float(self.config.get(f'{direction}_stop_tp', 20.0))
         sl_pips = float(self.config.get(f'{direction}_stop_sl', 20.0))
         
         if direction == "buy":
-            tp = exec_price + tp_pips
-            sl = exec_price - sl_pips
+            tp = grid_price + tp_pips
+            sl = grid_price - sl_pips
         else:
-            tp = exec_price - tp_pips
-            sl = exec_price + sl_pips
+            tp = grid_price - tp_pips
+            sl = grid_price + sl_pips
         
         # TP/SL ALIGNMENT: On second trade of a cycle, use aligned levels
         # trade_count: 0 (1st), 1 (2nd), 2 (3rd=new 1st), 3 (4th=new 2nd), ...
@@ -2359,18 +2368,18 @@ class LadderGridStrategy:
             "comment": f"L{index}",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_FOK,
-            "deviation": 200  # <-- CHANGED FROM 50 TO 200
+            "deviation": 200
         }
         
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            # Log trade to history
+            # Log trade to history - USE GRID PRICE for correct logging
             self._log_trade(
                 event_type="OPEN",
                 pair_index=index,
                 direction=direction.upper(),
-                price=exec_price,
+                price=grid_price,  # FIX: Log the grid price, not execution price
                 lot_size=volume,
                 ticket=result.order,
                 notes=f"TP={tp:.2f} SL={sl:.2f}"
@@ -2383,13 +2392,13 @@ class LadderGridStrategy:
                 point = symbol_info.point
                 min_dist = max(symbol_info.trade_stops_level * point, 10 * point)
                 
-                # Adjust TP/SL to minimum distance
+                # Adjust TP/SL to minimum distance - use GRID price
                 if direction == "buy":
-                    tp = exec_price + max(tp_pips, min_dist)
-                    sl = exec_price - max(sl_pips, min_dist)
+                    tp = grid_price + max(tp_pips, min_dist)
+                    sl = grid_price - max(sl_pips, min_dist)
                 else:
-                    tp = exec_price - max(tp_pips, min_dist)
-                    sl = exec_price + max(sl_pips, min_dist)
+                    tp = grid_price - max(tp_pips, min_dist)
+                    sl = grid_price + max(sl_pips, min_dist)
                 
                 request["sl"] = float(sl)
                 request["tp"] = float(tp)
@@ -2397,12 +2406,12 @@ class LadderGridStrategy:
                 # Retry with adjusted stops
                 result = mt5.order_send(request)
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    # Log trade to history (adjusted stops)
+                    # Log trade to history (adjusted stops) - use GRID price
                     self._log_trade(
                         event_type="OPEN",
                         pair_index=index,
                         direction=direction.upper(),
-                        price=exec_price,
+                        price=grid_price,  # FIX: Log the grid price
                         lot_size=volume,
                         ticket=result.order,
                         notes=f"TP={tp:.2f} SL={sl:.2f} (adj)"

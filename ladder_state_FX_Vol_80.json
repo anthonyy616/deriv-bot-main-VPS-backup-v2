@@ -1,0 +1,91 @@
+{
+  "phase": "RUNNING",
+  "center_price": 163556.48,
+  "pairs": {
+    "0": {
+      "index": 0,
+      "buy_price": 163556.48,
+      "sell_price": 163356.48,
+      "buy_ticket": 219875949,
+      "sell_ticket": 219875753,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": 0,
+      "sell_pending_ticket": -2,
+      "trade_count": 3,
+      "next_action": "sell",
+      "is_reopened": false
+    },
+    "1": {
+      "index": 1,
+      "buy_price": 163756.48,
+      "sell_price": 163556.48,
+      "buy_ticket": 219871134,
+      "sell_ticket": 219875670,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": -1001,
+      "sell_pending_ticket": -1002,
+      "trade_count": 3,
+      "next_action": "buy",
+      "is_reopened": false
+    },
+    "-1": {
+      "index": -1,
+      "buy_price": 163356.48,
+      "sell_price": 163156.48,
+      "buy_ticket": 219875743,
+      "sell_ticket": 0,
+      "buy_filled": true,
+      "sell_filled": false,
+      "buy_pending_ticket": 999,
+      "sell_pending_ticket": 998,
+      "trade_count": 1,
+      "next_action": "sell",
+      "is_reopened": false
+    },
+    "2": {
+      "index": 2,
+      "buy_price": 163956.48,
+      "sell_price": 163756.48,
+      "buy_ticket": 219875298,
+      "sell_ticket": 219874341,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": -2001,
+      "sell_pending_ticket": -2002,
+      "trade_count": 4,
+      "next_action": "sell",
+      "is_reopened": false
+    },
+    "-2": {
+      "index": -2,
+      "buy_price": 163156.48,
+      "sell_price": 162956.48,
+      "buy_ticket": 0,
+      "sell_ticket": 0,
+      "buy_filled": false,
+      "sell_filled": false,
+      "buy_pending_ticket": 1999,
+      "sell_pending_ticket": 1998,
+      "trade_count": 0,
+      "next_action": "buy",
+      "is_reopened": false
+    },
+    "3": {
+      "index": 3,
+      "buy_price": 164156.48,
+      "sell_price": 163956.48,
+      "buy_ticket": 0,
+      "sell_ticket": 219872588,
+      "buy_filled": false,
+      "sell_filled": true,
+      "buy_pending_ticket": -3001,
+      "sell_pending_ticket": -3002,
+      "trade_count": 1,
+      "next_action": "buy",
+      "is_reopened": false
+    }
+  },
+  "iteration": 1
+}

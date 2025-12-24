@@ -1,0 +1,77 @@
+{
+  "phase": "RUNNING",
+  "center_price": 96891.62,
+  "pairs": {
+    "0": {
+      "index": 0,
+      "buy_price": 96891.62,
+      "sell_price": 96841.62,
+      "buy_ticket": 219870942,
+      "sell_ticket": 0,
+      "buy_filled": true,
+      "sell_filled": false,
+      "buy_pending_ticket": -1,
+      "sell_pending_ticket": -2,
+      "trade_count": 1,
+      "next_action": "sell",
+      "is_reopened": false
+    },
+    "1": {
+      "index": 1,
+      "buy_price": 96941.62,
+      "sell_price": 96891.62,
+      "buy_ticket": 219874488,
+      "sell_ticket": 219872899,
+      "buy_filled": true,
+      "sell_filled": true,
+      "buy_pending_ticket": 0,
+      "sell_pending_ticket": -1002,
+      "trade_count": 4,
+      "next_action": "sell",
+      "is_reopened": false
+    },
+    "-1": {
+      "index": -1,
+      "buy_price": 96841.62,
+      "sell_price": 96791.62,
+      "buy_ticket": 0,
+      "sell_ticket": 0,
+      "buy_filled": false,
+      "sell_filled": false,
+      "buy_pending_ticket": 999,
+      "sell_pending_ticket": 998,
+      "trade_count": 0,
+      "next_action": "buy",
+      "is_reopened": false
+    },
+    "2": {
+      "index": 2,
+      "buy_price": 96991.62,
+      "sell_price": 96941.62,
+      "buy_ticket": 0,
+      "sell_ticket": 219871221,
+      "buy_filled": false,
+      "sell_filled": true,
+      "buy_pending_ticket": -2001,
+      "sell_pending_ticket": -2002,
+      "trade_count": 1,
+      "next_action": "buy",
+      "is_reopened": false
+    },
+    "-2": {
+      "index": -2,
+      "buy_price": 96791.62,
+      "sell_price": 96741.62,
+      "buy_ticket": 0,
+      "sell_ticket": 0,
+      "buy_filled": false,
+      "sell_filled": false,
+      "buy_pending_ticket": 1999,
+      "sell_pending_ticket": 1998,
+      "trade_count": 0,
+      "next_action": "buy",
+      "is_reopened": false
+    }
+  },
+  "iteration": 1
+}
