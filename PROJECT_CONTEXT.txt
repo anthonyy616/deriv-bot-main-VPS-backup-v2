@@ -466,5 +466,122 @@ The separate `buy_lot_index` / `sell_lot_index` was INCORRECT.
 It made BUY always use 0.01 and SELL always start at 0.01 independently.
 This has been reverted to use single `trade_count` per pair.
 
+## Last Updated
+2025-12-24 00:12 - COMPREHENSIVE BUG AUDIT & FIX
 
+### CRITICAL BUGS IDENTIFIED (Dec 24, 2025)
+
+**User Confirmed Requirements:**
+1. max_positions = 5 (hard cap)
+2. Once 5 trades executed on a pair, NO MORE trades until TP/SL resets it
+3. After TP/SL, pair resets to trade_count=0 (lot 0.01)
+4. Reopen uses SAME price levels, just flipped order types
+5. Adjacent chained pairs must execute correctly
+6. Late chain catch-up should respect toggle/max_positions
+
+---
+
+### BUG #1: `get_next_lot()` Uses Modulo - Allows Trades Beyond max_positions
+**Location:** Lines 78-92  
+**Problem:** Uses `self.trade_count % len(lot_sizes)` which wraps around.  
+**Evidence:** Trade #21 shows Pair -2, Lot 0.1, Trade# 5 (cycling after max)  
+**Fix:** Remove modulo. Return None/block if trade_count >= max_positions.
+
+### BUG #2: "Hedge Trade" Bypass Allows Infinite Cycling
+**Location:** Lines 2042-2044, 2172-2174  
+**Problem:** `is_hedge_trade = (pair.trade_count % 2 != 0)` bypasses max_positions check  
+**Evidence:** Trade #5 (odd count) bypasses check, allows Trade #6  
+**Fix:** Remove hedge trade bypass entirely. Hard cap at max_positions.
+
+### BUG #3: Chain Execution Has No `trade_count` Check
+**Location:** Lines 2113-2132, 2246-2265  
+**Problem:** Chains adjacent pairs without checking if they have room  
+**Fix:** Add `trade_count < max_positions` before any chain execution.
+
+### BUG #4: Stale Flag Reset Wipes trade_count During Normal Chain
+**Location:** Lines 2095-2110, 2228-2243  
+**Problem:** Resets trade_count=0 during chain validation, not just after TP/SL  
+**Fix:** Only reset in dedicated TP/SL handler, not during chain stale-flag check.
+
+### BUG #5: `_reopen_pair_at_same_level()` Chain Has No max_positions Guard
+**Location:** Lines 1291-1309, 1332-1350  
+**Problem:** Chains without checking adjacent pair's trade_count  
+**Fix:** Add trade_count < max_positions check.
+
+### BUG #6: Leapfrog Chain Execution Has No max_positions Guard
+**Location:** Lines 1538-1551, 1608-1621, 1689-1702, 1782-1795  
+**Problem:** All 4 leapfrog functions chain without trade_count check  
+**Fix:** Add guards before chain execution in all leapfrog functions.
+
+### BUG #7: Create Pair Functions Skip max_positions Check
+**Location:** Lines 1407-1416, 1477-1486  
+**Problem:** Edge pair chain has no trade_count check  
+**Fix:** Add trade_count < max_positions before edge chain.
+
+### BUG #8: Undefined Variable `volume` in Leapfrog Logging
+**Location:** Lines 1713, 1806  
+**Problem:** `volume` is used but never defined - will cause NameError  
+**Fix:** Calculate volume or use 0.0 placeholder.
+
+### BUG #9: Reopen Order Type Uses Hardcoded Flip Instead of Price Check
+**Location:** Lines 1923-1945  
+**Problem:** Uses pair index to determine order type, not actual price  
+**Fix:** Use `_get_order_type()` which checks current price dynamically.
+
+### BUG #10: Race Condition - Same Pair Executes Multiple Trades Same Tick
+**Evidence:** Logs show same pair with 2 trades at identical timestamp  
+**Problem:** `sell_filled` flag not checked/set fast enough  
+**Fix:** Add per-pair execution guard or early-exit after successful trade.
+
+### BUG #11: Late Chain Catch-Up Missing next_action and max_positions Check
+**Location:** Lines 2296-2335  
+**Problem:** Executes missed chains without verifying toggle state  
+**Fix:** Add next_action and trade_count < max_positions checks.
+
+---
+
+### FIX IMPLEMENTATION PLAN
+
+| Bug | File | Lines | Fix Description |
+|-----|------|-------|-----------------|
+| 1 | strategy_engine.py | 78-92 | Replace modulo with clamping, return None at max |
+| 2 | strategy_engine.py | 2042-2044, 2172-2174 | Remove hedge bypass, hard cap only |
+| 3 | strategy_engine.py | 2113-2132, 2246-2265 | Add trade_count check in chain |
+| 4 | strategy_engine.py | 2095-2110, 2228-2243 | Remove trade_count reset from chain stale-check |
+| 5 | strategy_engine.py | 1291-1309, 1332-1350 | Add trade_count check in reopen chain |
+| 6 | strategy_engine.py | 1538-1551, 1608-1621, 1689-1702, 1782-1795 | Add guards in all 4 leapfrog chains |
+| 7 | strategy_engine.py | 1407-1416, 1477-1486 | Add trade_count check in create pair chain |
+| 8 | strategy_engine.py | 1713, 1806 | Fix undefined volume variable |
+| 9 | strategy_engine.py | 1923-1945 | Use _get_order_type() instead of flip logic |
+| 10 | strategy_engine.py | 2335-2340 | Add volume==None check in _execute_market_order |
+| 11 | strategy_engine.py | 2296-2335 | Add next_action + trade_count checks |
+
+---
+
+### ALL 11 FIXES IMPLEMENTED (Dec 24, 2025)
+
+| Bug | Status | Description |
+|-----|--------|-------------|
+| 1 | ✅ FIXED | get_next_lot() now returns None at max instead of wrapping |
+| 2 | ✅ FIXED | Hedge trade bypass removed - hard cap only |
+| 3 | ✅ FIXED | Chain execution checks trade_count < max_positions |
+| 4 | ✅ FIXED | Stale flag detection no longer resets trade_count |
+| 5 | ✅ VERIFIED | Reopen chain already had max_positions check |
+| 6 | ✅ FIXED | All 4 leapfrog chains have max_positions check |
+| 7 | ✅ FIXED | Create pair chains have max_positions check |
+| 8 | ✅ FIXED | Leapfrog logging uses get_next_lot() instead of undefined volume |
+| 9 | ✅ FIXED | _get_reopen_order_type uses dynamic price check |
+| 10 | ✅ FIXED | _execute_market_order blocks if volume is None |
+| 11 | ✅ FIXED | Late chain catch-up checks next_action and trade_count |
+
+---
+
+### EXPECTED OUTCOME AFTER FIXES
+
+1. **Lot sizes follow sequence**: 0.1 → 0.2 → 0.3 → 0.4 → 0.5 → STOP
+2. **Hard cap enforced**: Once trade_count=5, pair frozen until TP/SL
+3. **TP/SL resets correctly**: trade_count=0, starts fresh
+4. **Chains respect limits**: Adjacent pairs only execute if they have room
+5. **No trades beyond max_positions**: Double-blocked at trigger and execution levels
+6. **Grid stays organized**: Visual chart shows clean ladder pattern
 

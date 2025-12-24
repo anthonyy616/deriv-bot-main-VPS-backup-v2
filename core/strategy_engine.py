@@ -12,6 +12,7 @@ import asyncio
 import time
 import json
 import os
+import threading
 from dataclasses import dataclass, field, asdict
 from typing import Dict, Optional, List, Any
 from collections import defaultdict, deque
@@ -79,17 +80,20 @@ class GridPair:
         """
         Get the next lot size for a trade based on trade_count.
         
-        Lot sizing is SEQUENTIAL per pair:
+        Lot sizing is SEQUENTIAL per pair (NO WRAPPING):
         - 1st trade (trade_count=0) → lot_sizes[0]
         - 2nd trade (trade_count=1) → lot_sizes[1]
-        - 3rd trade (trade_count=2) → lot_sizes[2]
-        - etc. (wraps using modulo)
+        - etc.
+        - After max_positions reached → returns None (blocked)
         """
         if not lot_sizes:
             return 0.01
         
-        idx = self.trade_count % len(lot_sizes)
-        return float(lot_sizes[idx])
+        # HARD CAP: If trade_count >= number of lot sizes, return None to block trade
+        if self.trade_count >= len(lot_sizes):
+            return None
+        
+        return float(lot_sizes[self.trade_count])
     
     def advance_toggle(self):
         """Advance to next action in toggle sequence AND increment trade_count for lot sizing."""
@@ -151,6 +155,11 @@ class LadderGridStrategy:
         
         # --- Persistence ---
         self.state_file = f"ladder_state_{self.symbol.replace(' ', '_')}.json"
+        
+        # --- MUTEX LOCKS (Race Condition Prevention) ---
+        self.execution_lock = threading.Lock()       # Global lock for atomic B[n] + S[n+1] chains
+        self.pair_locks: Dict[int, threading.Lock] = defaultdict(threading.Lock)  # Per-pair locks
+        self.trade_in_progress: Dict[int, bool] = defaultdict(bool)  # Track which pairs are mid-trade
         
         self.load_state()
         
@@ -903,6 +912,8 @@ class LadderGridStrategy:
                 pair.buy_in_zone = False
                 pair.sell_in_zone = False
                 pair.first_fill_direction = ""
+                pair.pair_tp = 0.0  # Clear stale TP/SL alignment
+                pair.pair_sl = 0.0
                 pair.is_reopened = True  # Mark as reopened to bypass zone checks
                 
                 # [CRITICAL] Reset next_action based on grid direction
@@ -1277,36 +1288,10 @@ class LadderGridStrategy:
                     buy_triggered = tick.ask >= pair.buy_price
                 
                 if buy_triggered and not pair.buy_filled:
-                    print(f"[REOPEN] {self.symbol}: Price at BUY level - executing immediately")
-                    ticket = self._execute_market_order("buy", pair.buy_price, pair_index)
-                    if ticket:
-                        pair.buy_filled = True
-                        pair.buy_ticket = ticket
-                        pair.buy_pending_ticket = 0
-                        pair.buy_in_zone = True  # Prevent re-trigger
-                        pair.advance_toggle()
-                        
-                        # [CHAIN FIX] Forward chain: B[n] triggers → S[n+1] must also trigger
-                        # But ONLY if next pair's toggle allows it
-                        next_idx = pair_index + 1
-                        next_pair = self.pairs.get(next_idx)
-                        if next_pair and not next_pair.sell_filled and next_pair.next_action == "sell":
-                            # Check if within max_positions
-                            if next_pair.trade_count < self.max_positions:
-                                # Check if S[next] is at same price as B[current] (chain condition)
-                                price_diff = abs(next_pair.sell_price - pair.buy_price)
-                                if price_diff < 11.0:  # Same tolerance as main chain logic
-                                    print(f"[REOPEN CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{pair_index})")
-                                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                                    if chain_ticket:
-                                        next_pair.sell_filled = True
-                                        next_pair.sell_ticket = chain_ticket
-                                        next_pair.sell_pending_ticket = 0
-                                        next_pair.sell_in_zone = True
-                                        next_pair.is_reopened = True  # Mark chained pair as reopened
-                                        next_pair.advance_toggle()
-                        
-                        return  # Exit after immediate execution
+                    print(f"[REOPEN] {self.symbol}: Price at BUY level - using locked execution")
+                    # Use locked execution to prevent race conditions
+                    if self._execute_trade_with_chain("buy", pair_index):
+                        return  # Exit after successful execution
             
             elif pair.next_action == "sell":
                 # Check if price at sell level using grid polarity logic
@@ -1318,36 +1303,10 @@ class LadderGridStrategy:
                     sell_triggered = tick.bid <= pair.sell_price
                 
                 if sell_triggered and not pair.sell_filled:
-                    print(f"[REOPEN] {self.symbol}: Price at SELL level - executing immediately")
-                    ticket = self._execute_market_order("sell", pair.sell_price, pair_index)
-                    if ticket:
-                        pair.sell_filled = True
-                        pair.sell_ticket = ticket
-                        pair.sell_pending_ticket = 0
-                        pair.sell_in_zone = True  # Prevent re-trigger
-                        pair.advance_toggle()
-                        
-                        # [CHAIN FIX] Backward chain: S[n] triggers → B[n-1] must also trigger
-                        # But ONLY if prev pair's toggle allows it
-                        prev_idx = pair_index - 1
-                        prev_pair = self.pairs.get(prev_idx)
-                        if prev_pair and not prev_pair.buy_filled and prev_pair.next_action == "buy":
-                            # Check if within max_positions
-                            if prev_pair.trade_count < self.max_positions:
-                                # Check if B[prev] is at same price as S[current] (chain condition)
-                                price_diff = abs(prev_pair.buy_price - pair.sell_price)
-                                if price_diff < 11.0:  # Same tolerance as main chain logic
-                                    print(f"[REOPEN CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{pair_index})")
-                                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                                    if chain_ticket:
-                                        prev_pair.buy_filled = True
-                                        prev_pair.buy_ticket = chain_ticket
-                                        prev_pair.buy_pending_ticket = 0
-                                        prev_pair.buy_in_zone = True
-                                        prev_pair.is_reopened = True  # Mark chained pair as reopened
-                                        prev_pair.advance_toggle()
-                        
-                        return  # Exit after immediate execution
+                    print(f"[REOPEN] {self.symbol}: Price at SELL level - using locked execution")
+                    # Use locked execution to prevent race conditions
+                    if self._execute_trade_with_chain("sell", pair_index):
+                        return  # Exit after successful execution
         
         print(f"[REOPEN] {self.symbol}: Pair {pair_index} re-armed at same levels (B@{pair.buy_price:.2f}, S@{pair.sell_price:.2f}) - lot reset to first")
     
@@ -1403,7 +1362,7 @@ class LadderGridStrategy:
             new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
             
             # [FIX #3] Chain: If edge pair's BUY is at same price as new SELL, execute it
-            if not edge_pair.buy_filled:
+            if not edge_pair.buy_filled and edge_pair.trade_count < self.max_positions:
                 if abs(edge_pair.buy_price - new_sell_price) < 1.0:
                     print(f" {self.symbol}: CHAIN B{edge_idx} @ {edge_pair.buy_price:.2f} (from expansion)")
                     chain_ticket = self._execute_market_order("buy", edge_pair.buy_price, edge_idx)
@@ -1473,7 +1432,7 @@ class LadderGridStrategy:
             new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
             
             # [FIX #3] Chain: If edge pair's SELL is at same price as new BUY, execute it
-            if not edge_pair.sell_filled:
+            if not edge_pair.sell_filled and edge_pair.trade_count < self.max_positions:
                 if abs(edge_pair.sell_price - new_buy_price) < 1.0:
                     print(f" {self.symbol}: CHAIN S{edge_idx} @ {edge_pair.sell_price:.2f} (from expansion)")
                     chain_ticket = self._execute_market_order("sell", edge_pair.sell_price, edge_idx)
@@ -1498,67 +1457,69 @@ class LadderGridStrategy:
         - Create new pair at top with SELL immediately at market
         - Set BUY trigger at spread above
         """
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            print(f" {self.symbol}: LEAPFROG UNTRIGGERED UP failed - no tick data")
-            return
-        
-        indices = sorted(self.pairs.keys())
-        max_idx = indices[-1]
-        new_idx = max_idx + 1
-        
-        # Get and remove the untriggered pair
-        untriggered_pair = self.pairs.get(untriggered_idx)
-        if untriggered_pair:
-            self._cancel_pair_orders(untriggered_pair)
-            del self.pairs[untriggered_idx]
-        
-        # Create new pair at top - SELL immediately at market
-        exec_sell_price = tick.bid
-        new_buy_price = exec_sell_price + self.spread
-        
-        new_pair = GridPair(
-            index=new_idx,
-            buy_price=new_buy_price,
-            sell_price=exec_sell_price
-        )
-        self.pairs[new_idx] = new_pair
-        
-        # Execute SELL immediately
-        ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
-        
-        if ticket:
-            new_pair.sell_filled = True
-            new_pair.sell_ticket = ticket
-            new_pair.sell_in_zone = True
-            new_pair.advance_toggle()  # Now next_action = "buy"
+        # Acquire global lock to prevent concurrent leapfrog operations
+        with self.execution_lock:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                print(f" {self.symbol}: LEAPFROG UNTRIGGERED UP failed - no tick data")
+                return
             
-            # [CHAIN FIX] Backward chain: S[new] triggers → B[new-1] must also trigger
-            prev_idx = new_idx - 1
-            prev_pair = self.pairs.get(prev_idx)
-            if prev_pair and not prev_pair.buy_filled:
-                price_diff = abs(prev_pair.buy_price - exec_sell_price)
-                if price_diff < 11.0:
-                    print(f"[LEAPFROG CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{new_idx})")
-                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                    if chain_ticket:
-                        prev_pair.buy_filled = True
-                        prev_pair.buy_ticket = chain_ticket
-                        prev_pair.buy_pending_ticket = 0
-                        prev_pair.buy_in_zone = True
-                        prev_pair.advance_toggle()
+            indices = sorted(self.pairs.keys())
+            max_idx = indices[-1]
+            new_idx = max_idx + 1
             
-            # Arm BUY trigger
-            new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
+            # Get and remove the untriggered pair
+            untriggered_pair = self.pairs.get(untriggered_idx)
+            if untriggered_pair:
+                self._cancel_pair_orders(untriggered_pair)
+                del self.pairs[untriggered_idx]
             
-            print(f" {self.symbol}: LEAPFROG UNTRIGGERED UP | Pair {untriggered_idx} → {new_idx} | SELL@{exec_sell_price:.2f}")
-        else:
-            # Failed - just arm triggers
-            new_pair.sell_pending_ticket = self._place_pending_order("sell_limit", exec_sell_price, new_idx)
-            new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
-        
-        self.print_grid_table()
-        self.save_state()
+            # Create new pair at top - SELL immediately at market
+            exec_sell_price = tick.bid
+            new_buy_price = exec_sell_price + self.spread
+            
+            new_pair = GridPair(
+                index=new_idx,
+                buy_price=new_buy_price,
+                sell_price=exec_sell_price
+            )
+            self.pairs[new_idx] = new_pair
+            
+            # Execute SELL immediately
+            ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
+            
+            if ticket:
+                new_pair.sell_filled = True
+                new_pair.sell_ticket = ticket
+                new_pair.sell_in_zone = True
+                new_pair.advance_toggle()  # Now next_action = "buy"
+                
+                # [CHAIN FIX] Backward chain: S[new] triggers → B[new-1] must also trigger
+                prev_idx = new_idx - 1
+                prev_pair = self.pairs.get(prev_idx)
+                if prev_pair and not prev_pair.buy_filled and prev_pair.trade_count < self.max_positions:
+                    price_diff = abs(prev_pair.buy_price - exec_sell_price)
+                    if price_diff < 11.0:
+                        print(f"[LEAPFROG CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{new_idx})")
+                        chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                        if chain_ticket:
+                            prev_pair.buy_filled = True
+                            prev_pair.buy_ticket = chain_ticket
+                            prev_pair.buy_pending_ticket = 0
+                            prev_pair.buy_in_zone = True
+                            prev_pair.advance_toggle()
+                
+                # Arm BUY trigger
+                new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
+                
+                print(f" {self.symbol}: LEAPFROG UNTRIGGERED UP | Pair {untriggered_idx} -> {new_idx} | SELL@{exec_sell_price:.2f}")
+            else:
+                # Failed - just arm triggers
+                new_pair.sell_pending_ticket = self._place_pending_order("sell_limit", exec_sell_price, new_idx)
+                new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
+            
+            self.print_grid_table()
+            self.save_state()
     
     async def _do_leapfrog_untriggered_down(self, untriggered_idx: int):
         """
@@ -1568,67 +1529,69 @@ class LadderGridStrategy:
         - Create new pair at bottom with BUY immediately at market
         - Set SELL trigger at spread below
         """
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            print(f" {self.symbol}: LEAPFROG UNTRIGGERED DOWN failed - no tick data")
-            return
-        
-        indices = sorted(self.pairs.keys())
-        min_idx = indices[0]
-        new_idx = min_idx - 1
-        
-        # Get and remove the untriggered pair
-        untriggered_pair = self.pairs.get(untriggered_idx)
-        if untriggered_pair:
-            self._cancel_pair_orders(untriggered_pair)
-            del self.pairs[untriggered_idx]
-        
-        # Create new pair at bottom - BUY immediately at market
-        exec_buy_price = tick.ask
-        new_sell_price = exec_buy_price - self.spread
-        
-        new_pair = GridPair(
-            index=new_idx,
-            buy_price=exec_buy_price,
-            sell_price=new_sell_price
-        )
-        self.pairs[new_idx] = new_pair
-        
-        # Execute BUY immediately
-        ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
-        
-        if ticket:
-            new_pair.buy_filled = True
-            new_pair.buy_ticket = ticket
-            new_pair.buy_in_zone = True
-            new_pair.advance_toggle()  # Now next_action = "sell"
+        # Acquire global lock to prevent concurrent leapfrog operations
+        with self.execution_lock:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                print(f" {self.symbol}: LEAPFROG UNTRIGGERED DOWN failed - no tick data")
+                return
             
-            # [CHAIN FIX] Forward chain: B[new] triggers → S[new+1] must also trigger
-            next_idx = new_idx + 1
-            next_pair = self.pairs.get(next_idx)
-            if next_pair and not next_pair.sell_filled:
-                price_diff = abs(next_pair.sell_price - exec_buy_price)
-                if price_diff < 11.0:
-                    print(f"[LEAPFROG CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{new_idx})")
-                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                    if chain_ticket:
-                        next_pair.sell_filled = True
-                        next_pair.sell_ticket = chain_ticket
-                        next_pair.sell_pending_ticket = 0
-                        next_pair.sell_in_zone = True
-                        next_pair.advance_toggle()
+            indices = sorted(self.pairs.keys())
+            min_idx = indices[0]
+            new_idx = min_idx - 1
             
-            # Arm SELL trigger
-            new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
+            # Get and remove the untriggered pair
+            untriggered_pair = self.pairs.get(untriggered_idx)
+            if untriggered_pair:
+                self._cancel_pair_orders(untriggered_pair)
+                del self.pairs[untriggered_idx]
             
-            print(f" {self.symbol}: LEAPFROG UNTRIGGERED DOWN | Pair {untriggered_idx} → {new_idx} | BUY@{exec_buy_price:.2f}")
-        else:
-            # Failed - just arm triggers
-            new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", exec_buy_price, new_idx)
-            new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
-        
-        self.print_grid_table()
-        self.save_state()
+            # Create new pair at bottom - BUY immediately at market
+            exec_buy_price = tick.ask
+            new_sell_price = exec_buy_price - self.spread
+            
+            new_pair = GridPair(
+                index=new_idx,
+                buy_price=exec_buy_price,
+                sell_price=new_sell_price
+            )
+            self.pairs[new_idx] = new_pair
+            
+            # Execute BUY immediately
+            ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
+            
+            if ticket:
+                new_pair.buy_filled = True
+                new_pair.buy_ticket = ticket
+                new_pair.buy_in_zone = True
+                new_pair.advance_toggle()  # Now next_action = "sell"
+                
+                # [CHAIN FIX] Forward chain: B[new] triggers → S[new+1] must also trigger
+                next_idx = new_idx + 1
+                next_pair = self.pairs.get(next_idx)
+                if next_pair and not next_pair.sell_filled and next_pair.trade_count < self.max_positions:
+                    price_diff = abs(next_pair.sell_price - exec_buy_price)
+                    if price_diff < 11.0:
+                        print(f"[LEAPFROG CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{new_idx})")
+                        chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                        if chain_ticket:
+                            next_pair.sell_filled = True
+                            next_pair.sell_ticket = chain_ticket
+                            next_pair.sell_pending_ticket = 0
+                            next_pair.sell_in_zone = True
+                            next_pair.advance_toggle()
+                
+                # Arm SELL trigger
+                new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
+                
+                print(f" {self.symbol}: LEAPFROG UNTRIGGERED DOWN | Pair {untriggered_idx} -> {new_idx} | BUY@{exec_buy_price:.2f}")
+            else:
+                # Failed - just arm triggers
+                new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", exec_buy_price, new_idx)
+                new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
+            
+            self.print_grid_table()
+            self.save_state()
     
     async def _do_leapfrog_up(self):
         """
@@ -1641,87 +1604,89 @@ class LadderGridStrategy:
         
         Toggle: After sell executes, next_action = "buy"
         """
-        if len(self.pairs) < 2:
-            return
-        
-        # Get current market price
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            print(f" {self.symbol}: LEAPFROG UP failed - no tick data")
-            return
+        # Acquire global lock to prevent concurrent leapfrog operations
+        with self.execution_lock:
+            if len(self.pairs) < 2:
+                return
             
-        indices = sorted(self.pairs.keys())
-        min_idx = indices[0]
-        max_idx = indices[-1]
-        
-        new_idx = max_idx + 1
-        
-        bottom_pair = self.pairs[min_idx]
-        
-        # Cancel bottom pair's pending orders and remove it
-        self._cancel_pair_orders(bottom_pair)
-        del self.pairs[min_idx]
-        
-        # SMART LEAPFROG UP:
-        # - Execute SELL immediately at current bid (market price for sells)
-        # - Set BUY trigger at sell_price + spread (above)
-        exec_sell_price = tick.bid
-        new_buy_price = exec_sell_price + self.spread
-        
-        new_pair = GridPair(
-            index=new_idx,
-            buy_price=new_buy_price,
-            sell_price=exec_sell_price
-        )
-        self.pairs[new_idx] = new_pair
-        
-        # Execute SELL immediately at market
-        ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
-        
-        if ticket:
-            new_pair.sell_filled = True
-            new_pair.sell_ticket = ticket
-            new_pair.sell_in_zone = True
-            new_pair.advance_toggle()  # Now next_action = "buy"
+            # Get current market price
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                print(f" {self.symbol}: LEAPFROG UP failed - no tick data")
+                return
+                
+            indices = sorted(self.pairs.keys())
+            min_idx = indices[0]
+            max_idx = indices[-1]
             
-            # [CHAIN FIX] Backward chain: S[new] triggers → B[new-1] must also trigger  
-            prev_idx = new_idx - 1
-            prev_pair = self.pairs.get(prev_idx)
-            if prev_pair and not prev_pair.buy_filled:
-                price_diff = abs(prev_pair.buy_price - exec_sell_price)
-                if price_diff < 11.0:
-                    print(f"[LEAPFROG CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{new_idx})")
-                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                    if chain_ticket:
-                        prev_pair.buy_filled = True
-                        prev_pair.buy_ticket = chain_ticket
-                        prev_pair.buy_pending_ticket = 0
-                        prev_pair.buy_in_zone = True
-                        prev_pair.advance_toggle()
+            new_idx = max_idx + 1
             
-            # Arm BUY trigger at spread above
-            new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
+            bottom_pair = self.pairs[min_idx]
             
-            # Log leapfrog event
-            self._log_trade(
-                event_type="LEAPFROG_UP",
-                pair_index=new_idx,
-                direction="SELL",
-                price=exec_sell_price,
-                lot_size=volume,
-                ticket=ticket,
-                notes=f"Pair {min_idx} → {new_idx} | SELL@MKT, B@{new_buy_price:.2f}"
+            # Cancel bottom pair's pending orders and remove it
+            self._cancel_pair_orders(bottom_pair)
+            del self.pairs[min_idx]
+            
+            # SMART LEAPFROG UP:
+            # - Execute SELL immediately at current bid (market price for sells)
+            # - Set BUY trigger at sell_price + spread (above)
+            exec_sell_price = tick.bid
+            new_buy_price = exec_sell_price + self.spread
+            
+            new_pair = GridPair(
+                index=new_idx,
+                buy_price=new_buy_price,
+                sell_price=exec_sell_price
             )
-        else:
-            # Failed to execute, just set up triggers
-            new_pair.next_action = "sell"
-            new_pair.sell_pending_ticket = self._place_pending_order("sell_limit", exec_sell_price, new_idx)
-            new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
-            print(f" {self.symbol}: LEAPFROG UP sell failed, armed triggers instead")
-        
-        # Print grid table after leapfrog for visualization
-        self.print_grid_table()
-        self.save_state()
+            self.pairs[new_idx] = new_pair
+            
+            # Execute SELL immediately at market
+            ticket = self._execute_market_order("sell", exec_sell_price, new_idx)
+            
+            if ticket:
+                new_pair.sell_filled = True
+                new_pair.sell_ticket = ticket
+                new_pair.sell_in_zone = True
+                new_pair.advance_toggle()  # Now next_action = "buy"
+                
+                # [CHAIN FIX] Backward chain: S[new] triggers → B[new-1] must also trigger  
+                prev_idx = new_idx - 1
+                prev_pair = self.pairs.get(prev_idx)
+                if prev_pair and not prev_pair.buy_filled and prev_pair.trade_count < self.max_positions:
+                    price_diff = abs(prev_pair.buy_price - exec_sell_price)
+                    if price_diff < 11.0:
+                        print(f"[LEAPFROG CHAIN] {self.symbol}: B{prev_idx} @ {prev_pair.buy_price:.2f} (chained from S{new_idx})")
+                        chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                        if chain_ticket:
+                            prev_pair.buy_filled = True
+                            prev_pair.buy_ticket = chain_ticket
+                            prev_pair.buy_pending_ticket = 0
+                            prev_pair.buy_in_zone = True
+                            prev_pair.advance_toggle()
+                
+                # Arm BUY trigger at spread above
+                new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
+                
+                # Log leapfrog event
+                self._log_trade(
+                    event_type="LEAPFROG_UP",
+                    pair_index=new_idx,
+                    direction="SELL",
+                    price=exec_sell_price,
+                    lot_size=new_pair.get_next_lot(self.lot_sizes) or 0.0,
+                    ticket=ticket,
+                    notes=f"Pair {min_idx} -> {new_idx} | SELL@MKT, B@{new_buy_price:.2f}"
+                )
+            else:
+                # Failed to execute, just set up triggers
+                new_pair.next_action = "sell"
+                new_pair.sell_pending_ticket = self._place_pending_order("sell_limit", exec_sell_price, new_idx)
+                new_pair.buy_pending_ticket = self._place_pending_order("buy_stop", new_buy_price, new_idx)
+                print(f" {self.symbol}: LEAPFROG UP sell failed, armed triggers instead")
+            
+            # Print grid table after leapfrog for visualization
+            self.print_grid_table()
+            self.save_state()
     
     async def _do_leapfrog_down(self):
         """
@@ -1734,87 +1699,89 @@ class LadderGridStrategy:
         
         Toggle: After buy executes, next_action = "sell"
         """
-        if len(self.pairs) < 2:
-            return
-        
-        # Get current market price
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            print(f" {self.symbol}: LEAPFROG DOWN failed - no tick data")
-            return
+        # Acquire global lock to prevent concurrent leapfrog operations
+        with self.execution_lock:
+            if len(self.pairs) < 2:
+                return
             
-        indices = sorted(self.pairs.keys())
-        min_idx = indices[0]
-        max_idx = indices[-1]
-        
-        new_idx = min_idx - 1
-        
-        top_pair = self.pairs[max_idx]
-        
-        # Cancel top pair's pending orders and remove it
-        self._cancel_pair_orders(top_pair)
-        del self.pairs[max_idx]
-        
-        # SMART LEAPFROG DOWN:
-        # - Execute BUY immediately at current ask (market price for buys)
-        # - Set SELL trigger at buy_price - spread (below)
-        exec_buy_price = tick.ask
-        new_sell_price = exec_buy_price - self.spread
-        
-        new_pair = GridPair(
-            index=new_idx,
-            buy_price=exec_buy_price,
-            sell_price=new_sell_price
-        )
-        self.pairs[new_idx] = new_pair
-        
-        # Execute BUY immediately at market
-        ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
-        
-        if ticket:
-            new_pair.buy_filled = True
-            new_pair.buy_ticket = ticket
-            new_pair.buy_in_zone = True
-            new_pair.advance_toggle()  # Now next_action = "sell"
+            # Get current market price
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                print(f" {self.symbol}: LEAPFROG DOWN failed - no tick data")
+                return
+                
+            indices = sorted(self.pairs.keys())
+            min_idx = indices[0]
+            max_idx = indices[-1]
             
-            # [CHAIN FIX] Forward chain: B[new] triggers → S[new+1] must also trigger
-            next_idx = new_idx + 1
-            next_pair = self.pairs.get(next_idx)
-            if next_pair and not next_pair.sell_filled:
-                price_diff = abs(next_pair.sell_price - exec_buy_price)
-                if price_diff < 11.0:
-                    print(f"[LEAPFROG CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{new_idx})")
-                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                    if chain_ticket:
-                        next_pair.sell_filled = True
-                        next_pair.sell_ticket = chain_ticket
-                        next_pair.sell_pending_ticket = 0
-                        next_pair.sell_in_zone = True
-                        next_pair.advance_toggle()
+            new_idx = min_idx - 1
             
-            # Arm SELL trigger at spread below
-            new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
+            top_pair = self.pairs[max_idx]
             
-            # Log leapfrog event
-            self._log_trade(
-                event_type="LEAPFROG_DOWN",
-                pair_index=new_idx,
-                direction="BUY",
-                price=exec_buy_price,
-                lot_size=volume,
-                ticket=ticket,
-                notes=f"Pair {max_idx} → {new_idx} | BUY@MKT, S@{new_sell_price:.2f}"
+            # Cancel top pair's pending orders and remove it
+            self._cancel_pair_orders(top_pair)
+            del self.pairs[max_idx]
+            
+            # SMART LEAPFROG DOWN:
+            # - Execute BUY immediately at current ask (market price for buys)
+            # - Set SELL trigger at buy_price - spread (below)
+            exec_buy_price = tick.ask
+            new_sell_price = exec_buy_price - self.spread
+            
+            new_pair = GridPair(
+                index=new_idx,
+                buy_price=exec_buy_price,
+                sell_price=new_sell_price
             )
-        else:
-            # Failed to execute, just set up triggers
-            new_pair.next_action = "buy"
-            new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", exec_buy_price, new_idx)
-            new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
-            print(f" {self.symbol}: LEAPFROG DOWN buy failed, armed triggers instead")
-        
-        # Print grid table after leapfrog for visualization
-        self.print_grid_table()
-        self.save_state()
+            self.pairs[new_idx] = new_pair
+            
+            # Execute BUY immediately at market
+            ticket = self._execute_market_order("buy", exec_buy_price, new_idx)
+            
+            if ticket:
+                new_pair.buy_filled = True
+                new_pair.buy_ticket = ticket
+                new_pair.buy_in_zone = True
+                new_pair.advance_toggle()  # Now next_action = "sell"
+                
+                # [CHAIN FIX] Forward chain: B[new] triggers → S[new+1] must also trigger
+                next_idx = new_idx + 1
+                next_pair = self.pairs.get(next_idx)
+                if next_pair and not next_pair.sell_filled and next_pair.trade_count < self.max_positions:
+                    price_diff = abs(next_pair.sell_price - exec_buy_price)
+                    if price_diff < 11.0:
+                        print(f"[LEAPFROG CHAIN] {self.symbol}: S{next_idx} @ {next_pair.sell_price:.2f} (chained from B{new_idx})")
+                        chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                        if chain_ticket:
+                            next_pair.sell_filled = True
+                            next_pair.sell_ticket = chain_ticket
+                            next_pair.sell_pending_ticket = 0
+                            next_pair.sell_in_zone = True
+                            next_pair.advance_toggle()
+                
+                # Arm SELL trigger at spread below
+                new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
+                
+                # Log leapfrog event
+                self._log_trade(
+                    event_type="LEAPFROG_DOWN",
+                    pair_index=new_idx,
+                    direction="BUY",
+                    price=exec_buy_price,
+                    lot_size=new_pair.get_next_lot(self.lot_sizes) or 0.0,
+                    ticket=ticket,
+                    notes=f"Pair {max_idx} -> {new_idx} | BUY@MKT, S@{new_sell_price:.2f}"
+                )
+            else:
+                # Failed to execute, just set up triggers
+                new_pair.next_action = "buy"
+                new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", exec_buy_price, new_idx)
+                new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, new_idx)
+                print(f" {self.symbol}: LEAPFROG DOWN buy failed, armed triggers instead")
+            
+            # Print grid table after leapfrog for visualization
+            self.print_grid_table()
+            self.save_state()
     
     async def _check_leapfrog(self, ask: float, bid: float):
         """
@@ -1921,26 +1888,26 @@ class LadderGridStrategy:
     def _get_reopen_order_type(self, direction: str, pair_idx: int) -> str:
         """
         Determine order type for RE-OPENED positions after TP/SL hits.
-        FLIPS the order types so pending orders are on opposite side of current price.
+        Uses the SAME order types as initial grid creation based on grid polarity.
         
-        NEGATIVE GRID (idx < 0):
-        - Original: BUY LIMIT + SELL STOP
-        - After TP/SL: BUY STOP + SELL LIMIT (flipped)
+        POSITIVE GRID (idx > 0):
+        - BUY = BUY_STOP (buy above market)
+        - SELL = SELL_LIMIT (sell above market)
         
-        POSITIVE GRID (idx >= 0):
-        - Original: BUY STOP + SELL LIMIT
-        - After TP/SL: BUY LIMIT + SELL STOP (flipped)
+        NEGATIVE GRID (idx <= 0):
+        - BUY = BUY_LIMIT (buy below market)
+        - SELL = SELL_STOP (sell below market)
         """
-        if pair_idx < 0:  # Negative grid
+        if pair_idx > 0:  # Positive grid
             if direction == "buy":
-                return "buy_stop"  # Was buy_limit, now buy_stop
+                return "buy_stop"
             else:
-                return "sell_limit"  # Was sell_stop, now sell_limit
-        else:  # Positive grid (including pair 0)
+                return "sell_limit"
+        else:  # Negative grid (including pair 0)
             if direction == "buy":
-                return "buy_limit"  # Was buy_stop, now buy_limit
+                return "buy_limit"
             else:
-                return "sell_stop"  # Was sell_limit, now sell_stop
+                return "sell_stop"
     
     def _get_filling_mode(self):
         """Get the correct filling mode for this symbol."""
@@ -1970,13 +1937,15 @@ class LadderGridStrategy:
         - 1st trade uses lot_sizes[0]
         - 2nd trade uses lot_sizes[1]
         - etc.
+        
+        Returns None if pair has reached max_positions (trade blocked).
         """
         pair = self.pairs.get(index)
         if not pair:
             # Pair not found, use first lot
             return self.lot_sizes[0] if self.lot_sizes else 0.01
         
-        # Use trade_count based lot sizing
+        # Use trade_count based lot sizing (returns None if at max)
         return pair.get_next_lot(self.lot_sizes)
 
     
@@ -1991,6 +1960,157 @@ class LadderGridStrategy:
         # Return a fake ticket (we use negative numbers to indicate virtual orders)
         # The actual ticket will be assigned when the market order fires
         return -(index * 1000 + (1 if "buy" in order_type else 2))
+    
+    def _position_exists_for_trade(self, pair_idx: int, direction: str) -> bool:
+        """
+        Check MT5 directly to see if a position already exists for this trade.
+        
+        Uses trade_count INDEX (not value) to determine expected lot size.
+        This is more reliable than flags because:
+        - No stale flags after TP/SL
+        - No race conditions
+        - Natural re-trigger support
+        
+        Returns True if position exists with matching lot size for current trade_count.
+        """
+        pair = self.pairs.get(pair_idx)
+        if not pair:
+            return False
+        
+        # Get expected lot size for this trade (based on trade_count index)
+        expected_lot = pair.get_next_lot(self.lot_sizes)
+        if expected_lot is None:
+            return True  # At max positions, block trade
+        
+        # Get all positions for this symbol
+        positions = mt5.positions_get(symbol=self.symbol)
+        if not positions:
+            return False  # No positions exist
+        
+        # Check if any position matches our criteria
+        target_price = pair.buy_price if direction == "buy" else pair.sell_price
+        order_type = 0 if direction == "buy" else 1  # 0=BUY, 1=SELL in MT5
+        
+        for pos in positions:
+            price_match = abs(pos.price_open - target_price) < 2.0  # Within 2.0 tolerance
+            lot_match = abs(pos.volume - expected_lot) < 0.001
+            type_match = pos.type == order_type
+            
+            if price_match and lot_match and type_match:
+                return True  # Position already exists
+        
+        return False  # No matching position found
+    
+    def _execute_trade_with_chain(self, direction: str, pair_idx: int) -> bool:
+        """
+        ATOMIC TRADE EXECUTION: Execute B[n] + S[n+1] or S[n] + B[n-1] as a single locked operation.
+        
+        Uses MT5 position check instead of flags to determine if trade should execute.
+        This prevents race conditions while allowing natural re-triggers after TP/SL.
+        
+        Returns True if trade executed, False if skipped.
+        """
+        pair = self.pairs.get(pair_idx)
+        if not pair:
+            return False
+        
+        # Check if this pair is already being traded (early exit without lock)
+        if self.trade_in_progress.get(pair_idx, False):
+            return False
+        
+        # Acquire global execution lock for atomic chain execution
+        with self.execution_lock:
+            # Double-check after acquiring lock
+            if self.trade_in_progress.get(pair_idx, False):
+                return False
+            
+            # Mark this pair as in-progress
+            self.trade_in_progress[pair_idx] = True
+            
+            try:
+                # CHECK 1: Toggle state (buy/sell alternation)
+                if pair.next_action != direction:
+                    return False
+                
+                # CHECK 2: Max positions hard cap
+                if pair.trade_count >= self.max_positions:
+                    return False
+                
+                # CHECK 3: Filled flag check (primary - fast)
+                filled_flag = pair.buy_filled if direction == "buy" else pair.sell_filled
+                if filled_flag:
+                    return False
+                
+                # CHECK 4: MT5 position check (backup - for stale flag detection)
+                # Only runs if flag says not filled, but checks MT5 in case flag is stale
+                if self._position_exists_for_trade(pair_idx, direction):
+                    # Position exists in MT5 but flag was wrong - fix the flag
+                    if direction == "buy":
+                        pair.buy_filled = True
+                    else:
+                        pair.sell_filled = True
+                    return False
+                
+                # All checks passed - execute the trade
+                price = pair.buy_price if direction == "buy" else pair.sell_price
+                print(f" {self.symbol}: {direction.upper()} @ Pair {pair_idx} ({price:.2f}) [LOCKED]")
+                ticket = self._execute_market_order(direction, price, pair_idx)
+                
+                if not ticket:
+                    print(f" {self.symbol}: {direction.upper()} failed for Pair {pair_idx}")
+                    return False
+                
+                # Update pair state
+                if direction == "buy":
+                    pair.buy_filled = True
+                    pair.buy_ticket = ticket
+                    pair.buy_pending_ticket = 0
+                else:
+                    pair.sell_filled = True
+                    pair.sell_ticket = ticket
+                    pair.sell_pending_ticket = 0
+                
+                pair.is_reopened = False
+                pair.advance_toggle()
+                
+                # --- CHAIN EXECUTION (within same lock) ---
+                if direction == "buy":
+                    # Forward chain: B[n] -> S[n+1]
+                    next_idx = pair_idx + 1
+                    next_pair = self.pairs.get(next_idx)
+                    # CHECK FLAGS FIRST (primary), then max_positions
+                    if next_pair and not next_pair.sell_filled and next_pair.trade_count < self.max_positions:
+                        price_diff = abs(next_pair.sell_price - pair.buy_price)
+                        if price_diff < 11.0:
+                            print(f" {self.symbol}: CHAIN S{next_idx} @ {next_pair.sell_price:.2f} [LOCKED]")
+                            chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
+                            if chain_ticket:
+                                next_pair.sell_filled = True
+                                next_pair.sell_ticket = chain_ticket
+                                next_pair.sell_pending_ticket = 0
+                                next_pair.advance_toggle()
+                else:
+                    # Backward chain: S[n] -> B[n-1]
+                    prev_idx = pair_idx - 1
+                    prev_pair = self.pairs.get(prev_idx)
+                    # CHECK FLAGS FIRST (primary), then max_positions
+                    if prev_pair and not prev_pair.buy_filled and prev_pair.trade_count < self.max_positions:
+                        price_diff = abs(prev_pair.buy_price - pair.sell_price)
+                        if price_diff < 11.0:
+                            print(f" {self.symbol}: CHAIN B{prev_idx} @ {prev_pair.buy_price:.2f} [LOCKED]")
+                            chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
+                            if chain_ticket:
+                                prev_pair.buy_filled = True
+                                prev_pair.buy_ticket = chain_ticket
+                                prev_pair.buy_pending_ticket = 0
+                                prev_pair.advance_toggle()
+                
+                self.save_state()
+                return True
+                
+            finally:
+                # Always clear in-progress flag
+                self.trade_in_progress[pair_idx] = False
     
     def _check_virtual_triggers(self, ask: float, bid: float):
         """
@@ -2032,101 +2152,15 @@ class LadderGridStrategy:
                 should_trigger_buy = buy_in_zone_now and not pair.buy_in_zone and pair.next_action == "buy"
             
             if should_trigger_buy:
-                # LOGIC FIX: Allow trade if under limit OR if completing a pair (odd count)
-                # trade_count is 0-based. 
-                # 0 (New) -> check limit. 
-                # 1 (Hedge) -> ALWAYS ALLOW. 
-                # 2 (New) -> check limit.
-                is_hedge_trade = (pair.trade_count % 2 != 0)
-                
-                if is_hedge_trade or (pair.trade_count < self.max_positions):
-                    print(f" {self.symbol}: BUY @ Pair {idx} ({pair.buy_price:.2f})")
-                    ticket = self._execute_market_order("buy", pair.buy_price, idx)
-                    if ticket:
-                        pair.buy_filled = True
-                        pair.buy_ticket = ticket
-                        pair.buy_pending_ticket = 0
-                        pair.is_reopened = False  # Clear reopen flag after first successful trade
-                        pair.advance_toggle()
-                        # [CRITICAL FIX] FORWARD: Check if next pair exists, if not CREATE it first
-                        # Grid structure: S[N] = B[N-1], so when B[N] triggers, S[N+1] should also trigger
-                        next_idx = idx + 1
-                        next_pair = self.pairs.get(next_idx)
-                        
-                        # If next pair doesn't exist, we need to expand the grid upward
-                        if not next_pair:
-                            print(f" {self.symbol}: B{idx} triggered, but S{next_idx} doesn't exist. Creating Pair {next_idx}...")
-                            # Create new pair above
-                            new_sell_price = pair.buy_price  # S[next_idx] = B[idx]
-                            new_buy_price = new_sell_price + self.spread
-                            
-                            new_pair = GridPair(
-                                index=next_idx,
-                                buy_price=new_buy_price,
-                                sell_price=new_sell_price
-                            )
-                            new_pair.next_action = "sell"
-                            self.pairs[next_idx] = new_pair
-                            
-                            # Execute SELL immediately at market
-                            print(f" {self.symbol}: Executing S{next_idx} @ {new_sell_price:.2f} (expansion + chain)")
-                            chain_ticket = self._execute_market_order("sell", new_sell_price, next_idx)
-                            if chain_ticket:
-                                new_pair.sell_filled = True
-                                new_pair.sell_ticket = chain_ticket
-                                new_pair.sell_in_zone = True
-                                new_pair.advance_toggle()
-                                # Arm BUY trigger for this new pair
-                                new_pair.buy_pending_ticket = self._place_pending_order("buy_limit", new_buy_price, next_idx)
-                                print(f" {self.symbol}: Pair {next_idx} created with S filled, B pending @ {new_buy_price:.2f}")
-                            
-                            next_pair = new_pair  # Update reference
-                        
-                        # Now execute normal forward chain (if pair exists)
-                        if next_pair:
-                            # [FIX] Check if position ACTUALLY exists in MT5, not just flag
-                            existing_pos = mt5.positions_get(ticket=next_pair.sell_ticket) if next_pair.sell_ticket else None
-                            
-                            if existing_pos:
-                                # Position actually exists, skip chain
-                                print(f" {self.symbol}: CHAIN SKIP S{next_idx} - already exists (ticket {next_pair.sell_ticket})")
-                            elif next_pair.sell_filled:
-                                # Flag says filled but position doesn't exist - position was closed!
-                                # Reset the flag and allow chaining
-                                print(f" {self.symbol}: S{next_idx} position closed (stale flag), resetting...")
-                                next_pair.sell_filled = False
-                                next_pair.sell_ticket = 0
-                                # Fall through to chain logic below
-                            
-                            # Now chain if not filled
-                            if not next_pair.sell_filled:
-                                # Check price match with increased tolerance
-                                price_diff = abs(next_pair.sell_price - pair.buy_price)
-                                if price_diff < 11.0:
-                                    print(f" {self.symbol}: CHAIN S{next_idx} @ {next_pair.sell_price:.2f} (diff: {price_diff:.2f})")
-                                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                                    if chain_ticket:
-                                        next_pair.sell_filled = True
-                                        next_pair.sell_ticket = chain_ticket
-                                        next_pair.sell_pending_ticket = 0
-                                        next_pair.advance_toggle()
-                                else:
-                                    # Beyond tolerance but entry was missed - execute at market anyway
-                                    print(f" {self.symbol}: CHAIN S{next_idx} @ MARKET (diff {price_diff:.2f} > 11.0)")
-                                    chain_ticket = self._execute_market_order("sell", next_pair.sell_price, next_idx)
-                                    if chain_ticket:
-                                        next_pair.sell_filled = True
-                                        next_pair.sell_ticket = chain_ticket
-                                        next_pair.sell_pending_ticket = 0
-                                        next_pair.advance_toggle()
-                        
-                        # Expand Grid Up (legacy check - should mostly be handled above now)
+                # HARD CAP: Only allow trade if under max_positions limit
+                if pair.trade_count < self.max_positions:
+                    # Use LOCKED execution to prevent race conditions
+                    if self._execute_trade_with_chain("buy", idx):
+                        # Trade executed successfully - check for grid expansion
                         indices = sorted(self.pairs.keys())
                         if idx == indices[-1] and idx >= 0:
                             self._create_next_positive_pair(idx)
-                        self.save_state()
                     else:
-                        print(f" {self.symbol}: Buy failed for Pair {idx}, retrying next tick...")
                         buy_attempt_failed = True
                 else:
                     # Only latch if we are strictly blocked by logic, not failure
@@ -2157,100 +2191,15 @@ class LadderGridStrategy:
                 should_trigger_sell = sell_in_zone_now and not pair.sell_in_zone and pair.next_action == "sell"
             
             if should_trigger_sell:
-                # LOGIC FIX: Allow trade if under limit OR if completing a pair (odd count)
-                is_hedge_trade = (pair.trade_count % 2 != 0)
-                
-                if is_hedge_trade or (pair.trade_count < self.max_positions):
-                    print(f" {self.symbol}: SELL @ Pair {idx} ({pair.sell_price:.2f})")
-                    ticket = self._execute_market_order("sell", pair.sell_price, idx)
-                    if ticket:
-                        pair.sell_filled = True
-                        pair.sell_ticket = ticket
-                        pair.sell_pending_ticket = 0
-                        pair.is_reopened = False  # Clear reopen flag after first successful trade
-                        pair.advance_toggle()
-                        #For downwards expansion 
-
-                        # [CRITICAL FIX] BACKWARD: Check if previous pair exists, if not CREATE it first
-                        # Grid structure: S[N] = B[N-1], so when S[N] triggers, B[N-1] should also trigger
-                        prev_idx = idx - 1
-                        prev_pair = self.pairs.get(prev_idx)
-                        
-                        # If previous pair doesn't exist, we need to expand the grid downward
-                        if not prev_pair:
-                            print(f" {self.symbol}: S{idx} triggered, but B{prev_idx} doesn't exist. Creating Pair {prev_idx}...")
-                            # Create new pair below
-                            new_buy_price = pair.sell_price  # B[prev_idx] = S[idx]
-                            new_sell_price = new_buy_price - self.spread
-                            
-                            new_pair = GridPair(
-                                index=prev_idx,
-                                buy_price=new_buy_price,
-                                sell_price=new_sell_price
-                            )
-                            new_pair.next_action = "buy"
-                            self.pairs[prev_idx] = new_pair
-                            
-                            # Execute BUY immediately at market
-                            print(f" {self.symbol}: Executing B{prev_idx} @ {new_buy_price:.2f} (expansion + chain)")
-                            chain_ticket = self._execute_market_order("buy", new_buy_price, prev_idx)
-                            if chain_ticket:
-                                new_pair.buy_filled = True
-                                new_pair.buy_ticket = chain_ticket
-                                new_pair.buy_in_zone = True
-                                new_pair.advance_toggle()
-                                
-                                # Arm SELL trigger for this new pair
-                                new_pair.sell_pending_ticket = self._place_pending_order("sell_stop", new_sell_price, prev_idx)
-                                print(f" {self.symbol}: Pair {prev_idx} created with B filled, S pending @ {new_sell_price:.2f}")
-                            
-                            prev_pair = new_pair  # Update reference
-                        
-                        # Now execute normal backward chain (if pair exists)
-                        if prev_pair:
-                            # [FIX] Check if position ACTUALLY exists in MT5, not just flag
-                            existing_pos = mt5.positions_get(ticket=prev_pair.buy_ticket) if prev_pair.buy_ticket else None
-                            
-                            if existing_pos:
-                                # Position actually exists, skip chain
-                                print(f" {self.symbol}: CHAIN SKIP B{prev_idx} - already exists (ticket {prev_pair.buy_ticket})")
-                            elif prev_pair.buy_filled:
-                                # Flag says filled but position doesn't exist - position was closed!
-                                # Reset the flag and allow chaining
-                                print(f" {self.symbol}: B{prev_idx} position closed (stale flag), resetting...")
-                                prev_pair.buy_filled = False
-                                prev_pair.buy_ticket = 0
-                                # Fall through to chain logic below
-                            
-                            # Now chain if not filled
-                            if not prev_pair.buy_filled:
-                                # Check price match with increased tolerance
-                                price_diff = abs(prev_pair.buy_price - pair.sell_price)
-                                if price_diff < 11.0:
-                                    print(f" {self.symbol}: CHAIN B{prev_idx} @ {prev_pair.buy_price:.2f} (diff: {price_diff:.2f})")
-                                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                                    if chain_ticket:
-                                        prev_pair.buy_filled = True
-                                        prev_pair.buy_ticket = chain_ticket
-                                        prev_pair.buy_pending_ticket = 0
-                                        prev_pair.advance_toggle()
-                                else:
-                                    # Beyond tolerance but entry was missed - execute at market anyway
-                                    print(f" {self.symbol}: CHAIN B{prev_idx} @ MARKET (diff {price_diff:.2f} > 11.0)")
-                                    chain_ticket = self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
-                                    if chain_ticket:
-                                        prev_pair.buy_filled = True
-                                        prev_pair.buy_ticket = chain_ticket
-                                        prev_pair.buy_pending_ticket = 0
-                                        prev_pair.advance_toggle()
-                        
-                        # Expand Grid Down (legacy check - should mostly be handled above now)
+                # HARD CAP: Only allow trade if under max_positions limit
+                if pair.trade_count < self.max_positions:
+                    # Use LOCKED execution to prevent race conditions
+                    if self._execute_trade_with_chain("sell", idx):
+                        # Trade executed successfully - check for grid expansion
                         indices = sorted(self.pairs.keys())
                         if idx == indices[0] and idx <= 0:
                             self._create_next_negative_pair(idx)
-                        self.save_state()
                     else:
-                        print(f" {self.symbol}: Sell failed for Pair {idx}, retrying next tick...")
                         sell_attempt_failed = True
                 else:
                     pair.sell_in_zone = True
@@ -2272,8 +2221,12 @@ class LadderGridStrategy:
                 if not check_pair:
                     continue
                 
+                # Skip if trade already in progress for this pair (mutex check)
+                if self.trade_in_progress.get(check_idx, False):
+                    continue
+                
                 # Check if BUY side should have chained but didn't
-                if not check_pair.buy_filled:
+                if not check_pair.buy_filled and check_pair.next_action == "buy" and check_pair.trade_count < self.max_positions:
                     prev_idx = check_idx - 1
                     prev_pair = self.pairs.get(prev_idx)
                     if prev_pair and prev_pair.sell_filled:
@@ -2284,17 +2237,12 @@ class LadderGridStrategy:
                             # Safety Check 3: Price freshness - only execute if current price is within tolerance
                             current_price_diff = abs(tick.ask - check_pair.buy_price)
                             if current_price_diff < 7.0:
-                                print(f" {self.symbol}: LATE CHAIN B{check_idx} @ {check_pair.buy_price:.2f} (missed earlier)")
-                                chain_ticket = self._execute_market_order("buy", check_pair.buy_price, check_idx)
-                                if chain_ticket:
-                                    check_pair.buy_filled = True
-                                    check_pair.buy_ticket = chain_ticket
-                                    check_pair.buy_pending_ticket = 0
-                                    check_pair.advance_toggle()
-                                    self.save_state()
+                                # Use locked execution
+                                print(f" {self.symbol}: LATE CHAIN B{check_idx} @ {check_pair.buy_price:.2f} [LOCKED]")
+                                self._execute_trade_with_chain("buy", check_idx)
                 
                 # Check if SELL side should have chained but didn't
-                if not check_pair.sell_filled:
+                if not check_pair.sell_filled and check_pair.next_action == "sell" and check_pair.trade_count < self.max_positions:
                     next_idx = check_idx + 1
                     next_pair = self.pairs.get(next_idx)
                     if next_pair and next_pair.buy_filled:
@@ -2305,14 +2253,9 @@ class LadderGridStrategy:
                             # Safety Check 3: Price freshness - only execute if current price is within tolerance
                             current_price_diff = abs(tick.bid - check_pair.sell_price)
                             if current_price_diff < 7.0:
-                                print(f" {self.symbol}: LATE CHAIN S{check_idx} @ {check_pair.sell_price:.2f} (missed earlier)")
-                                chain_ticket = self._execute_market_order("sell", check_pair.sell_price, check_idx)
-                                if chain_ticket:
-                                    check_pair.sell_filled = True
-                                    check_pair.sell_ticket = chain_ticket
-                                    check_pair.sell_pending_ticket = 0
-                                    check_pair.advance_toggle()
-                                    self.save_state()
+                                # Use locked execution
+                                print(f" {self.symbol}: LATE CHAIN S{check_idx} @ {check_pair.sell_price:.2f} [LOCKED]")
+                                self._execute_trade_with_chain("sell", check_idx)
 
     def _execute_market_order(self, direction: str, price: float, index: int) -> int:
         """Execute a market order and return the position ticket.
@@ -2331,6 +2274,11 @@ class LadderGridStrategy:
         
         # Get volume based on pair section and fill order
         volume = self._get_lot_size(index, direction)
+        
+        # HARD CAP: If volume is None, pair has reached max_positions - block trade
+        if volume is None:
+            print(f" {self.symbol}: BLOCKED {direction.upper()} @ Pair {index} - max_positions reached")
+            return 0
         
         # Get the pair to check if TP/SL levels are already set
         pair = self.pairs.get(index)
