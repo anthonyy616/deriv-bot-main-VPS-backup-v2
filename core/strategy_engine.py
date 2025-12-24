@@ -402,6 +402,47 @@ class LadderGridStrategy:
         return int(self.config.get('max_positions', 5))
     
     # ========================================================================
+    # PRICE-ANCHORED PAIR INDEX CALCULATION
+    # ========================================================================
+    
+    def _calculate_pair_index_from_price(self, price: float, direction: str) -> int:
+        """
+        Calculate the correct pair index from price using center_price as anchor.
+        
+        PRICE IS THE SINGLE SOURCE OF TRUTH FOR PAIR INDEX.
+        
+        This method ensures that every position's pair index is derived from its
+        execution price, not from mutable state. This prevents pair mislabeling
+        after TP/SL re-entry.
+        
+        Grid structure:
+        - B(n) is at center_price + (n * spread)
+        - S(n) is at B(n) - spread = center_price + (n * spread) - spread
+        
+        Args:
+            price: The execution/trigger price
+            direction: "buy" or "sell"
+        
+        Returns:
+            The correct pair index based on price position in the grid
+        """
+        if self.center_price == 0.0:
+            return 0  # No anchor yet, return 0 for initial pair
+        
+        if direction == "buy":
+            # Buy price directly maps to pair index
+            # pair_idx = (buy_price - center_price) / spread
+            pair_idx = round((price - self.center_price) / self.spread)
+        else:
+            # Sell price is one spread below the buy price at the same pair level
+            # So: sell_price = center_price + (pair_idx * spread) - spread
+            # Rearranging: pair_idx = (sell_price + spread - center_price) / spread
+            #                       = (sell_price - center_price) / spread + 1
+            pair_idx = round((price - self.center_price) / self.spread) + 1
+        
+        return int(pair_idx)
+    
+    # ========================================================================
     # LIFECYCLE
     # ========================================================================
     
@@ -2034,12 +2075,12 @@ class LadderGridStrategy:
                 if positions:
                     pair_positions = [p for p in positions if p.magic == 50000 + pair_idx]
                 
-                # If NO positions exist for this pair, reset trade_count to 0
+                # If NO positions exist for this pair, log it (but do NOT reset trade_count here)
+                # NOTE: trade_count reset is ONLY handled by _check_tp_sl_from_history
                 if not pair_positions:
-                    pair.trade_count = 0
-                    print(f" {self.symbol}: Pair {pair_idx} has NO active positions, reset trade_count to 0")
+                    print(f" {self.symbol}: Pair {pair_idx} has NO active positions (trade_count={pair.trade_count})")
                 else:
-                    print(f" {self.symbol}: Pair {pair_idx} has {len(pair_positions)} active positions, trade_count stays at {pair.trade_count}")
+                    print(f" {self.symbol}: Pair {pair_idx} has {len(pair_positions)} active positions, trade_count={pair.trade_count}")
                 # ============================================
                 
                 # Execute the trade
@@ -2094,6 +2135,10 @@ class LadderGridStrategy:
                                     next_pair.sell_pending_ticket = 0
                                     next_pair.record_position_open(chain_ticket)
                                     next_pair.advance_toggle()
+                                    # FIX: Set zone flags to prevent immediate B[n+1] trigger
+                                    # Price must EXIT the zone first before next trigger can fire
+                                    next_pair.sell_in_zone = True
+                                    next_pair.buy_in_zone = True
                         else:
                             print(f" {self.symbol}: Skipping chain to S{next_idx} - {len(next_positions)} active positions exist")
                         # ============================================
@@ -2121,8 +2166,12 @@ class LadderGridStrategy:
                                     next_pair.buy_pending_ticket = 0
                                     next_pair.record_position_open(chain_ticket)
                                     next_pair.advance_toggle()
+                                    # FIX: Set zone flags to prevent immediate S[n+1] trigger
+                                    # Price must EXIT the zone first before next trigger can fire
+                                    next_pair.buy_in_zone = True
+                                    next_pair.sell_in_zone = True
                         else:
-                            print(f" {self.symbol}: Skipping chain to B{prev_idx} - {len(prev_positions)} active positions exist")
+                            print(f" {self.symbol}: Skipping chain to B{next_idx} - {len(next_positions)} active positions exist")
                         # ============================================
                 
                 self.save_state()
@@ -2167,8 +2216,12 @@ class LadderGridStrategy:
             # Zone ENTRY
             buy_attempt_failed = False
 
-            # SIMPLE LOGIC: Always trigger if price in zone and it's the pair's turn
-            should_trigger_buy = buy_in_zone_now and pair.next_action == "buy"
+            # FIX: Match SELL trigger logic - only trigger on zone ENTRY (not already in zone)
+            # Reopened pairs bypass zone checks - MUST trigger when price reaches level
+            if pair.is_reopened:
+                should_trigger_buy = buy_in_zone_now and pair.next_action == "buy"
+            else:
+                should_trigger_buy = buy_in_zone_now and not pair.buy_in_zone and pair.next_action == "buy"
             
             if should_trigger_buy:
                 # HARD CAP: Only allow trade if under max_positions limit
@@ -2374,12 +2427,12 @@ class LadderGridStrategy:
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            # Log trade to history - USE GRID PRICE for correct logging
+            # Log trade to history
             self._log_trade(
                 event_type="OPEN",
                 pair_index=index,
                 direction=direction.upper(),
-                price=grid_price,  # FIX: Log the grid price, not execution price
+                price=exec_price,
                 lot_size=volume,
                 ticket=result.order,
                 notes=f"TP={tp:.2f} SL={sl:.2f}"
@@ -2406,12 +2459,12 @@ class LadderGridStrategy:
                 # Retry with adjusted stops
                 result = mt5.order_send(request)
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    # Log trade to history (adjusted stops) - use GRID price
+                    # Log trade to history (adjusted stops)
                     self._log_trade(
                         event_type="OPEN",
                         pair_index=index,
                         direction=direction.upper(),
-                        price=grid_price,  # FIX: Log the grid price
+                        price=exec_price,
                         lot_size=volume,
                         ticket=result.order,
                         notes=f"TP={tp:.2f} SL={sl:.2f} (adj)"

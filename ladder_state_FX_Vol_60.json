@@ -1,16 +1,16 @@
 {
   "phase": "RUNNING",
-  "center_price": 45058.89,
+  "center_price": 44707.74,
   "pairs": {
     "0": {
       "index": 0,
-      "buy_price": 45058.89,
-      "sell_price": 44988.89,
-      "buy_ticket": 219870944,
+      "buy_price": 44707.74,
+      "sell_price": 44637.74,
+      "buy_ticket": 220040465,
       "sell_ticket": 0,
       "buy_filled": true,
       "sell_filled": false,
-      "buy_pending_ticket": -1,
+      "buy_pending_ticket": 0,
       "sell_pending_ticket": -2,
       "trade_count": 1,
       "next_action": "sell",
@@ -18,22 +18,22 @@
     },
     "1": {
       "index": 1,
-      "buy_price": 45128.89,
-      "sell_price": 45058.89,
-      "buy_ticket": 219876371,
-      "sell_ticket": 219875385,
-      "buy_filled": true,
+      "buy_price": 44777.74,
+      "sell_price": 44707.74,
+      "buy_ticket": 0,
+      "sell_ticket": 220040476,
+      "buy_filled": false,
       "sell_filled": true,
-      "buy_pending_ticket": 0,
-      "sell_pending_ticket": -1002,
-      "trade_count": 4,
-      "next_action": "sell",
+      "buy_pending_ticket": -1001,
+      "sell_pending_ticket": 0,
+      "trade_count": 1,
+      "next_action": "buy",
       "is_reopened": false
     },
     "-1": {
       "index": -1,
-      "buy_price": 44988.89,
-      "sell_price": 44918.89,
+      "buy_price": 44637.74,
+      "sell_price": 44567.74,
       "buy_ticket": 0,
       "sell_ticket": 0,
       "buy_filled": false,
@@ -46,22 +46,22 @@
     },
     "2": {
       "index": 2,
-      "buy_price": 45198.89,
-      "sell_price": 45128.89,
+      "buy_price": 44847.74,
+      "sell_price": 44777.74,
       "buy_ticket": 0,
-      "sell_ticket": 219874244,
+      "sell_ticket": 0,
       "buy_filled": false,
-      "sell_filled": true,
+      "sell_filled": false,
       "buy_pending_ticket": -2001,
       "sell_pending_ticket": -2002,
-      "trade_count": 1,
-      "next_action": "buy",
+      "trade_count": 0,
+      "next_action": "sell",
       "is_reopened": false
     },
     "-2": {
       "index": -2,
-      "buy_price": 44918.89,
-      "sell_price": 44848.89,
+      "buy_price": 44567.74,
+      "sell_price": 44497.74,
       "buy_ticket": 0,
       "sell_ticket": 0,
       "buy_filled": false,
@@ -73,5 +73,5 @@
       "is_reopened": false
     }
   },
-  "iteration": 1
+  "iteration": 2
 }
