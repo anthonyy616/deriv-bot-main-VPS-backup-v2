@@ -76,6 +76,9 @@ class GridPair:
     pair_tp: float = 0.0            # Shared TP level (set by first trade of cycle)
     pair_sl: float = 0.0            # Shared SL level (set by first trade of cycle)
     
+    # New field for position age tracking (Bug 3 fix)
+    position_timestamps: Dict[int, float] = field(default_factory=dict)  # ticket -> opening time
+    
     def get_next_lot(self, lot_sizes: list) -> float:
         """
         Get the next lot size for a trade based on trade_count.
@@ -99,6 +102,17 @@ class GridPair:
         """Advance to next action in toggle sequence AND increment trade_count for lot sizing."""
         self.trade_count += 1
         self.next_action = "sell" if self.next_action == "buy" else "buy"
+    
+    # New methods for Bug 3 fix (1-second minimum position age)
+    def record_position_open(self, ticket: int):
+        """Record when position was opened for age tracking."""
+        self.position_timestamps[ticket] = time.time()
+    
+    def get_position_age(self, ticket: int) -> float:
+        """Get how long position has been open in seconds."""
+        if ticket in self.position_timestamps:
+            return time.time() - self.position_timestamps[ticket]
+        return 0.0
 
     
 
@@ -267,7 +281,8 @@ class LadderGridStrategy:
         closed_count = 0
         if positions:
             for pos in positions:
-                if self._close_position(pos.ticket):
+                # CRITICAL FIX (Bug 5): Pass position object, not ticket
+                if self._close_position(pos):  # Changed from self._close_position(pos.ticket)
                     closed_count += 1
                 else:
                     print(f"[ERROR] Failed to close position {pos.ticket}")
@@ -294,7 +309,7 @@ class LadderGridStrategy:
             os.remove(self.state_file)
         
         print(f"[TERMINATE] {self.symbol}: Grid reset complete.")
-    
+
     # ========================================================================
     # MAIN TICK HANDLER
     # ========================================================================
@@ -801,6 +816,10 @@ class LadderGridStrategy:
                 return
             
             for deal in deals:
+                # CRITICAL FIX (Bug 4): Filter by symbol (double-check)
+                if deal.symbol != self.symbol:
+                    continue
+                
                 # [CRITICAL FIX] Skip already processed deals
                 if deal.ticket in self.processed_deals:
                     continue
@@ -823,6 +842,12 @@ class LadderGridStrategy:
                 if not pair:
                     continue  # Pair no longer exists
                 
+                # CRITICAL FIX (Bug 3): Check minimum position age (1 second)
+                position_age = pair.get_position_age(deal.position_id)
+                if position_age < 1.0:  # Less than 1 second old
+                    print(f" {self.symbol}: Skipping TP/SL reset for position {deal.position_id} (age: {position_age:.2f}s < 1s)")
+                    continue
+                
                 # Mark as processed IMMEDIATELY
                 self.processed_deals.append(deal.ticket)
                 
@@ -843,72 +868,56 @@ class LadderGridStrategy:
                 pair.trade_count = 0
                 print(f"   [RESET] Pair {pair_idx} trade_count reset to 0 (was {old_count})")
                 
-                # Nuclear reset: Close opposite side if still open
-                if deal.type == mt5.DEAL_TYPE_SELL:  # Closed a BUY position
-                    pair.buy_filled = False
-                    pair.buy_ticket = 0
+                # ============================================================
+                # NUCLEAR RESET PER PAIR: Close ALL positions for this pair
+                # Query MT5 for all positions with this pair's magic number
+                # This catches ALL re-triggered positions, not just tracked ones
+                # ============================================================
+                pair_magic = 50000 + pair_idx
+                all_positions = mt5.positions_get(symbol=self.symbol)
+                
+                if all_positions:
+                    positions_to_close = [p for p in all_positions if p.magic == pair_magic]
                     
-                    # Close opposite SELL if open
-                    if pair.sell_filled and pair.sell_ticket:
-                        print(f"   [PAIR RESET] Closing opposite Sell {pair.sell_ticket}...")
-                        # Get position and close it properly
-                        sell_pos = mt5.positions_get(ticket=pair.sell_ticket)
-                        if sell_pos:
-                            pos = sell_pos[0]
-                            tick = mt5.symbol_info_tick(self.symbol)
+                    if positions_to_close:
+                        print(f"   [PAIR NUCLEAR] Found {len(positions_to_close)} positions to close for Pair {pair_idx}")
+                        tick = mt5.symbol_info_tick(self.symbol)
+                        
+                        for pos in positions_to_close:
                             if tick:
+                                # Determine close direction and price
+                                if pos.type == 0:  # BUY position
+                                    close_type = mt5.ORDER_TYPE_SELL
+                                    close_price = tick.bid
+                                else:  # SELL position
+                                    close_type = mt5.ORDER_TYPE_BUY
+                                    close_price = tick.ask
+                                
                                 close_request = {
                                     "action": mt5.TRADE_ACTION_DEAL,
                                     "symbol": self.symbol,
-                                    "position": pair.sell_ticket,
+                                    "position": pos.ticket,
                                     "volume": pos.volume,
-                                    "type": mt5.ORDER_TYPE_BUY,  # Buy to close sell
-                                    "price": tick.ask,
+                                    "type": close_type,
+                                    "price": close_price,
                                     "deviation": 50,
                                     "magic": pos.magic,
-                                    "comment": "Nuclear Reset (TP/SL)",
+                                    "comment": "Pair Nuclear Reset",
                                 }
                                 result = mt5.order_send(close_request)
                                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                                    print(f"   [SUCCESS] Closed Sell {pair.sell_ticket}")
+                                    print(f"   [CLOSED] Position {pos.ticket} (Lot: {pos.volume})")
                                 else:
-                                    print(f"   [FAILED] Could not close Sell {pair.sell_ticket}")
-                        pair.sell_filled = False
-                        pair.sell_ticket = 0
+                                    error = result.comment if result else "Unknown"
+                                    print(f"   [FAILED] Position {pos.ticket}: {error}")
                 
-                elif deal.type == mt5.DEAL_TYPE_BUY:  # Closed a SELL position
-                    pair.sell_filled = False
-                    pair.sell_ticket = 0
-                    
-                    # Close opposite BUY if open
-                    if pair.buy_filled and pair.buy_ticket:
-                        print(f"   [PAIR RESET] Closing opposite Buy {pair.buy_ticket}...")
-                        # Get position and close it properly
-                        buy_pos = mt5.positions_get(ticket=pair.buy_ticket)
-                        if buy_pos:
-                            pos = buy_pos[0]
-                            tick = mt5.symbol_info_tick(self.symbol)
-                            if tick:
-                                close_request = {
-                                    "action": mt5.TRADE_ACTION_DEAL,
-                                    "symbol": self.symbol,
-                                    "position": pair.buy_ticket,
-                                    "volume": pos.volume,
-                                    "type": mt5.ORDER_TYPE_SELL,  # Sell to close buy
-                                    "price": tick.bid,
-                                    "deviation": 50,
-                                    "magic": pos.magic,
-                                    "comment": "Nuclear Reset (TP/SL)",
-                                }
-                                result = mt5.order_send(close_request)
-                                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                                    print(f"   [SUCCESS] Closed Buy {pair.buy_ticket}")
-                                else:
-                                    print(f"   [FAILED] Could not close Buy {pair.buy_ticket}")
-                        pair.buy_filled = False
-                        pair.buy_ticket = 0
+                # Clear ALL filled flags and tickets
+                pair.buy_filled = False
+                pair.buy_ticket = 0
+                pair.sell_filled = False
+                pair.sell_ticket = 0
                 
-                # Reset flags AND toggle direction
+                # Reset zone flags
                 pair.buy_in_zone = False
                 pair.sell_in_zone = False
                 pair.first_fill_direction = ""
@@ -926,8 +935,10 @@ class LadderGridStrategy:
                 # Cancel any existing pending orders
                 if pair.buy_pending_ticket:
                     self._cancel_order(pair.buy_pending_ticket)
+                    pair.buy_pending_ticket = 0
                 if pair.sell_pending_ticket:
                     self._cancel_order(pair.sell_pending_ticket)
+                    pair.sell_pending_ticket = 0
                 
                 # Re-place triggers for both sides (FLIPPED order types for re-open)
                 pair.buy_pending_ticket = self._place_pending_order(
@@ -939,7 +950,7 @@ class LadderGridStrategy:
                     pair.sell_price, pair_idx
                 )
                 
-                print(f"   [PAIR RESET] Pair {pair_idx} fully reset. Sentries re-armed.")
+                print(f"   [PAIR RESET COMPLETE] Pair {pair_idx} fully reset. Sentries re-armed. next_action={pair.next_action}")
                 self.save_state()
             
             # Update last check time
@@ -948,6 +959,7 @@ class LadderGridStrategy:
         except Exception as e:
             print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
             # Don't crash, just skip this tick
+
 
     async def _check_and_reopen(self):
         """
@@ -2028,28 +2040,22 @@ class LadderGridStrategy:
             self.trade_in_progress[pair_idx] = True
             
             try:
-                # CHECK 1: Toggle state (buy/sell alternation)
+                # CRITICAL FIX (Bug 1): Validate toggle BEFORE execution
                 if pair.next_action != direction:
+                    print(f" {self.symbol}: TOGGLE MISMATCH - Expected {pair.next_action}, got {direction}. Skipping.")
                     return False
                 
                 # CHECK 2: Max positions hard cap
                 if pair.trade_count >= self.max_positions:
                     return False
                 
-                # CHECK 3: Filled flag check (primary - fast)
-                filled_flag = pair.buy_filled if direction == "buy" else pair.sell_filled
-                if filled_flag:
-                    return False
-                
-                # CHECK 4: MT5 position check (backup - for stale flag detection)
-                # Only runs if flag says not filled, but checks MT5 in case flag is stale
-                if self._position_exists_for_trade(pair_idx, direction):
-                    # Position exists in MT5 but flag was wrong - fix the flag
-                    if direction == "buy":
-                        pair.buy_filled = True
-                    else:
-                        pair.sell_filled = True
-                    return False
+                # NOTE: We do NOT check filled flag for main triggers!
+                # The combination of:
+                # - toggle (next_action) - enforces buy/sell alternation
+                # - trade_count - tracks positions and limits via max_positions
+                # - trade_in_progress mutex - prevents same-tick duplicates
+                # - zone transition check in caller - prevents spam
+                # is sufficient to prevent race conditions while allowing re-triggers.
                 
                 # All checks passed - execute the trade
                 price = pair.buy_price if direction == "buy" else pair.sell_price
@@ -2070,7 +2076,18 @@ class LadderGridStrategy:
                     pair.sell_ticket = ticket
                     pair.sell_pending_ticket = 0
                 
+                # CRITICAL FIX (Bug 1): Clear reopened flag IMMEDIATELY after first post-reset trade
                 pair.is_reopened = False
+                
+                # CRITICAL FIX (Bug 2): Set zone flag IMMEDIATELY after trade
+                if direction == "buy":
+                    pair.buy_in_zone = True
+                else:
+                    pair.sell_in_zone = True
+                
+                # Record position opening time for age tracking (Bug 3 fix)
+                pair.record_position_open(ticket)
+                
                 pair.advance_toggle()
                 
                 # --- CHAIN EXECUTION (within same lock) ---
@@ -2088,6 +2105,7 @@ class LadderGridStrategy:
                                 next_pair.sell_filled = True
                                 next_pair.sell_ticket = chain_ticket
                                 next_pair.sell_pending_ticket = 0
+                                next_pair.record_position_open(chain_ticket)  # Bug 3 fix
                                 next_pair.advance_toggle()
                 else:
                     # Backward chain: S[n] -> B[n-1]
@@ -2103,6 +2121,7 @@ class LadderGridStrategy:
                                 prev_pair.buy_filled = True
                                 prev_pair.buy_ticket = chain_ticket
                                 prev_pair.buy_pending_ticket = 0
+                                prev_pair.record_position_open(chain_ticket)  # Bug 3 fix
                                 prev_pair.advance_toggle()
                 
                 self.save_state()
@@ -2111,7 +2130,7 @@ class LadderGridStrategy:
             finally:
                 # Always clear in-progress flag
                 self.trade_in_progress[pair_idx] = False
-    
+
     def _check_virtual_triggers(self, ask: float, bid: float):
         """
         Check triggers and fire market orders.
@@ -2166,8 +2185,15 @@ class LadderGridStrategy:
                     # Only latch if we are strictly blocked by logic, not failure
                     pair.buy_in_zone = True 
 
-            if not buy_attempt_failed:
-                pair.buy_in_zone = buy_in_zone_now
+            if buy_attempt_failed:
+                # Failed attempt, don't set zone flag
+                pass
+            else:
+                # Normal flow or successful trade (zone flag already set in execute method)
+                # Just ensure flag matches current state if no trade happened
+                if not pair.buy_in_zone:
+                    pair.buy_in_zone = buy_in_zone_now
+
             
             # --- SELL TRIGGER ---
             if idx > 0:   sell_in_zone_now = ask >= pair.sell_price
@@ -2204,8 +2230,15 @@ class LadderGridStrategy:
                 else:
                     pair.sell_in_zone = True
 
-            if not sell_attempt_failed:
-                pair.sell_in_zone = sell_in_zone_now
+            if sell_attempt_failed:
+                # Failed attempt, don't set zone flag
+                pass
+            else:
+                # Normal flow or successful trade (zone flag already set in execute method)
+                # Just ensure flag matches current state if no trade happened
+                if not pair.sell_in_zone:
+                    pair.sell_in_zone = sell_in_zone_now
+
         
         # [FIX] Retroactive Catch-Up Scan: Check for missed chains
         # Safety Check 2: Limit scope to recently touched pairs (avoid scanning entire grid every tick)
