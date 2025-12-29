@@ -511,7 +511,7 @@ This has been reverted to use single `trade_count` per pair.
 ### BUG #6: Leapfrog Chain Execution Has No max_positions Guard
 **Location:** Lines 1538-1551, 1608-1621, 1689-1702, 1782-1795  
 **Problem:** All 4 leapfrog functions chain without trade_count check  
-**Fix:** Add guards before chain execution in all leapfrog functions.
+**Fix:** Add guards in all 4 leapfrog chains.
 
 ### BUG #7: Create Pair Functions Skip max_positions Check
 **Location:** Lines 1407-1416, 1477-1486  
@@ -585,3 +585,40 @@ This has been reverted to use single `trade_count` per pair.
 5. **No trades beyond max_positions**: Double-blocked at trigger and execution levels
 6. **Grid stays organized**: Visual chart shows clean ladder pattern
 
+## Last Updated
+2025-12-25 00:15 - CRITICAL STATE MANAGEMENT & RACE CONDITION FIXES
+
+### Critical Issues Fixed (Dec 25, 2025)
+
+**1. Wrong Lot Sizing & Direction After TP/SL**
+- **Symptom**: After a TP/SL reset, trades would continue with wrong lot sizes (0.3, 0.4 instead of 0.1) and often in the wrong direction (SELL instead of BUY).
+- **Root Cause**: `trade_count` was reset but `next_action` (toggle state) was NOT reset, causing the pair to resume with the wrong polarity.
+- **Fix**:
+  - In `_check_tp_sl_from_history`, explicitly reset `next_action` based on pair polarity:
+    - Index > 0 (Positive) → Reset to "sell"
+    - Index ≤ 0 (Negative/Zero) → Reset to "buy"
+  - Reset `trade_count` to 0.
+
+**2. Missing Re-Entry Trades (Stale Flags)**
+- **Symptom**: After a position closed, the bot wouldn't always re-enter immediately.
+- **Root Cause**: The `buy_filled`/`sell_filled` and `in_zone` flags remained True after the position closed, blocking new triggers.
+- **Fix**:
+  - In `_check_tp_sl_from_history`, properly detect which side closed (using `deal.type`) and reset the corresponding flags (`filled` and `in_zone`) to False.
+  - Set `is_reopened = True` to enable immediate re-evaluation.
+
+**3. Double Execution (Race Condition)**
+- **Symptom**: Two identical trades executing at the same time (one from chain, one from trigger).
+- **Root Cause**: `_check_virtual_triggers` didn't check if the position was *already* filled before firing.
+- **Fix**: Added explicit guards in `_check_virtual_triggers`:
+  ```python
+  if pair.buy_filled: should_trigger_buy = False
+  if pair.sell_filled: should_trigger_sell = False
+  ```
+  This prevents the trigger loop from firing if a chain execution (or another thread) has already filled the order.
+
+### Files Modified
+- `core/strategy_engine.py` - `_check_tp_sl_from_history()`, `_check_virtual_triggers()`
+
+### Status
+- **Verified**: Logic reviewed and confirmed to handle state transitions correctly.
+- **Ready**: Codebase updated and ready for deployment.

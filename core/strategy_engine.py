@@ -1123,11 +1123,33 @@ class LadderGridStrategy:
                 
                 print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
                 
-                # CRITICAL: Reset trade_count to 0 for lot sizing
-                # BUT DON'T TOUCH ANY OTHER FLAGS!
+                # CRITICAL: Complete Pair Reset on TP/SL
                 old_count = pair.trade_count
                 pair.trade_count = 0
-                print(f"   [LOT RESET] Pair {pair_idx} trade_count reset to 0 (was {old_count})")
+
+                # 1. Reset Toggle / Next Action based on Polarity
+                # Positive pairs start with SELL, Negative/Zero start with BUY
+                if pair_idx > 0:
+                    pair.next_action = "sell"
+                else:
+                    pair.next_action = "buy"
+
+                # 2. Reset Flags for the CLOSED side
+                # deal.type == SELL means we closed a BUY position (Exit Long)
+                # deal.type == BUY means we closed a SELL position (Exit Short)
+                if deal.type == mt5.DEAL_TYPE_SELL:
+                    pair.buy_filled = False
+                    pair.buy_ticket = 0
+                    pair.buy_in_zone = False
+                elif deal.type == mt5.DEAL_TYPE_BUY:
+                    pair.sell_filled = False
+                    pair.sell_ticket = 0
+                    pair.sell_in_zone = False
+
+                # 3. Enable Immediate Re-entry (Bypass zone entry check)
+                pair.is_reopened = True
+
+                print(f"   [RESET] Pair {pair_idx} count=0, next={pair.next_action}, reopened=True")
                 
                 # Log to session
                 if self.session_logger:
@@ -2224,8 +2246,12 @@ class LadderGridStrategy:
                 should_trigger_buy = buy_in_zone_now and not pair.buy_in_zone and pair.next_action == "buy"
             
             if should_trigger_buy:
+                # GUARD: Don't fire if already filled (Prevents double execution)
+                if pair.buy_filled:
+                    should_trigger_buy = False
+
                 # HARD CAP: Only allow trade if under max_positions limit
-                if pair.trade_count < self.max_positions:
+                if should_trigger_buy and pair.trade_count < self.max_positions:
                     # Use LOCKED execution to prevent race conditions
                     if self._execute_trade_with_chain("buy", idx):
                         # Trade executed successfully - check for grid expansion
@@ -2270,8 +2296,12 @@ class LadderGridStrategy:
                 should_trigger_sell = sell_in_zone_now and not pair.sell_in_zone and pair.next_action == "sell"
             
             if should_trigger_sell:
+                # GUARD: Don't fire if already filled (Prevents double execution)
+                if pair.sell_filled:
+                    should_trigger_sell = False
+
                 # HARD CAP: Only allow trade if under max_positions limit
-                if pair.trade_count < self.max_positions:
+                if should_trigger_sell and pair.trade_count < self.max_positions:
                     # Use LOCKED execution to prevent race conditions
                     if self._execute_trade_with_chain("sell", idx):
                         # Trade executed successfully - check for grid expansion
