@@ -1126,14 +1126,14 @@ class LadderGridStrategy:
                 # CRITICAL: Complete Pair Reset on TP/SL
                 old_count = pair.trade_count
                 pair.trade_count = 0
-                
+
                 # 1. Reset Toggle / Next Action based on Polarity
                 # Positive pairs start with SELL, Negative/Zero start with BUY
                 if pair_idx > 0:
                     pair.next_action = "sell"
                 else:
                     pair.next_action = "buy"
-                
+
                 # 2. Reset Flags for the CLOSED side
                 # deal.type == SELL means we closed a BUY position (Exit Long)
                 # deal.type == BUY means we closed a SELL position (Exit Short)
@@ -1145,10 +1145,10 @@ class LadderGridStrategy:
                     pair.sell_filled = False
                     pair.sell_ticket = 0
                     pair.sell_in_zone = False
-                
+
                 # 3. Enable Immediate Re-entry (Bypass zone entry check)
                 pair.is_reopened = True
-                
+
                 print(f"   [RESET] Pair {pair_idx} count=0, next={pair.next_action}, reopened=True")
                 
                 # Log to session
@@ -2249,7 +2249,7 @@ class LadderGridStrategy:
                 # GUARD: Don't fire if already filled (Prevents double execution)
                 if pair.buy_filled:
                     should_trigger_buy = False
-                
+
                 # HARD CAP: Only allow trade if under max_positions limit
                 if should_trigger_buy and pair.trade_count < self.max_positions:
                     # Use LOCKED execution to prevent race conditions
@@ -2299,7 +2299,7 @@ class LadderGridStrategy:
                 # GUARD: Don't fire if already filled (Prevents double execution)
                 if pair.sell_filled:
                     should_trigger_sell = False
-                
+
                 # HARD CAP: Only allow trade if under max_positions limit
                 if should_trigger_sell and pair.trade_count < self.max_positions:
                     # Use LOCKED execution to prevent race conditions
