@@ -51,3 +51,9 @@ Thumbs.db
 # Database
 *.db
 *.sqlite3
+
+supabase_schema_v2.sql
+
+db/schema.sql
+
+DEPLOYMENT.md
