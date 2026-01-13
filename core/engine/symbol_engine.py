@@ -1138,6 +1138,16 @@ class SymbolEngine:
                 
                 print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
                 
+                print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
+                
+                # [FIX] CLOSE HEDGE IF ACTIVE (Spec Section 10)
+                if pair.hedge_active and pair.hedge_ticket:
+                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket} due to Pair {reason}")
+                    self._close_position(pair.hedge_ticket)
+                    pair.hedge_active = False
+                    pair.hedge_ticket = 0
+                    pair.hedge_direction = None
+
                 # CRITICAL: Complete Pair Reset on TP/SL
                 old_count = pair.trade_count
                 pair.trade_count = 0
@@ -2179,36 +2189,36 @@ class SymbolEngine:
                         else:
                             print(f" {self.symbol}: Skipping chain to S{next_idx} - {len(next_positions)} active positions exist")
                         # ============================================
-                            # --- ADDITIONAL CHAIN: S[n] → B[n+1] ---
-                # When SELL executes, it should also chain to next pair's BUY if they're at same price
+                            # --- ADDITIONAL CHAIN: S[n] → B[n-1] ---
+                # When SELL executes, it should also chain to PREVIOUS pair's BUY if they're at same price
                 if direction == "sell":
-                    next_idx = pair_idx + 1
-                    next_pair = self.pairs.get(next_idx)
-                    if next_pair:
-                        # Check if next pair's BUY is at same price as this SELL
-                        price_diff = abs(next_pair.buy_price - price)
-                        if price_diff < 10.0 and not next_pair.buy_filled:
-                            # Check if next pair has any active positions
-                            next_positions = []
+                    prev_idx = pair_idx - 1
+                    prev_pair = self.pairs.get(prev_idx)
+                    if prev_pair:
+                        # Check if prev pair's BUY is at same price as this SELL
+                        price_diff = abs(prev_pair.buy_price - price)
+                        if price_diff < 10.0 and not prev_pair.buy_filled:
+                            # Check if prev pair has any active positions
+                            prev_positions = []
                             if positions:
-                                next_positions = [p for p in positions if p.magic == 50000 + next_idx]
+                                prev_positions = [p for p in positions if p.magic == 50000 + prev_idx]
                             
-                            # Only chain if NO active position exists in next pair
-                            if not next_positions:
-                                print(f" {self.symbol}: CHAIN B{next_idx} @ {next_pair.buy_price:.2f} [from S{pair_idx}]")
-                                chain_ticket = await self._execute_market_order("buy", next_pair.buy_price, next_idx)
+                            # Only chain if NO active position exists in prev pair
+                            if not prev_positions:
+                                print(f" {self.symbol}: CHAIN B{prev_idx} @ {prev_pair.buy_price:.2f} [from S{pair_idx}]")
+                                chain_ticket = await self._execute_market_order("buy", prev_pair.buy_price, prev_idx)
                                 if chain_ticket:
-                                    next_pair.buy_filled = True
-                                    next_pair.buy_ticket = chain_ticket
-                                    next_pair.buy_pending_ticket = 0
-                                    next_pair.record_position_open(chain_ticket)
-                                    next_pair.advance_toggle()
-                                    # FIX: Set zone flags to prevent immediate S[n+1] trigger
+                                    prev_pair.buy_filled = True
+                                    prev_pair.buy_ticket = chain_ticket
+                                    prev_pair.buy_pending_ticket = 0
+                                    prev_pair.record_position_open(chain_ticket)
+                                    prev_pair.advance_toggle()
+                                    # FIX: Set zone flags to prevent immediate S[n-1] trigger
                                     # Price must EXIT the zone first before next trigger can fire
-                                    next_pair.buy_in_zone = True
-                                    next_pair.sell_in_zone = True
+                                    prev_pair.buy_in_zone = True
+                                    prev_pair.sell_in_zone = True
                         else:
-                            print(f" {self.symbol}: Skipping chain to B{next_idx} - {len(next_positions)} active positions exist")
+                            print(f" {self.symbol}: Skipping chain to B{prev_idx} - {len(prev_positions)} active positions exist")
                         # ============================================
                 
                 await self.save_state()
