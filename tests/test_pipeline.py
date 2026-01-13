@@ -6,7 +6,7 @@ import os
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from core.engine import Engine
+from core.trading_engine import TradingEngine as Engine
 from data.ingestion import DataIngestion
 from data.feature_store import FeatureStore
 from mt5_interface import MT5Interface

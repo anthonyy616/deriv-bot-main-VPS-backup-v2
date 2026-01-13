@@ -7,3 +7,4 @@ schedule
 MetaTrader5
 requests
 pydantic
+aiosqlite

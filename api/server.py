@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from core.bot_manager import BotManager
-from core.engine import TradingEngine 
+from core.trading_engine import TradingEngine 
 from supabase import create_client, Client
 import asyncio
 import os

@@ -2192,8 +2192,8 @@ class LadderGridStrategy:
                                     # Price must EXIT the zone first before next trigger can fire
                                     next_pair.buy_in_zone = True
                                     next_pair.sell_in_zone = True
-                        else:
-                            print(f" {self.symbol}: Skipping chain to B{next_idx} - {len(next_positions)} active positions exist")
+                            else:
+                                print(f" {self.symbol}: Skipping chain to B{next_idx} - {len(next_positions)} active positions exist")
                         # ============================================
                 
                 self.save_state()
