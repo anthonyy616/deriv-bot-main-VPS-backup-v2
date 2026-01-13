@@ -54,6 +54,8 @@ class SymbolConfig(BaseModel):
     buy_stop_sl: Optional[float] = None
     sell_stop_tp: Optional[float] = None
     sell_stop_sl: Optional[float] = None
+    hedge_enabled: Optional[bool] = None
+    hedge_lot_size: Optional[float] = None
 
 class GlobalConfig(BaseModel):
     """Global settings"""

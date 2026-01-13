@@ -819,6 +819,8 @@
             const buySl = cfg.buy_stop_sl || 75;
             const sellTp = cfg.sell_stop_tp || 50;
             const sellSl = cfg.sell_stop_sl || 75;
+            const hedgeEnabled = cfg.hedge_enabled !== false; // Default true
+            const hedgeLot = cfg.hedge_lot_size || 0.01;
 
             // Generate lot inputs (number = max_positions)
             let lotHtml = '';
@@ -898,6 +900,22 @@
                         <label class="block text-[10px] text-yellow-400 mb-1">Lot Sizes (Trade #N → Lot #N)</label>
                         <div id="lots_${safeId}" class="grid grid-cols-5 gap-1">
                             ${lotHtml}
+                        </div>
+                    </div>
+
+                    <!-- Hedge Settings -->
+                    <div class="grid grid-cols-2 gap-2 border-t border-slate-700 pt-2 mt-2">
+                        <div>
+                            <label class="block text-[10px] text-purple-400">Hedge Enabled</label>
+                            <select id="hedge_en_${safeId}" class="w-full p-1.5 text-sm rounded bg-slate-900 border border-purple-700/50">
+                                <option value="true" ${hedgeEnabled ? 'selected' : ''}>Yes</option>
+                                <option value="false" ${!hedgeEnabled ? 'selected' : ''}>No</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] text-purple-400">Hedge Lot</label>
+                            <input type="number" id="hedge_lot_${safeId}" step="0.01" value="${hedgeLot}"
+                                class="w-full p-1.5 text-sm rounded bg-slate-900 border border-purple-700/50">
                         </div>
                     </div>
                 </div>
@@ -986,7 +1004,9 @@
                         buy_stop_tp: parseFloat(document.getElementById(`buytp_${safeId}`)?.value) || 50,
                         buy_stop_sl: parseFloat(document.getElementById(`buysl_${safeId}`)?.value) || 75,
                         sell_stop_tp: parseFloat(document.getElementById(`selltp_${safeId}`)?.value) || 50,
-                        sell_stop_sl: parseFloat(document.getElementById(`sellsl_${safeId}`)?.value) || 75
+                        sell_stop_sl: parseFloat(document.getElementById(`sellsl_${safeId}`)?.value) || 75,
+                        hedge_enabled: document.getElementById(`hedge_en_${safeId}`)?.value === 'true',
+                        hedge_lot_size: parseFloat(document.getElementById(`hedge_lot_${safeId}`)?.value) || 0.01
                     };
                 }
             });

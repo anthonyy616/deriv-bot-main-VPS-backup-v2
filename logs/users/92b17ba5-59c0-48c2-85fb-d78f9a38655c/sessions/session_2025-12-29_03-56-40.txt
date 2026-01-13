@@ -1,0 +1,223 @@
+=====================================
+SESSION: 2025-12-29 03:57:05
+USER ID: 92b17ba5-59c0-48c2-85fb-d78f9a38655c
+=====================================
+
+[03:57:05] BUTTON: Start All
+[03:57:05] TRADE #1
+  Symbol: FX Vol 20
+  Pair: 0
+  Direction: BUY
+  Price: 112889.90
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261928
+
+[03:57:05] TRADE #2
+  Symbol: FX Vol 20
+  Pair: 1
+  Direction: SELL
+  Price: 112885.88
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261929
+
+[03:57:05] TRADE #3
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: BUY
+  Price: 162060.95
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261930
+
+[03:57:05] TRADE #4
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: SELL
+  Price: 162037.87
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261931
+
+[03:57:06] TRADE #5
+  Symbol: FX Vol 40
+  Pair: 0
+  Direction: BUY
+  Price: 95926.15
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261932
+
+[03:57:06] TRADE #6
+  Symbol: FX Vol 40
+  Pair: 1
+  Direction: SELL
+  Price: 95919.32
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261934
+
+[03:57:06] TRADE #7
+  Symbol: FX Vol 60
+  Pair: 0
+  Direction: BUY
+  Price: 39597.10
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261935
+
+[03:57:06] TRADE #8
+  Symbol: FX Vol 60
+  Pair: 1
+  Direction: SELL
+  Price: 39592.87
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223261936
+
+[03:57:32] TRADE #9
+  Symbol: FX Vol 20
+  Pair: -1
+  Direction: BUY
+  Price: 112863.38
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223262010
+
+[03:57:32] TRADE #10
+  Symbol: FX Vol 20
+  Pair: 0
+  Direction: SELL
+  Price: 112859.36
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223262011
+
+[03:57:53] TRADE #11
+  Symbol: FX Vol 80
+  Pair: -1
+  Direction: BUY
+  Price: 161860.11
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223262130
+
+[03:57:53] TRADE #12
+  Symbol: FX Vol 80
+  Pair: 0
+  Direction: SELL
+  Price: 161837.05
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223262132
+
+[03:58:20] TRADE #13
+  Symbol: FX Vol 80
+  Pair: -2
+  Direction: BUY
+  Price: 161679.07
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223262310
+
+[03:58:20] TRADE #14
+  Symbol: FX Vol 80
+  Pair: -1
+  Direction: SELL
+  Price: 161656.04
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223262311
+
+[03:59:19] TRADE #15
+  Symbol: FX Vol 40
+  Pair: -1
+  Direction: BUY
+  Price: 95879.26
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223262672
+
+[03:59:19] TRADE #16
+  Symbol: FX Vol 40
+  Pair: 0
+  Direction: SELL
+  Price: 95872.43
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223262673
+
+[04:01:34] TRADE #17
+  Symbol: FX Vol 80
+  Pair: 1
+  Direction: BUY
+  Price: 162271.79
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223263699
+
+[04:01:34] TRADE #18
+  Symbol: FX Vol 80
+  Pair: 2
+  Direction: SELL
+  Price: 162248.67
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223263700
+
+[04:01:47] TRADE #19
+  Symbol: FX Vol 20
+  Pair: 1
+  Direction: BUY
+  Price: 112920.12
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223263884
+
+[04:01:47] TRADE #20
+  Symbol: FX Vol 20
+  Pair: 2
+  Direction: SELL
+  Price: 112916.10
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223263885
+
+[04:01:54] TRADE #21
+  Symbol: FX Vol 80
+  Pair: 2
+  Direction: BUY
+  Price: 162469.51
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223263917
+
+[04:01:54] TRADE #22
+  Symbol: FX Vol 80
+  Pair: 3
+  Direction: SELL
+  Price: 162446.36
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223263920
+
+[04:02:00] TRADE #23
+  Symbol: FX Vol 20
+  Pair: 2
+  Direction: BUY
+  Price: 112951.26
+  Lot: 0.2
+  Trade #: 1
+  Ticket: 223263957
+
+[04:02:00] TRADE #24
+  Symbol: FX Vol 20
+  Pair: 3
+  Direction: SELL
+  Price: 112947.24
+  Lot: 0.1
+  Trade #: 0
+  Ticket: 223263958
+
+[04:02:23] BUTTON: Terminate All

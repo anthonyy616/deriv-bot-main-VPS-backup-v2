@@ -35,6 +35,8 @@ def get_default_symbol_config() -> Dict[str, Any]:
         "buy_stop_sl": 75.0,
         "sell_stop_tp": 50.0,
         "sell_stop_sl": 75.0,
+        "hedge_enabled": True,   # Section 9: Hedge System
+        "hedge_lot_size": 0.01,
     }
 
 
@@ -117,6 +119,8 @@ class ConfigManager:
                 sym_cfg["buy_stop_sl"] = old_config.get("buy_stop_sl", 75.0)
                 sym_cfg["sell_stop_tp"] = old_config.get("sell_stop_tp", 50.0)
                 sym_cfg["sell_stop_sl"] = old_config.get("sell_stop_sl", 75.0)
+                sym_cfg["hedge_enabled"] = old_config.get("hedge_enabled", True)
+                sym_cfg["hedge_lot_size"] = old_config.get("hedge_lot_size", 0.01)
                 
                 # Migrate lot sizes (old format was center_lot_first, etc.)
                 max_pos = sym_cfg["max_positions"]

@@ -1,7 +1,7 @@
 from typing import Dict, List, Set, Any
 import asyncio
 import time
-from core.strategy_engine import LadderGridStrategy as GridStrategy
+from core.engine.symbol_engine import SymbolEngine as GridStrategy
 from core.session_logger import SessionLogger
 
 

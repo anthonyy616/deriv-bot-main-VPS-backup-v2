@@ -1,624 +1,518 @@
-# Weltrade MT5 Trading Bot - Project Context
+# PROJECT CONTEXT — INFINITE GRID + PAIR-LOCAL HEDGE STRATEGY (MT5)
 
-## Overview
-An automated grid trading bot for MetaTrader 5 (MT5) that implements an "Infinite Ladder Grid" strategy with leapfrog mechanics. The bot manages multiple trading pairs across various synthetic indices (FX Vol, SFX Vol, FlipX, PainX, GainX, etc.).
-
-## Core Architecture
-
-### Files Structure
-```
-trade-bot-deriv/
-├── main.py                    # Entry point, starts FastAPI server
-├── api/server.py              # FastAPI endpoints for UI control
-├── core/
-│   ├── strategy_engine.py     # Main trading logic (LadderGridStrategy)
-│   ├── bot_manager.py         # Manages multiple symbol strategies
-│   └── config_manager.py      # Configuration persistence
-├── static/index.html          # Web UI (Supabase auth + trading controls)
-└── state/                     # Persisted strategy states per symbol
-```
-
-### Key Class: `LadderGridStrategy`
-
-Located in `core/strategy_engine.py`. Implements the grid trading logic.
-
-**Phases:**
-1. `INIT` - Execute B0 immediately at market, set up S0 pending
-2. `WAITING_CENTER` - Wait for both B0 and S0 to fill
-3. `EXPANDING` - Create pairs up to `max_pairs`
-4. `RUNNING` - Monitor triggers, execute trades, handle TP/SL
-
-**Data Structures:**
-- `GridPair` - Represents one grid level with buy/sell prices, fill status, trade count
-- `TradeLog` - Debug logging for each trade event
-
-## The Grid Structure (CRITICAL)
-
-```
-Pair Index | BUY Price  | SELL Price | Relationship
------------|------------|------------|-------------
-    +3     |   120      |   100      | S[3] = B[2]
-    +2     |   100      |    80      | S[2] = B[1]
-    +1     |    80      |    60      | S[1] = B[0]
-     0     |    60      |    40      | S[0] = B[-1]
-    -1     |    40      |    20      | S[-1] = B[-2]
-    -2     |    20      |     0      | 
-```
-
-**Key Invariant:** `S[N] = B[N-1]` for all N. Adjacent pairs share a price level.
-
-## Chain Execution Rule (MANDATORY)
-
-When ANY order triggers at a price level, the opposite order from the adjacent pair at the SAME price MUST also trigger.
-
-**Example:** When B[-3] @ 112864 triggers → S[-2] @ 112864 MUST also trigger.
-
-This ensures that at ANY random time, looking at MT5:
-- The TOP line has BOTH buy and sell
-- The BOTTOM line has BOTH buy and sell
-
-## Known Bugs Fixed
-
-1. **Race Condition / Ghost Close Loop** - Fixed by debouncing position closure detection (3 consecutive missing ticks required)
-2. **Nuclear Reset on Network Error** - Fixed by checking `None` return from `mt5.positions_get()`
-3. **Lot Size Continuity on Re-open** - Fixed by resetting `trade_count` to 0 on pair reset
-4. **Missing Chain Execution** - Fixed by adding bidirectional chain logic
-
-## Configuration (from UI)
-
-Per-symbol settings:
-- `spread` - Grid spacing in points (e.g., 24)
-- `max_pairs` - Odd number 1-9 (total grid levels)
-- `max_positions` - Trades per pair 1-20
-- `lot_sizes` - Array of lot sizes for trade sequence
-- `buy_stop_tp/sl` - TP/SL for buy orders
-- `sell_stop_tp/sl` - TP/SL for sell orders
-
-## API Endpoints
-
-- `GET /status` - Current bot state, positions, phase
-- `GET /config` - Current configuration
-- `POST /config` - Update configuration
-- `POST /control/start/{symbol}` - Start trading a symbol
-- `POST /control/stop/{symbol}` - Stop trading a symbol
-- `GET /env` - Returns Supabase credentials for frontend auth
-
-## Debugging Tips
-
-1. Check `trade_debug_{symbol}.txt` for trade history
-2. The terminal shows emoji-coded events:
-   - ⚡ = Trigger fired
-   - 🟢 = Order opened
-   - ⛓️ = Chain execution
-   - 💥 = Nuclear reset
-   - 📝 = Virtual pending order placed
-
-## Last Updated
-2025-12-19 14:57 - FEATURE VERIFIED AND COMPLETE
-
-### Chain Execution Implementation
-- Bidirectional: BUY triggers S[idx+1], SELL triggers B[idx-1] for ALL pairs
-- Guard: Expansion skips if chain already filled the target order
-- Chain from Expansion: After creating new pair, chains adjacent order at same price
-- Result: NO missed orders, NO duplicates at shared price levels
-
-### Edge Case Scenarios (Expected Behavior)
-
-**Why TOP/BOTTOM lines may not show BOTH BUY and SELL on MT5:**
-
-| Scenario | What You'll See | Why |
-|----------|-----------------|-----|
-| Edge pair just created via expansion | One side filled, one pending | Expansion executes "inside" order; "outside" awaits price |
-| Strong trending market (price UP) | Top pair: only SELL visible | BUY at higher price hasn't triggered yet |
-| Strong trending market (price DOWN) | Bottom pair: only BUY visible | SELL at lower price hasn't triggered yet |
-| Price reverses after edge expansion | Edge has one position | Opposite side is armed but untriggered |
-
-**Key Insight:** Chain execution ensures orders at the SAME price level fire together.
-But the absolute EDGE pair (top or bottom) will always have one side pending until price reaches its trigger level.
-
-**Visual Example:**
-```
-Price @ 112850 (rising)
-┌─────────────────────────────────────────┐
-│ Pair 5:  S5 ✅ FILLED @ 112836          │  ← TOP LINE (only SELL, B5 pending @ 112860)
-│ Pair 4:  B4 ✅ + S4 ✅ @ 112812/112836  │  ← Both filled (chain worked)
-│ Pair 3:  B3 ✅ + S3 ✅ @ 112788/112812  │
-│ ...                                      │
-│ Pair -2: (pending, price never reached) │  ← BOTTOM LINE (no MT5 positions)
-└─────────────────────────────────────────┘
-```
-
-This is mathematically correct for an infinite expanding grid.
-
-## Production Deployment (VPS)
-
-### VPS Details
-- **IP**: 45.144.242.97
-- **Port**: 800
-- **Access URL**: http://45.144.242.97:800/
-- **Project Path**: `C:\Users\Administrator\Downloads\trade-bot-deriv-v2`
-- **Python Path**: `C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe`
-- **NSSM Path**: `C:\nssm\nssm.exe`
-
-### File Structure (Production)
-```
-trade-bot-deriv-v2/
-├── main.py                    # Entry point (port 800, rotating logs)
-├── run_forever.py             # Watchdog wrapper (infinite restart loop)
-├── install_service.bat        # NSSM service installer
-├── uninstall_service.bat      # NSSM service remover
-├── .env                       # Production credentials
-├── .env.production            # Credentials template
-├── DEPLOYMENT.md              # Full deployment guide
-├── logs/                      # Log files directory
-│   ├── bot.log               # Main application log (10MB, 5 rotations)
-│   ├── crash.log             # Crash reports from watchdog
-│   ├── stdout.log            # Real-time console output
-│   ├── service_stdout.log    # NSSM service stdout
-│   └── service_stderr.log    # NSSM service stderr
-└── ...
-```
-
-### 3-Layer Crash Protection Architecture
-```
-┌─────────────────────────────────────────────────────────┐
-│             Layer 3: NSSM Service                       │
-│  - Starts on Windows boot                               │
-│  - Restarts on crash (5 second delay)                   │
-│  ┌───────────────────────────────────────────────────┐  │
-│  │       Layer 2: run_forever.py (Watchdog)          │  │
-│  │  - Catches Python exceptions                      │  │
-│  │  - Cooldown if too many rapid restarts            │  │
-│  │  ┌─────────────────────────────────────────────┐  │  │
-│  │  │     Layer 1: core/engine.py (MT5 Health)    │  │  │
-│  │  │  - Health check every 100 ticks             │  │  │
-│  │  │  - Auto-reconnect (10 attempts, 5s delay)   │  │  │
-│  │  └─────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────┘
-```
-
-### NSSM Service Commands
-
-**Install Service:**
-```cmd
-C:\nssm\nssm.exe install TradingBotService "C:\Users\Administrator\AppData\Local\Programs\Python\Python311\python.exe" "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\run_forever.py"
-C:\nssm\nssm.exe set TradingBotService AppDirectory "C:\Users\Administrator\Downloads\trade-bot-deriv-v2"
-C:\nssm\nssm.exe set TradingBotService AppExit Default Restart
-C:\nssm\nssm.exe set TradingBotService AppRestartDelay 5000
-C:\nssm\nssm.exe set TradingBotService Start SERVICE_AUTO_START
-```
-
-**Or use batch file:**
-```cmd
-cd C:\Users\Administrator\Downloads\trade-bot-deriv-v2
-install_service.bat
-```
-
-**Start/Stop Service:**
-```cmd
-net start TradingBotService
-net stop TradingBotService
-```
-
-**Check Service Status:**
-```cmd
-sc query TradingBotService
-```
-
-**View Logs:**
-```cmd
-type "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\bot.log"
-type "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\service_stdout.log"
-```
-
-**Uninstall Service:**
-```cmd
-net stop TradingBotService
-C:\nssm\nssm.exe remove TradingBotService confirm
-```
-
-### Environment Variables (.env)
-```
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_KEY=your-anon-key
-MT5_LOGIN=your-mt5-login
-MT5_PASSWORD=your-mt5-password
-MT5_SERVER=Weltrade-Demo
-MT5_PATH=C:\Program Files\Weltrade MT5\terminal64.exe
-BOT_HOST=0.0.0.0
-BOT_PORT=800
-```
-
-### Firewall Rule
-```powershell
-New-NetFirewallRule -DisplayName "Allow Bot Port 800" -Direction Inbound -Protocol TCP -LocalPort 800 -Action Allow
-```
-
-### Important Notes
-
-1. **NO EMOJIS IN CODE**: Windows service uses cp1252 encoding. All print/logger statements must use ASCII only.
-
-2. **Relative API URLs**: Frontend uses `BASE_URL = ""` (empty string) so API calls work from any host.
-
-3. **MT5 Requires Desktop Session**: MT5 terminal must be running with logged-in user session.
-
-4. **Update Process**:
-   ```cmd
-   net stop TradingBotService
-   # Copy updated files to VPS
-   net start TradingBotService
-   ```
-
-## Last Updated
-2025-12-20 20:50 - FEATURE UPDATE
-
-### New Features Implemented (Dec 20, 2025)
-
-**1. Terminate All Button (Nuclear Reset)**
-- UI Button: "TERMINATE ALL (Nuclear Reset)" - red, executes immediately (no confirmation)
-- Endpoint: `POST /control/terminate-all`
-- Endpoint: `POST /control/terminate/{symbol}`
-- Closes ALL open positions immediately for all/specific symbols
-- Resets grid state, clears state files
-- Located in: `strategy_orchestrator.py` → `terminate_all()`, `terminate_symbol()`
-- Strategy method: `strategy_engine.py` → `terminate()`
-
-**2. Graceful Stop**
-- UI Button: "Graceful Stop All" (yellow)
-- Sets `graceful_stop = True` flag
-- Completes open pairs to `max_positions` before fully stopping
-- Located in: `strategy_engine.py` → `stop()`, `_check_graceful_stop_complete()`
-
-**3. Session History Logging**
-- New file: `core/session_logger.py`
-- Creates user-specific log files: `logs/users/{user_id}/sessions/session_YYYY-MM-DD_HH-MM-SS.txt`
-- Logs: button clicks, trades, config changes, TP/SL hits
-- API Endpoints: `GET /history`, `GET /history/{session_id}`
-- UI: "Session History" panel with Refresh/View/Download buttons
-
-**4. Lot Size Reset on TP/SL (Per Pair)**
-- When ANY position hits TP or SL for a pair, `trade_count` resets to 0 for THAT pair only
-- Next trade on that pair starts with `lot_sizes[0]`
-- Located in: `strategy_engine.py` line 861: `pair.trade_count = 0`
-- Triggered by: `_check_open_positions_status()` detecting position closure
-
-### Files Modified
-- `core/strategy_engine.py` - terminate(), graceful_stop, trade_count reset
-- `core/strategy_orchestrator.py` - terminate_symbol(), terminate_all(), session_logger
-- `core/session_logger.py` - NEW FILE
-- `core/bot_manager.py` - pass user_id to orchestrator
-- `api/server.py` - terminate endpoints, history endpoints
-- `static/index.html` - terminate buttons, graceful stop, history panel
-
-### Known Issues / Bugs
-
-**1. Lot Size Reset Not Working (FIXED - Dec 21, 2025)**
-- **SYMPTOM**: After TP/SL hit, `trade_count` does not reset to 0, causing wrong lot sizes on re-entry
-- **EVIDENCE**: Session log 2025-12-20 shows pairs 22, 25, 26, 31 with continuous trade_num incrementing (0→1→2→3→4→5) without reset
-- **ROOT CAUSE**: 
-  - Current detection uses "position disappeared" snapshot method with 3-tick debounce
-  - If position closes and reopens quickly, debounce counter resets before confirmation
-  - Race condition: `_check_virtual_triggers` can execute new trade before `_check_and_reopen` processes reset
-  - No verification of WHY position closed (TP vs SL vs error)
-- **STATUS**: FIXED (Dec 21, 2025)
-- **IMPLEMENTATION**: 
-  - New method `_check_tp_sl_from_history()` queries `mt5.history_deals_get()` for authoritative TP/SL events
-  - Maps deals to pairs via `magic` number (50000 + pair_index)
-  - Immediately resets `trade_count = 0` when `DEAL_REASON_TP` or `DEAL_REASON_SL` detected
-  - Called at START of `_handle_running()` to eliminate race conditions
-  - Logs "TP_HIT" or "SL_HIT" to session logger for debugging
-  - Location: `core/strategy_engine.py` lines 769-875
-
-**2. Chain Execution Failure (FIXED - Dec 21, 2025)**
-- **SYMPTOM**: Adjacent pairs fail to chain-execute together (e.g., B25 missing when S26 triggered)
-- **EVIDENCE**: 
-  - Trade #97 [21:20:02]: S26 SELL triggered at 112062.20
-  - Expected: B25 should chain (S26 = B25 in grid structure)
-  - Reality: No B25 trade occurred (last B25 was ~10 minutes earlier)
-- **ROOT CAUSE**:
-  - Price tolerance too tight (< 1.0 points) - missed 2.99 point difference
-  - No backward chain logic (SELL triggers → previous BUY chain)
-  - Stale state flags (`pair.sell_filled = True`) blocking chains even after position closed
-- **STATUS**: FIXED (Dec 21, 2025)
-- **IMPLEMENTATION**:
-  - **Forward Chain (BUY → next SELL)**: Increased tolerance from 1.0 to 11.0 points (user adjustment)
-  - **Backward Chain (SELL → previous BUY)**: NEW - Added symmetric chain logic for downward price movement
-  - **Safety Check 1 (Deduplication)**: Verify position doesn't exist via `mt5.positions_get(ticket=...)`
-  - **Safety Check 2 (Scope Limit)**: Retroactive scan limited to ±2 pairs from last trigger
-  - **Safety Check 3 (Price Freshness)**: Only execute late chains if current price within tolerance
-  - **Market Fallback**: If tolerance exceeded but entry was clearly missed, execute at market anyway
-  - **Retroactive Catch-Up**: Scans for missed chains at end of `_check_virtual_triggers()`
-  - Location: `core/strategy_engine.py` lines 1846-2023
-
-**3. Session History & Terminate All**
-- STATUS: FIXED (Dec 20, 2025). Log path absolute, UI buttons working, Nuclear Fallback implemented.
-
-
-### API Endpoints (Updated)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/control/start` | POST | Start all enabled symbols |
-| `/control/stop` | POST | Graceful stop (complete open pairs) |
-| `/control/start/{symbol}` | POST | Start specific symbol |
-| `/control/stop/{symbol}` | POST | Graceful stop specific symbol |
-| `/control/terminate/{symbol}` | POST | **NEW** - Nuclear reset for symbol |
-| `/control/terminate-all` | POST | **NEW** - Nuclear reset for all |
-| `/history` | GET | **NEW** - List session logs |
-| `/history/{session_id}` | GET | **NEW** - Get session log content |
-
-### VPS Log Commands
-```cmd
-# View NSSM service logs
-powershell -Command "Get-Content 'C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\service_stdout.log' -Tail 100"
-
-# Check session history files
-dir "C:\Users\Administrator\Downloads\trade-bot-deriv-v2\logs\users\"
-
-# Check if logs directory exists
-if not exist "logs\users" mkdir "logs\users"
-```
-
-## Regression Test Results (Dec 20, 2025)
-- **Lot Size Reset**: PASSED (Logic Verified). Reset logic ensures trade #1 (Index 0) is always used after a Full Pair Reset (TP/SL). Pending field verification.
-- **Terminate All**: PASSED. Safe wrapper + Nuclear Fallback (scan user account) ensures 100% cleanup of all positions. UI confirmation removed.
-- **Session Logs**: PASSED. Pathing issue resolved (Absolute paths). UI View/Download buttons fixed (Text fetch). Trade data injection verified.
-- **Graceful Stop**: VERIFIED. Terminates pair only after `trade_count >= max_positions`. Note: Does not currently block *new* pairs from starting if they trigger during the stop phase (Behavior acceptable for now).
-
-## Last Updated
-2025-12-22 16:30 - CRITICAL FIXES
-
-### Fixes Implemented (Dec 22, 2025)
-
-**1. Fix 4: Deduplicate TP/SL Detection**
-- PROBLEM: Both `_check_tp_sl_from_history()` and `_check_and_reopen()` independently detected TP/SL hits, causing race conditions and duplicate processing
-- SOLUTION: Added check at start of `_check_and_reopen()` loop to skip tickets already in `processed_deals`
-- LOCATION: `core/strategy_engine.py` lines 987-993
-
-**2. Fix 1: Merge Dual Loop in `_check_and_reopen()`**
-- PROBLEM: Two separate loops processed `confirmed_closed_tickets`. The first loop deleted from snapshot, then the second loop tried to access deleted items (KeyError). This prevented leapfrog logic and `next_action` reset from executing.
-- SOLUTION: Merged all unique logic from loop 2 into loop 1, removed duplicate loop 2. Added:
-  - `next_action` reset based on grid polarity
-  - TP detection for leapfrog decision
-  - Leapfrog scheduling via `asyncio.create_task()`
-  - Call to `_reopen_pair_at_same_level()` instead of duplicate inline code
-- LOCATION: `core/strategy_engine.py` lines 1033-1088
-
-**3. Fix 3: Immediate Execution on Reopen**
-- PROBLEM: After TP/SL reset, `_reopen_pair_at_same_level()` only placed pending orders. If price was already at trigger level, the zone logic prevented re-triggering because it requires price to LEAVE and RETURN.
-- SOLUTION: After placing pending triggers, check if current price is at trigger level using grid polarity logic. If conditions met, execute market order immediately and set appropriate flags.
-- LOCATION: `core/strategy_engine.py` lines 1260-1332
-
-**4. Fix 2: Separate Lot Index Per Direction**
-- PROBLEM: Single `trade_count` was used for BOTH BUY and SELL lot sizing. If BUY executed first, SELL would use lot_sizes[1] instead of lot_sizes[0].
-- SOLUTION: Added separate `buy_lot_index` and `sell_lot_index` counters to `GridPair`. Updated:
-  - `GridPair.get_next_lot()` to accept direction parameter
-  - `GridPair.advance_lot_index(direction)` method
-  - `GridPair.reset_lot_indices()` method
-  - All 22+ `advance_toggle()` call sites to also call `advance_lot_index(direction)`
-  - `save_state()` and `load_state()` for persistence
-- LOCATION: `core/strategy_engine.py` lines 42-117 (GridPair), multiple call sites throughout
-
-### Files Modified
-- `core/strategy_engine.py` - All 4 fixes
-
-### Potential Issues to Monitor
-1. **Leapfrog Async Scheduling**: Uses `asyncio.create_task()` - ensure event loop is running
-2. **Backwards Compatibility**: Old state files will load with `buy_lot_index=0` and `sell_lot_index=0` defaults - this is correct behavior
-3. **Immediate Execution Race**: Immediate execution sets `in_zone=True` to prevent double execution on same tick
-
-## Last Updated
-2025-12-22 19:10 - CHAIN EXECUTION FIX
-
-### Fix 5: Chain Execution After TP/SL Reset (Dec 22, 2025)
-
-**PROBLEM**: After TP/SL reset, immediate execution in `_reopen_pair_at_same_level()` did NOT chain to adjacent pairs. For example, B[0] would execute but S[1] would stay pending.
-
-**EXPECTED BEHAVIOR**: 
-- B[n] triggers → S[n+1] must also trigger (same price)
-- S[n] triggers → B[n-1] must also trigger (same price)
-
-**SOLUTION**: Added chain execution logic to 6 key functions:
-1. `_reopen_pair_at_same_level()` - forward/backward chain after immediate execution
-2. `_do_leapfrog_up()` - backward chain (S[new] → B[new-1])
-3. `_do_leapfrog_down()` - forward chain (B[new] → S[new+1])  
-4. `_do_leapfrog_untriggered_up()` - backward chain
-5. `_do_leapfrog_untriggered_down()` - forward chain
-
-**KEY RULE**: Chain logic now works for ALL scenarios:
-- Normal trigger (in `_check_virtual_triggers`)
-- After TP/SL reset (in `_reopen_pair_at_same_level`)
-- After leapfrog (in all 4 leapfrog functions)
-
-## Last Updated
-2025-12-22 20:15 - LOT SIZE LOGIC CLARIFICATION
-
-### CRITICAL: Lot Size Logic (Per Pair, Sequential by Toggle Order)
-
-**CORRECT Implementation:**
-Lot sizes follow `trade_count` which increments with each trade via `advance_toggle()`.
-
-| Trade # | trade_count | Lot Size (if [0.01, 0.02, 0.03]) |
-|---------|-------------|-----------------------------------|
-| 1st trade | 0 | 0.01 |
-| 2nd trade | 1 | 0.02 |
-| 3rd trade | 2 | 0.03 |
-| 4th trade | 3 | 0.01 (wraps) |
-
-**Key Rules:**
-1. Use ONLY `trade_count` for lot sizing. NO separate buy/sell indices.
-2. `trade_count` is per-pair, advanced by `advance_toggle()`.
-3. After TP/SL, reset `trade_count = 0` so next trade uses `lot_sizes[0]`.
-4. Toggle alternates direction: buy→sell→buy→sell, but lot sizing is sequential.
-
-**Example Pair 0:**
-- B0 opens first (trade_count=0) → 0.01
-- S0 opens second (trade_count=1) → 0.02
-- B0 opens again (trade_count=2) → 0.03
-- S0 opens again (trade_count=3) → wraps to 0.01
-
-**Chain Execution Lot Size:**
-When B[n] chains to S[n+1], the S[n+1] uses ITS OWN pair's trade_count, not B[n]'s.
-
-### Fix 2 REVERTED (Was Wrong):
-The separate `buy_lot_index` / `sell_lot_index` was INCORRECT.
-It made BUY always use 0.01 and SELL always start at 0.01 independently.
-This has been reverted to use single `trade_count` per pair.
-
-## Last Updated
-2025-12-24 00:12 - COMPREHENSIVE BUG AUDIT & FIX
-
-### CRITICAL BUGS IDENTIFIED (Dec 24, 2025)
-
-**User Confirmed Requirements:**
-1. max_positions = 5 (hard cap)
-2. Once 5 trades executed on a pair, NO MORE trades until TP/SL resets it
-3. After TP/SL, pair resets to trade_count=0 (lot 0.01)
-4. Reopen uses SAME price levels, just flipped order types
-5. Adjacent chained pairs must execute correctly
-6. Late chain catch-up should respect toggle/max_positions
+**AUTHORITATIVE SPECIFICATION — V3.0**
+No assumptions. No gaps. No contradictions.
 
 ---
 
-### BUG #1: `get_next_lot()` Uses Modulo - Allows Trades Beyond max_positions
-**Location:** Lines 78-92  
-**Problem:** Uses `self.trade_count % len(lot_sizes)` which wraps around.  
-**Evidence:** Trade #21 shows Pair -2, Lot 0.1, Trade# 5 (cycling after max)  
-**Fix:** Remove modulo. Return None/block if trade_count >= max_positions.
+## Implementation Progress
 
-### BUG #2: "Hedge Trade" Bypass Allows Infinite Cycling
-**Location:** Lines 2042-2044, 2172-2174  
-**Problem:** `is_hedge_trade = (pair.trade_count % 2 != 0)` bypasses max_positions check  
-**Evidence:** Trade #5 (odd count) bypasses check, allows Trade #6  
-**Fix:** Remove hedge trade bypass entirely. Hard cap at max_positions.
-
-### BUG #3: Chain Execution Has No `trade_count` Check
-**Location:** Lines 2113-2132, 2246-2265  
-**Problem:** Chains adjacent pairs without checking if they have room  
-**Fix:** Add `trade_count < max_positions` before any chain execution.
-
-### BUG #4: Stale Flag Reset Wipes trade_count During Normal Chain
-**Location:** Lines 2095-2110, 2228-2243  
-**Problem:** Resets trade_count=0 during chain validation, not just after TP/SL  
-**Fix:** Only reset in dedicated TP/SL handler, not during chain stale-flag check.
-
-### BUG #5: `_reopen_pair_at_same_level()` Chain Has No max_positions Guard
-**Location:** Lines 1291-1309, 1332-1350  
-**Problem:** Chains without checking adjacent pair's trade_count  
-**Fix:** Add trade_count < max_positions check.
-
-### BUG #6: Leapfrog Chain Execution Has No max_positions Guard
-**Location:** Lines 1538-1551, 1608-1621, 1689-1702, 1782-1795  
-**Problem:** All 4 leapfrog functions chain without trade_count check  
-**Fix:** Add guards in all 4 leapfrog chains.
-
-### BUG #7: Create Pair Functions Skip max_positions Check
-**Location:** Lines 1407-1416, 1477-1486  
-**Problem:** Edge pair chain has no trade_count check  
-**Fix:** Add trade_count < max_positions before edge chain.
-
-### BUG #8: Undefined Variable `volume` in Leapfrog Logging
-**Location:** Lines 1713, 1806  
-**Problem:** `volume` is used but never defined - will cause NameError  
-**Fix:** Calculate volume or use 0.0 placeholder.
-
-### BUG #9: Reopen Order Type Uses Hardcoded Flip Instead of Price Check
-**Location:** Lines 1923-1945  
-**Problem:** Uses pair index to determine order type, not actual price  
-**Fix:** Use `_get_order_type()` which checks current price dynamically.
-
-### BUG #10: Race Condition - Same Pair Executes Multiple Trades Same Tick
-**Evidence:** Logs show same pair with 2 trades at identical timestamp  
-**Problem:** `sell_filled` flag not checked/set fast enough  
-**Fix:** Add per-pair execution guard or early-exit after successful trade.
-
-### BUG #11: Late Chain Catch-Up Missing next_action and max_positions Check
-**Location:** Lines 2296-2335  
-**Problem:** Executes missed chains without verifying toggle state  
-**Fix:** Add next_action and trade_count < max_positions checks.
+| Phase | Status | Files |
+|-------|--------|-------|
+| **Phase 1: Data Models & Persistence** | ✅ Complete | `core/models.py`, `db/schema.sql`, `core/persistence/repository.py` |
+|✅ **Phase 2: Strategy Engine + MT5 Bridge** — Complete (Corrected Strict)
+   - **MT5 Authority**: MT5 is the sole truth. `on_external_tick` validates against `bridge.get_tick`.
+   - **Strict Surface**: `MT5Bridge` exposes ONLY `initialize`, `shutdown`, `get_tick`, `execute_market_order`, `close_position`, `get_positions`, `get_deals_since`. NO dicts.
+   - **Tick Contract**: Strict deduplication (bid/ask equality check) and monotonicity (time_msc check).
+   - **Persistence**: No execution = No persistence. Checkpoints saved only if tick flows through validation.
+   - **Failure Modes**: MT5 disconnect/failure aborts tick immediately without side effects./`
+| Phase 3: Core Grid Engine | 🔲 Pending | `core/engine/pair_engine.py`, `core/engine/hedge_engine.py`, `core/engine/symbol_engine.py` |
+| Phase 4: Invariant Checker | 🔲 Pending | `core/invariants/checker.py` |
+| Phase 5: Recovery & Reconciliation | 🔲 Pending | `core/recovery/reconciler.py` |
+| Phase 6: Testing | 🔲 Pending | `tests/` |
 
 ---
 
-### FIX IMPLEMENTATION PLAN
+## 1. System Purpose
 
-| Bug | File | Lines | Fix Description |
-|-----|------|-------|-----------------|
-| 1 | strategy_engine.py | 78-92 | Replace modulo with clamping, return None at max |
-| 2 | strategy_engine.py | 2042-2044, 2172-2174 | Remove hedge bypass, hard cap only |
-| 3 | strategy_engine.py | 2113-2132, 2246-2265 | Add trade_count check in chain |
-| 4 | strategy_engine.py | 2095-2110, 2228-2243 | Remove trade_count reset from chain stale-check |
-| 5 | strategy_engine.py | 1291-1309, 1332-1350 | Add trade_count check in reopen chain |
-| 6 | strategy_engine.py | 1538-1551, 1608-1621, 1689-1702, 1782-1795 | Add guards in all 4 leapfrog chains |
-| 7 | strategy_engine.py | 1407-1416, 1477-1486 | Add trade_count check in create pair chain |
-| 8 | strategy_engine.py | 1713, 1806 | Fix undefined volume variable |
-| 9 | strategy_engine.py | 1923-1945 | Use _get_order_type() instead of flip logic |
-| 10 | strategy_engine.py | 2335-2340 | Add volume==None check in _execute_market_order |
-| 11 | strategy_engine.py | 2296-2335 | Add next_action + trade_count checks |
+This system is an **infinite, geometry-driven grid trading engine** for MT5 synthetic indices (FX & SFX Volatility pairs only).
+The system must operate **indefinitely** on a VPS without logic degradation, restart inconsistencies, or exposure leaks.
+
+The strategy is:
+- **Pair-based**: Each pair is an independent FSM
+- **Threshold-driven**: Only price crossing triggers execution
+- **Restart-safe**: State survives VPS restarts
+- **Deterministic**: Same inputs = same outputs, always
+- **Non-degrading**: 10,000th execution behaves identically to the 1st
 
 ---
 
-### ALL 11 FIXES IMPLEMENTED (Dec 24, 2025)
+## 2. Core Definitions
 
-| Bug | Status | Description |
-|-----|--------|-------------|
-| 1 | ✅ FIXED | get_next_lot() now returns None at max instead of wrapping |
-| 2 | ✅ FIXED | Hedge trade bypass removed - hard cap only |
-| 3 | ✅ FIXED | Chain execution checks trade_count < max_positions |
-| 4 | ✅ FIXED | Stale flag detection no longer resets trade_count |
-| 5 | ✅ VERIFIED | Reopen chain already had max_positions check |
-| 6 | ✅ FIXED | All 4 leapfrog chains have max_positions check |
-| 7 | ✅ FIXED | Create pair chains have max_positions check |
-| 8 | ✅ FIXED | Leapfrog logging uses get_next_lot() instead of undefined volume |
-| 9 | ✅ FIXED | _get_reopen_order_type uses dynamic price check |
-| 10 | ✅ FIXED | _execute_market_order blocks if volume is None |
-| 11 | ✅ FIXED | Late chain catch-up checks next_action and trade_count |
+### Pip Definition (Non-Negotiable)
+
+```
+price = 100000.01
++1 pip  = 100001.01
++10 pips = 100010.01
++50 pips = 100050.01
+```
+
+All distance calculations MUST use this definition.
 
 ---
 
-### EXPECTED OUTCOME AFTER FIXES
+## 3. Grid Geometry (Infinite, Bidirectional)
 
-1. **Lot sizes follow sequence**: 0.1 → 0.2 → 0.3 → 0.4 → 0.5 → STOP
-2. **Hard cap enforced**: Once trade_count=5, pair frozen until TP/SL
-3. **TP/SL resets correctly**: trade_count=0, starts fresh
-4. **Chains respect limits**: Adjacent pairs only execute if they have room
-5. **No trades beyond max_positions**: Double-blocked at trigger and execution levels
-6. **Grid stays organized**: Visual chart shows clean ladder pattern
+### Grid Distance Configuration
 
-## Last Updated
-2025-12-25 00:15 - CRITICAL STATE MANAGEMENT & RACE CONDITION FIXES
+```
+pip_size = 1.0  # Base pip value (symbol-specific)
+grid_distance_in_pips = CONFIG VALUE (from user settings)
 
-### Critical Issues Fixed (Dec 25, 2025)
+effective_distance = grid_distance_in_pips × pip_size
+```
 
-**1. Wrong Lot Sizing & Direction After TP/SL**
-- **Symptom**: After a TP/SL reset, trades would continue with wrong lot sizes (0.3, 0.4 instead of 0.1) and often in the wrong direction (SELL instead of BUY).
-- **Root Cause**: `trade_count` was reset but `next_action` (toggle state) was NOT reset, causing the pair to resume with the wrong polarity.
-- **Fix**:
-  - In `_check_tp_sl_from_history`, explicitly reset `next_action` based on pair polarity:
-    - Index > 0 (Positive) → Reset to "sell"
-    - Index ≤ 0 (Negative/Zero) → Reset to "buy"
-  - Reset `trade_count` to 0.
+**CRITICAL DISTINCTIONS:**
+- Grid distance is **USER-DEFINED** in pips (not from MT5 spread)
+- MT5 spread is used for **ALIGNMENT ONLY** (initial anchor), NOT for grid spacing
+- effective_distance is **LOCKED** per symbol session after initial calculation
+- Persisted to SQLite
+- Never recomputed mid-session
 
-**2. Missing Re-Entry Trades (Stale Flags)**
-- **Symptom**: After a position closed, the bot wouldn't always re-enter immediately.
-- **Root Cause**: The `buy_filled`/`sell_filled` and `in_zone` flags remained True after the position closed, blocking new triggers.
-- **Fix**:
-  - In `_check_tp_sl_from_history`, properly detect which side closed (using `deal.type`) and reset the corresponding flags (`filled` and `in_zone`) to False.
-  - Set `is_reopened = True` to enable immediate re-evaluation.
+### Pair Indexing (Bidirectional)
 
-**3. Double Execution (Race Condition)**
-- **Symptom**: Two identical trades executing at the same time (one from chain, one from trigger).
-- **Root Cause**: `_check_virtual_triggers` didn't check if the position was *already* filled before firing.
-- **Fix**: Added explicit guards in `_check_virtual_triggers`:
-  ```python
-  if pair.buy_filled: should_trigger_buy = False
-  if pair.sell_filled: should_trigger_sell = False
-  ```
-  This prevents the trigger loop from firing if a chain execution (or another thread) has already filled the order.
+For all integers `n ∈ ℤ` (negative, zero, positive):
 
-### Files Modified
-- `core/strategy_engine.py` - `_check_tp_sl_from_history()`, `_check_virtual_triggers()`
+```
+B[n] = B[0] + n × effective_distance
+S[n] = B[n−1]
+```
 
-### Status
-- **Verified**: Logic reviewed and confirmed to handle state transitions correctly.
-- **Ready**: Codebase updated and ready for deployment.
+**INVARIANT:** `S[n] == B[n-1]` holds across ALL pairs indefinitely.
+**INVARIANT:** `max_pairs` does NOT cap execution — grid is infinite.
+
+**Examples:**
+```
+grid_distance_in_pips = 10
+pip_size = 1.0
+effective_distance = 10.0
+B[0] = 100000
+
+Positive direction:
+  B[0] = 100000,  S[0] = 99990
+  B[1] = 100010,  S[1] = 100000 (== B[0])
+  B[2] = 100020,  S[2] = 100010 (== B[1])
+
+Negative direction:
+  B[-1] = 99990,  S[-1] = 99980
+  B[-2] = 99980,  S[-2] = 99970
+```
+
+- No maximum pair index
+- Negative indices are valid
+- Pairs created lazily when price reaches their thresholds
+- Grid expands infinitely in both directions
+
+---
+
+## 4. Fresh Grid Initialization vs Reopen (CRITICAL DISTINCTION)
+
+### B0 Definition
+
+```
+B0 is always the FIRST DEFINED LEVEL (anchor point)
+B0 is NOT always the first EXECUTED order after reset
+```
+
+### Fresh Grid Initialization (Empty Grid Only)
+
+Triggers:
+- `/start` command on empty grid
+- Nuclear reset
+- VPS restart with empty exposure
+
+**Sequence:**
+1. **B0 executes immediately as market BUY**
+2. S0 is armed at `B0 − effective_distance`
+
+**HARD RULE**: S0 can never execute before B0 on an empty grid.
+
+### After Reset (Reopen Scenario)
+
+- First execution depends on current price vs B0/S0 (see Section 11)
+- Buy may be limit or stop
+- Sell may execute first in some scenarios
+- B0 remains the ANCHOR, not necessarily the first trade
+
+---
+
+## 5. Execution Model (Threshold-Based Only)
+
+### Trigger Condition
+
+- **Only threshold crossing triggers execution**
+- Zone containment is NEVER used
+- No time-based triggers
+
+### Same-Tick Multi-Pair Execution
+
+If a single tick crosses multiple thresholds:
+
+| Rule | Specification |
+|------|--------------|
+| Execution scope | ALL crossed levels execute in the SAME event cycle |
+| Ordering | By distance from previous tick price (closest first) |
+| Rate limiting | NONE — no throttling |
+| Tick throttling | NONE |
+| Determinism | Same tick delta = same execution sequence, always |
+
+### Price Gap Handling
+
+When price gaps across multiple levels:
+
+1. Detect ALL levels crossed between previous_tick and current_tick
+2. Sort by distance from previous_tick price
+3. Execute each in order
+4. Chain propagation after each execution
+5. No skipping, no batching
+
+---
+
+## 6. Structural Chain Execution (Mandatory, Bidirectional)
+
+Execution propagates structurally in BOTH directions:
+
+| Execution | Creates | Reason |
+|-----------|---------|--------|
+| B[n] executes | S[n+1] must exist | Upward propagation |
+| S[n] executes | B[n-1] must exist | Downward propagation |
+
+**Both directions must be enforced. This is not optional.**
+
+Propagation continues until grid invariants are satisfied.
+
+**INVARIANT**: Chain propagation applies equally to:
+- Normal threshold execution
+- Reopening after reset
+- Recovery re-arming
+
+There is no "reopen mode" — all executions flow through identical logic.
+
+---
+
+## 7. Toggle Logic (Per Pair)
+
+Each pair has an independent toggle:
+
+```
+BUY → SELL → BUY → SELL → …
+```
+
+- Lot sizes follow UI order
+- Toggle resets only on nuclear reset
+- Toggle never skips
+
+---
+
+## 8. Max Positions (Per Pair)
+
+- Each pair has `max_positions` (from config)
+- When `trade_count == max_positions`:
+  - Pair is **frozen** (no further grid trades)
+  - **Hedge becomes eligible** (see Section 9)
+  - Other pairs continue unaffected
+
+---
+
+## 9. Hedge System (Per Pair, Mandatory)
+
+### Hedge Eligibility
+
+Hedge becomes eligible **only** when:
+```
+trade_count == max_positions
+```
+
+### Hedge Direction (CRITICAL INVARIANT)
+
+```
+Hedge direction = INVERSE of the LAST EXECUTED POSITION that caused max_positions
+
+- Last position was BUY  → Hedge is SELL
+- Last position was SELL → Hedge is BUY
+```
+
+**DO NOT:**
+- Infer net exposure
+- Infer dominant side
+- Use any logic other than "inverse of last executed position"
+
+### Hedge Execution Mode
+
+**IMMEDIATE ONLY** — There is no distance-based mode.
+
+- Hedge is a **market order**
+- Executed on the **next tick** after max_positions reached (to avoid race conditions)
+- No pending orders
+- No trigger prices
+
+### Hedge Lot Size
+
+- Configured per symbol via UI
+- Field: `hedge_lot_size`
+- Applied directly to market order
+
+### Hedge Lifecycle
+
+1. Hedge opens immediately after pair reaches max_positions
+2. Hedge remains open while pair is frozen
+3. Hedge closes **only** on:
+   - TP hit
+   - SL hit
+   - Nuclear reset
+4. Hedge closes **simultaneously** with pair positions (atomic)
+5. **If user manually closes hedge** → Re-open immediately (next tick market order)
+
+### Hedge Invariants (All Mandatory)
+
+| ID | Invariant |
+|----|-----------|
+| HEDGE-01 | One hedge per pair maximum (singleton) |
+| HEDGE-02 | Hedge only exists when trade_count == max_positions |
+| HEDGE-03 | Hedge direction = inverse of last executed position |
+| HEDGE-04 | Hedge must always exist after max_positions reached |
+| HEDGE-05 | Hedge must re-open after nuclear reset IF max is reached again |
+| HEDGE-06 | Hedge must NOT persist across pair reset without requalification |
+| HEDGE-07 | Hedge never increments trade_count |
+| HEDGE-08 | If manually closed → re-open immediately (next tick) |
+
+---
+
+## 10. TP/SL & Nuclear Reset (Pair-Local)
+
+### When TP or SL hits for a pair:
+
+1. All grid positions for that pair close
+2. Hedge closes **simultaneously** (atomic)
+3. Pair state resets to empty (trade_count=0, toggle=BUY)
+4. Grid structure (price levels) remains intact
+
+This is a **single atomic state transition**.
+
+### Partial Fill Handling
+
+If MT5 closes some but not all positions:
+1. Forced reconciliation with MT5
+2. Attempt to close remaining positions
+3. If still inconsistent → nuclear reset for that pair
+4. **Never halt indefinitely** — system must self-heal
+
+---
+
+## 11. Reopening After Reset (Critical Logic)
+
+After reset, reopening must:
+- Use **same exact price levels**
+- Determine order type dynamically
+- Re-enter normal execution pipeline (no special mode)
+
+### Order Type Rules
+
+| Condition | First Order | Second Order |
+|-----------|-------------|--------------|
+| `Price > B[n]` | Buy Limit @ B[n] | Sell Stop @ S[n] |
+| `Price < S[n]` | Sell Limit @ S[n] | Buy Stop @ B[n] |
+| `S[n] < Price < B[n]` | Side of last closed trade | Opposite |
+
+Where:
+- B[n] = buy level of the pair
+- S[n] = sell level of the pair
+- Price = current price
+
+**Priority for multi-pair reopen:**
+- Ordered by distance from current price (closest first)
+- Deterministic ordering (same price = same order)
+
+**INVARIANT**: Reopening can trigger chain propagation to other pairs.
+**INVARIANT**: Reopening is idempotent (same state = same result).
+
+---
+
+## 12. MT5 Architecture
+
+### Connection Model
+
+- **Single shared MT5 connection** for entire application
+- **MT5 bridge lives INSIDE the strategy engine** (not external service)
+- **Zero IPC latency** — no async boundary
+- Centralized execution gateway for thread-safety
+
+### Execution Gateway Responsibilities
+
+- Send orders (market, limit, stop)
+- Modify/cancel orders
+- Query open positions
+- Query deal history
+- **All calls are sequenced** (no parallel order sends)
+
+### Symbol Engine Isolation
+
+- One symbol engine per active symbol
+- Engines are pure decision units
+- Engines do not own the MT5 connection
+- Engines issue commands to execution gateway
+
+```
+┌─────────────────────────────────────────────────────┐
+│                  Strategy Engine                    │
+│                                                     │
+│  ┌──────────────────────────────────────────────┐  │
+│  │              MT5 Bridge (EMBEDDED)            │  │
+│  │  - Zero IPC latency                          │  │
+│  │  - No async boundary                         │  │
+│  │  - Single-threaded sequenced execution       │  │
+│  └──────────────────────────────────────────────┘  │
+│                       ▲                             │
+│  ┌───────────┐  ┌─────┴─────┐  ┌───────────┐       │
+│  │ Symbol    │  │ Symbol    │  │ Symbol    │       │
+│  │ Engine 1  │  │ Engine 2  │  │ Engine N  │       │
+│  └───────────┘  └───────────┘  └───────────┘       │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## 13. Persistence & Recovery
+
+### Storage: SQLite (ACID, crash-safe)
+
+### Persisted State
+
+| Data | Purpose |
+|------|---------|
+| Pair states | buy_price, sell_price, trade_count, toggle, frozen |
+| Effective distance | Locked per symbol session |
+| Hedge state | status, direction, ticket, last_executed_type |
+| Position map | ticket → pair_id mapping |
+| Last tick timestamp | Recovery checkpoint |
+| First buy/sell prices | Per cycle, for reference |
+
+### Restart Recovery Algorithm
+
+1. Load SQLite state
+2. Query MT5:
+   - Open positions
+   - Pending orders
+   - Deals since last timestamp
+3. Reconcile (MT5 = execution authority):
+   - MT5 shows close, local shows open → Apply reset
+   - MT5 shows open, local shows closed → Reconstruct from MT5
+   - Position count mismatch → Rebuild from MT5
+4. Rebuild grid geometry from anchors
+5. Re-arm virtual thresholds
+6. Verify reopening is idempotent
+
+**System must self-heal without manual intervention.**
+
+---
+
+## 14. Event Ordering Guarantees
+
+```
+1. Tick received
+2. Threshold crossings detected (all levels)
+3. Crossings sorted by distance from previous price
+4. For each crossing (in order):
+   a. Execute trade
+   b. Update pair state
+   c. Create companion pair (immediate)
+   d. Check hedge eligibility
+   e. Execute hedge if eligible
+5. Check for MT5 closures (TP/SL)
+6. Handle resets atomically
+7. Verify all invariants
+8. Persist checkpoint
+```
+
+---
+
+## 15. Non-Degradation Guarantee
+
+- No time-based logic
+- No "first time" flags
+- No counters tied to uptime
+- Geometry-only decisions
+- Idempotent reopening
+
+The 10,000th execution behaves exactly like the first.
+
+---
+
+## 16. Invariants (Fatal on Violation)
+
+### Core Grid Invariants
+| ID | Invariant |
+|----|-----------|
+| INV-01 | `trade_count <= max_positions` |
+| INV-02 | `S[n] == B[n-1]` for all n (grid geometry) |
+| INV-03 | Grid extends bidirectionally (negative indices valid) |
+| INV-04 | Companion creation immediate on execution |
+| INV-05 | B0 first on empty grid (not after reset) |
+| INV-06 | Effective distance immutable per symbol session |
+
+### Hedge Invariants
+| ID | Invariant |
+|----|-----------|
+| INV-07 | One hedge per pair maximum |
+| INV-08 | Hedge only after max_positions |
+| INV-09 | Hedge direction = inverse of last executed position |
+| INV-10 | Hedge never increments trade_count |
+
+### Execution Invariants
+| ID | Invariant |
+|----|-----------|
+| INV-11 | Atomic TP/SL closure (hedge + grid simultaneous) |
+| INV-12 | Same-tick multi-execution ordered deterministically |
+| INV-13 | Reopen order-type follows price vs level rules |
+| INV-14 | Reopening is idempotent (same state = same result) |
+
+### Non-Degradation Invariants
+| ID | Invariant |
+|----|-----------|
+| INV-15 | No time-based logic anywhere |
+| INV-16 | 10,000th reopen == 1st reopen behavior |
+
+---
+
+## 17. File Structure
+
+```
+core/
+├── models.py                # Data models
+├── strategy_engine.py       # Main facade with embedded MT5 bridge
+├── engine/
+│   ├── symbol_engine.py     # Per-symbol event loop
+│   ├── pair_engine.py       # Grid FSM (bidirectional)
+│   └── hedge_engine.py      # Hedge overlay controller
+├── persistence/
+│   └── repository.py        # SQLite CRUD
+├── recovery/
+│   └── reconciler.py        # MT5 state reconciliation
+├── invariants/
+│   └── checker.py           # 16 invariant checks
+└── [existing files]
+
+db/
+├── schema.sql               # SQLite schema
+└── grid_*.db                # Runtime generated
+```
+
+**No file outside `engine/` may contain strategy logic.**
+
+---
+
+## 18. Agent Boundaries
+
+You are **NOT ALLOWED** to:
+- Simplify logic
+- "Optimize" execution order
+- Change event ordering
+- Infer missing rules
+- Add time-based logic
+
+You **MUST**:
+- Follow this context verbatim
+- Stop and ask when unclear
+- Never assume trader intent
+- Ensure zero silent failure paths
