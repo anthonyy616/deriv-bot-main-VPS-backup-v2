@@ -2494,8 +2494,11 @@ class SymbolEngine:
                  h_sl = grid_price + 20 * mt5.symbol_info(self.symbol).point
         
         else: # direction == "buy"
-            h_tp = pair.pair_tp
-            h_sl = pair.pair_sl
+            # FIX: Swap TP/SL from the existing Sell positions (same logic as sell hedge)
+            # Sell's SL (ABOVE) becomes Buy's TP (ABOVE)
+            # Sell's TP (BELOW) becomes Buy's SL (BELOW)
+            h_tp = pair.pair_sl
+            h_sl = pair.pair_tp
             
             # Fallback
             if h_tp == 0.0 or h_sl == 0.0:
