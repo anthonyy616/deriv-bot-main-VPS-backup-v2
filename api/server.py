@@ -9,10 +9,21 @@ from core.trading_engine import TradingEngine
 from supabase import create_client, Client
 import asyncio
 import os
+import signal
+import sys
 from dotenv import load_dotenv
 from cachetools import TTLCache 
 
 load_dotenv()
+
+# --- FRESH SESSION: Clean stale DB on boot ---
+DB_PATH = "db/grid_v3.db"
+if os.path.exists(DB_PATH):
+    try:
+        os.remove(DB_PATH)
+        print(f"[STARTUP] Cleaned stale DB: {DB_PATH}")
+    except Exception as e:
+        print(f"[STARTUP] Could not clean DB (may be locked): {e}")
 
 app = FastAPI()
 
@@ -215,3 +226,13 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/")
 async def read_index():
     return FileResponse('static/index.html')
+
+
+# --- 4. Simplified Signal Handling ---
+def cleanup_handler(signum, frame):
+    """Handle SIGINT (Ctrl+C) - exit cleanly. DB cleanup handled on next startup."""
+    print("\n[SERVER] Caught Signal. Exiting...")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, cleanup_handler)
+print("[SERVER] Signal Handler Registered")
