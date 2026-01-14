@@ -2,6 +2,7 @@ import uuid
 from typing import Dict
 from core.config_manager import ConfigManager
 from core.strategy_orchestrator import StrategyOrchestrator
+from core.engine.symbol_engine import SymbolEngine
 
 class BotManager:
     def __init__(self):

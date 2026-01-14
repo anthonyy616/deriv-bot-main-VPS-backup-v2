@@ -471,7 +471,8 @@ class SymbolEngine:
         pass
     
     async def start(self):
-        self.running = True
+        # FIX: Don't set self.running = True yet - wait until fully initialized
+        # This prevents race conditions where ticks arrive before DB is ready
         self.start_time = time.time()
         
         # FRESH SESSION: Delete stale DB before init
@@ -500,6 +501,10 @@ class SymbolEngine:
             print(f"[START] {self.symbol}: Fresh Start - B0 will execute")
         else:
              print(f"[START] {self.symbol}: Resumed with {len(self.pairs)} pairs.")
+        
+        # FIX: Only enable tick processing AFTER everything is initialized
+        # This is the last line to prevent race conditions
+        self.running = True
     
     async def stop(self):
         """
@@ -748,6 +753,9 @@ class SymbolEngine:
                         
                         print(f" {self.symbol}: [INIT] Establishing S1 (Pair 1).")
                         pair1 = GridPair(index=1, buy_price=p1_buy_price, sell_price=p1_sell_target)
+                        # FIX: Positive pairs start with SELL, so set next_action="sell"
+                        # After advance_toggle(), it will correctly become "buy"
+                        pair1.next_action = "sell"
                         self.pairs[1] = pair1
                         
                         # For INIT, we typically want the grid ACTIVE.
@@ -2888,6 +2896,16 @@ class SymbolEngine:
             pair.is_reopened = bool(row['is_reopened'])
             pair.buy_in_zone = bool(row['buy_in_zone'])
             pair.sell_in_zone = bool(row['sell_in_zone'])
+            
+            # ===== SANITY CHECK: Fix State Desync =====
+            # If pair is marked as filled but trade_count is 0, the DB was saved
+            # inconsistently (crash during save). Correct it to prevent duplicate orders.
+            if (pair.buy_filled or pair.sell_filled) and pair.trade_count == 0:
+                print(f"[SANITY] {self.symbol} Pair {idx}: Filled but trade_count=0 - correcting to trade_count=1")
+                pair.trade_count = 1
+                pair.buy_in_zone = True if pair.buy_filled else pair.buy_in_zone
+                pair.sell_in_zone = True if pair.sell_filled else pair.sell_in_zone
+            # ===== END SANITY CHECK =====
             
             self.pairs[idx] = pair
             # Update ground truth
