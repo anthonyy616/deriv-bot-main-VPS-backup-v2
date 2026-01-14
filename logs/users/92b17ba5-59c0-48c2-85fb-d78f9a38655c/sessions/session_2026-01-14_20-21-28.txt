@@ -166,3 +166,58 @@ USER ID: 92b17ba5-59c0-48c2-85fb-d78f9a38655c
   Trade #: 0
   Ticket: 237353546
 
+[20:28:48] TRADE #19
+  Symbol: FX Vol 20
+  Pair: 7
+  Direction: SELL
+  Price: 111098.05
+  Lot: 0.03
+  Trade #: 0
+  Ticket: 237354596
+
+[20:29:48] TRADE #20
+  Symbol: FX Vol 20
+  Pair: 6
+  Direction: SELL
+  Price: 111074.87
+  Lot: 0.03
+  Trade #: 0
+  Ticket: 237355531
+
+[20:30:07] TRADE #21
+  Symbol: FX Vol 20
+  Pair: 5
+  Direction: SELL
+  Price: 111057.39
+  Lot: 0.03
+  Trade #: 0
+  Ticket: 237355835
+
+[20:32:14] SL HIT
+  Symbol: FX Vol 20
+  Pair: 1
+  Direction: BUY
+  Profit: $-0.36
+
+[20:34:14] TP HIT
+  Symbol: FX Vol 20
+  Pair: 1
+  Direction: BUY
+  Profit: +$0.65
+
+[20:35:01] SL HIT
+  Symbol: FX Vol 20
+  Pair: 0
+  Direction: SELL
+  Profit: $-0.94
+
+[20:35:01] TRADE #22
+  Symbol: FX Vol 20
+  Pair: 0
+  Direction: BUY
+  Price: 111078.06
+  Lot: 0.01
+  Trade #: 0
+  Ticket: 237358513
+
+[20:40:47] BUTTON: Terminate All

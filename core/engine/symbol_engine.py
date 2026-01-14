@@ -1032,6 +1032,10 @@ class SymbolEngine:
         # [FIX] Check TP/SL from MT5 history FIRST (before triggers/reopen)
         await self._check_tp_sl_from_history()
         
+        # [HEDGE SUPERVISOR] Enforce hedge rules BEFORE processing new triggers
+        # This ensures hedges are placed on the tick AFTER max positions is reached
+        await self._enforce_hedge_invariants()
+        
         # 1. Check virtual triggers (monitor prices and fire market orders)
         await self._check_virtual_triggers(ask, bid)
         
@@ -2420,6 +2424,40 @@ class SymbolEngine:
                                 if abs(tick.bid - check_pair.sell_price) < 7.0: # Freshness check
                                     await self._execute_trade_with_chain("sell", check_idx)
     
+    async def _enforce_hedge_invariants(self):
+        """
+        HEDGE SUPERVISOR: State-based enforcement of hedge rules.
+        
+        This runs at the START of every tick cycle (before triggers) to ensure
+        hedges are placed when required. This is more robust than trying to
+        fire hedges atomically during trade execution because:
+        
+        1. Decoupling - Trade logic and hedge logic don't fight for resources
+        2. Resilience - If hedge fails, it retries on next tick
+        3. Crash-proof - On restart, supervisor sees missing hedge and fixes it
+        
+        Rule: If trade_count >= max_positions AND hedge_active is False -> Execute Hedge
+        """
+        if not self.hedge_enabled:
+            return
+            
+        for idx, pair in self.pairs.items():
+            # Check if this pair needs a hedge
+            if pair.trade_count == self.max_positions and not pair.hedge_active:
+                # Determine hedge direction (opposite of next_action, or based on exposure)
+                # If next_action is "buy", we sold last, so hedge with buy
+                # If next_action is "sell", we bought last, so hedge with sell
+                hedge_direction = pair.next_action
+                
+                print(f" {self.symbol}: [HEDGE SUPERVISOR] Pair {idx} at max positions ({pair.trade_count}/{self.max_positions}) - Executing hedge ({hedge_direction.upper()})")
+                
+                success = await self._execute_hedge(idx, hedge_direction)
+                
+                if success:
+                    print(f" {self.symbol}: [HEDGE SUPERVISOR] Hedge for Pair {idx} SUCCESSFUL")
+                else:
+                    print(f" {self.symbol}: [HEDGE SUPERVISOR] Hedge for Pair {idx} FAILED - will retry next tick")
+
     async def _execute_hedge(self, pair_index: int, direction: str) -> bool:
         """
         Execute a HEDGE order to lock the pair when max_positions is reached.
