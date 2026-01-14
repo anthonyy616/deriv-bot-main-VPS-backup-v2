@@ -2300,7 +2300,7 @@ class SymbolEngine:
             
             # --- BUY TRIGGER ---
             if idx > 0:   buy_in_zone_now = ask >= pair.buy_price
-            elif idx < 0: buy_in_zone_now = bid <= pair.buy_price
+            elif idx < 0: buy_in_zone_now = bid >= pair.buy_price
             else:         buy_in_zone_now = ask >= pair.buy_price
             
             # Zone EXIT
@@ -2314,10 +2314,14 @@ class SymbolEngine:
             # Zone ENTRY Logic
             buy_attempt_failed = False
             
-            # Reopened pairs bypass zone checks (must trigger immediately on level touch)
-            if pair.is_reopened:
+            # FIX: Zone latch only applies to FIRST trade (trade_count==0).
+            # Subsequent trades (trade_count > 0) fire immediately while in zone.
+            # Reopened pairs also bypass zone checks.
+            if pair.is_reopened or pair.trade_count > 0:
+                # Immediate trigger - no leave-and-return required
                 should_trigger_buy = buy_in_zone_now and pair.next_action == "buy"
             else:
+                # First trade requires leave-and-return (edge detection)
                 should_trigger_buy = buy_in_zone_now and not pair.buy_in_zone and pair.next_action == "buy"
             
             if should_trigger_buy:
@@ -2343,7 +2347,7 @@ class SymbolEngine:
 
             
             # --- SELL TRIGGER ---
-            if idx > 0:   sell_in_zone_now = ask >= pair.sell_price
+            if idx > 0:   sell_in_zone_now = ask <= pair.sell_price
             elif idx < 0: sell_in_zone_now = bid <= pair.sell_price
             else:         sell_in_zone_now = bid <= pair.sell_price
             
@@ -2358,9 +2362,14 @@ class SymbolEngine:
             # Zone ENTRY Logic
             sell_attempt_failed = False
             
-            if pair.is_reopened:
+            # FIX: Zone latch only applies to FIRST trade (trade_count==0).
+            # Subsequent trades (trade_count > 0) fire immediately while in zone.
+            # Reopened pairs also bypass zone checks.
+            if pair.is_reopened or pair.trade_count > 0:
+                # Immediate trigger - no leave-and-return required
                 should_trigger_sell = sell_in_zone_now and pair.next_action == "sell"
             else:
+                # First trade requires leave-and-return (edge detection)
                 should_trigger_sell = sell_in_zone_now and not pair.sell_in_zone and pair.next_action == "sell"
             
             if should_trigger_sell:
@@ -2897,15 +2906,35 @@ class SymbolEngine:
             pair.buy_in_zone = bool(row['buy_in_zone'])
             pair.sell_in_zone = bool(row['sell_in_zone'])
             
-            # ===== SANITY CHECK: Fix State Desync =====
-            # If pair is marked as filled but trade_count is 0, the DB was saved
-            # inconsistently (crash during save). Correct it to prevent duplicate orders.
+            # ===== ROBUST STATE SYNCHRONIZATION =====
+            # Enforce invariants regardless of what was saved in DB.
+            # This prevents race conditions after crashes/restarts.
+            
+            # 1. FIX NEGATIVE PAIR RACE: Always latch zone if filled
+            #    If position is filled, zone MUST be latched to prevent re-trigger
+            if pair.buy_filled:
+                pair.buy_in_zone = True
+            if pair.sell_filled:
+                pair.sell_in_zone = True
+            
+            # 2. FIX POSITIVE PAIR WRONG DIRECTION: Sync toggle with fill state
+            #    If we have a sell but no buy (or last was sell), next must be buy
+            if pair.sell_filled and not pair.buy_filled:
+                if pair.next_action != "buy":
+                    print(f"[SYNC] {self.symbol} Pair {idx}: sell_filled but next_action was '{pair.next_action}' - correcting to 'buy'")
+                    pair.next_action = "buy"
+            elif pair.buy_filled and not pair.sell_filled:
+                if pair.next_action != "sell":
+                    print(f"[SYNC] {self.symbol} Pair {idx}: buy_filled but next_action was '{pair.next_action}' - correcting to 'sell'")
+                    pair.next_action = "sell"
+            
+            # 3. SANITY CHECK: Repair trade_count if 0 but filled
+            #    If pair is filled but trade_count is 0, the DB was saved inconsistently
             if (pair.buy_filled or pair.sell_filled) and pair.trade_count == 0:
                 print(f"[SANITY] {self.symbol} Pair {idx}: Filled but trade_count=0 - correcting to trade_count=1")
                 pair.trade_count = 1
-                pair.buy_in_zone = True if pair.buy_filled else pair.buy_in_zone
-                pair.sell_in_zone = True if pair.sell_filled else pair.sell_in_zone
-            # ===== END SANITY CHECK =====
+            
+            # ===== END STATE SYNCHRONIZATION =====
             
             self.pairs[idx] = pair
             # Update ground truth
