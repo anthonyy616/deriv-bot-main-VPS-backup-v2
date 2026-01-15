@@ -2290,7 +2290,7 @@ class SymbolEngine:
         order_type = 0 if direction == "buy" else 1  # 0=BUY, 1=SELL in MT5
         
         for pos in positions:
-            price_match = abs(pos.price_open - target_price) < 2.0  # Within 2.0 tolerance
+            price_match = abs(pos.price_open - target_price) < 5.0  # Within 5.0 tolerance
             lot_match = abs(pos.volume - expected_lot) < 0.001
             type_match = pos.type == order_type
             
@@ -2438,7 +2438,7 @@ class SymbolEngine:
         sorted_items = sorted(self.pairs.items(), key=lambda x: x[0])
         
         # Tolerance for proximity check (price must be within this distance to "touch" the level)
-        tolerance = self.spread * 0.1  # 10% of spread, or use fixed 2.0 points
+        tolerance = self.spread * 0.1  # 10% of spread, or use fixed 5.0 points
         
         for idx, pair in sorted_items:
             # Validation: Ensure spread consistency
