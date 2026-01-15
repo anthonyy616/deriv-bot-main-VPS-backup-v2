@@ -572,8 +572,8 @@ class SymbolEngine:
         closed_count = 0
         if positions:
             for pos in positions:
-                # CRITICAL FIX (Bug 5): Pass position object, not ticket
-                if self._close_position(pos):  # Changed from self._close_position(pos.ticket)
+                # Pass the ticket number (int), not the position object
+                if self._close_position(pos.ticket):
                     closed_count += 1
                 else:
                     print(f"[ERROR] Failed to close position {pos.ticket}")
@@ -595,9 +595,8 @@ class SymbolEngine:
         self.pairs = {}
         self.center_price = 0.0
         
-        # Clear state file
-        if os.path.exists(self.state_file):
-            os.remove(self.state_file)
+        # Reset position tracking for drop detection
+        self.last_pair_counts = defaultdict(int)
         
         print(f"[TERMINATE] {self.symbol}: Grid reset complete.")
 
@@ -1312,10 +1311,10 @@ class SymbolEngine:
             deals = mt5.history_deals_get(from_time, datetime.now(), symbol=self.symbol)
             
             # DEBUG: Log deal query results
-            if deals:
-                print(f"[DEBUG] {self.symbol}: Found {len(deals)} deals since {from_time}")
-                for d in deals[-5:]:  # Show last 5 deals
-                    print(f"   Deal {d.ticket}: reason={d.reason}, magic={d.magic}, type={d.type}, symbol={d.symbol}")
+            #if deals:
+            #    print(f"[DEBUG] {self.symbol}: Found {len(deals)} deals since {from_time}")
+            #    for d in deals[-5:]:  # Show last 5 deals
+            #        print(f"   Deal {d.ticket}: reason={d.reason}, magic={d.magic}, type={d.type}, symbol={d.symbol}")
             
             if not deals:
                 return
@@ -2434,8 +2433,12 @@ class SymbolEngine:
         FIXED: 
         1. Removes 'Latch' logic that prevented re-entry after first fill.
         2. Uses trade_count < max_positions as the primary guard.
+        3. PROXIMITY-BASED RE-ENTRY: Reopened pairs wait for price to TOUCH the level.
         """
         sorted_items = sorted(self.pairs.items(), key=lambda x: x[0])
+        
+        # Tolerance for proximity check (price must be within this distance to "touch" the level)
+        tolerance = self.spread * 0.1  # 10% of spread, or use fixed 2.0 points
         
         for idx, pair in sorted_items:
             # Validation: Ensure spread consistency
@@ -2443,6 +2446,37 @@ class SymbolEngine:
             if abs(pair.buy_price - expected_buy_price) > 0.5:
                 pair.buy_price = pair.sell_price + self.spread
                 await self.save_state()
+            
+            # ================================================================
+            # PROXIMITY-BASED RE-ENTRY FOR PHOENIX PAIRS
+            # When is_reopened=True, we ONLY use proximity check (price must TOUCH level)
+            # This prevents firing when price is far away (e.g., price 60 vs level 90)
+            # ================================================================
+            if pair.is_reopened:
+                # Check BUY proximity
+                if pair.next_action == "buy":
+                    buy_proximity = abs(ask - pair.buy_price) <= tolerance
+                    if buy_proximity and pair.trade_count < self.max_positions:
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} touched BUY level {pair.buy_price:.2f}")
+                        await self._execute_trade_with_chain("buy", idx)
+                    # If not close enough, do nothing - just wait
+                    continue  # Skip standard logic for this pair
+                
+                # Check SELL proximity
+                if pair.next_action == "sell":
+                    sell_proximity = abs(bid - pair.sell_price) <= tolerance
+                    if sell_proximity and pair.trade_count < self.max_positions:
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} touched SELL level {pair.sell_price:.2f}")
+                        await self._execute_trade_with_chain("sell", idx)
+                    # If not close enough, do nothing - just wait
+                    continue  # Skip standard logic for this pair
+                
+                # If we get here, just skip to next pair
+                continue
+            
+            # ================================================================
+            # STANDARD DIRECTIONAL LOGIC (for normal pairs, not reopened)
+            # ================================================================
             
             # --- BUY TRIGGER ---
             if idx > 0:   buy_in_zone_now = ask >= pair.buy_price
@@ -2460,10 +2494,10 @@ class SymbolEngine:
             # Zone ENTRY Logic
             buy_attempt_failed = False
             
-            # FIX: Zone latch only applies to FIRST trade (trade_count==0).
+            # Zone latch only applies to FIRST trade (trade_count==0).
             # Subsequent trades (trade_count > 0) fire immediately while in zone.
-            # Reopened pairs also bypass zone checks.
-            if pair.is_reopened or pair.trade_count > 0:
+            # NOTE: Reopened pairs are handled by PROXIMITY check above and won't reach here.
+            if pair.trade_count > 0:
                 # Immediate trigger - no leave-and-return required
                 should_trigger_buy = buy_in_zone_now and pair.next_action == "buy"
             else:
@@ -2508,10 +2542,10 @@ class SymbolEngine:
             # Zone ENTRY Logic
             sell_attempt_failed = False
             
-            # FIX: Zone latch only applies to FIRST trade (trade_count==0).
+            # Zone latch only applies to FIRST trade (trade_count==0).
             # Subsequent trades (trade_count > 0) fire immediately while in zone.
-            # Reopened pairs also bypass zone checks.
-            if pair.is_reopened or pair.trade_count > 0:
+            # NOTE: Reopened pairs are handled by PROXIMITY check above and won't reach here.
+            if pair.trade_count > 0:
                 # Immediate trigger - no leave-and-return required
                 should_trigger_sell = sell_in_zone_now and pair.next_action == "sell"
             else:
