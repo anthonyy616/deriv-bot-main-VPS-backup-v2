@@ -378,6 +378,9 @@ class SymbolEngine:
         self.last_deal_check_time: float = time.time()  # Track last history query time
         self.processed_deals: deque = deque(maxlen=1000)  # Auto-cleanup: keeps last 1000 deals only
         
+        # --- Position Drop Detection (Nuclear Reset) ---
+        self.last_pair_counts: Dict[int, int] = defaultdict(int)  # Track position count per pair from previous tick
+        
         # --- MUTEX LOCKS (Race Condition Prevention) ---
         self.execution_lock = asyncio.Lock()       # Global lock for atomic B[n] + S[n+1] chains
         # self.pair_locks REMOVED - not used or can be simplified
@@ -1029,7 +1032,11 @@ class SymbolEngine:
                     await self.save_state()
                     return  # Exit, next tick will run _handle_init
         
-        # [FIX] Check TP/SL from MT5 history FIRST (before triggers/reopen)
+        # [PRIMARY] POSITION DROP DETECTION - Most reliable Nuclear Reset trigger
+        # This detects ANY position decrease (TP, SL, manual close) and triggers reset
+        await self._monitor_position_drops()
+        
+        # [BACKUP] Check TP/SL from MT5 history (less reliable, kept as secondary)
         await self._check_tp_sl_from_history()
         
         # [HEDGE SUPERVISOR] Enforce hedge rules BEFORE processing new triggers
@@ -1168,16 +1175,147 @@ class SymbolEngine:
                             print(f" {self.symbol}: Chained Pair {next_idx} from S{idx}. B@{new_buy:.2f} S@{new_sell:.2f} [next=BUY]")
                             await self.save_state()
                             return
-    
+
+    async def _monitor_position_drops(self):
+        """
+        POSITION DROP DETECTION: Reliable Nuclear Reset trigger.
+        
+        This method detects when the number of open positions for a pair DECREASES,
+        which indicates a TP, SL, or manual close happened. When detected:
+        1. Close ALL remaining positions for that pair (kill survivors)
+        2. Execute Phoenix reset (destroy & recreate pair)
+        3. Save state immediately
+        
+        This is MORE RELIABLE than the MT5 history check because it catches:
+        - TP closures
+        - SL closures
+        - Manual user closures
+        - Any other position reduction
+        """
+        # Get all current positions for this symbol
+        positions = mt5.positions_get(symbol=self.symbol)
+        
+        # Group positions by pair index
+        current_counts: Dict[int, int] = defaultdict(int)
+        if positions:
+            for pos in positions:
+                if pos.magic >= 50000:
+                    pair_idx = pos.magic - 50000
+                    current_counts[pair_idx] += 1
+        
+        # Check for drops in ALL known pairs (both from last_pair_counts and self.pairs)
+        all_pair_indices = set(self.last_pair_counts.keys()) | set(self.pairs.keys())
+        
+        for pair_idx in all_pair_indices:
+            old_count = self.last_pair_counts.get(pair_idx, 0)
+            new_count = current_counts.get(pair_idx, 0)
+            
+            # CRITICAL CONDITION: Position count DECREASED
+            if old_count > 0 and new_count < old_count:
+                print(f"[DROP DETECTED] {self.symbol} Pair {pair_idx}: {old_count} -> {new_count} positions. Executing NUCLEAR RESET.")
+                
+                # Check if pair exists in memory
+                pair = self.pairs.get(pair_idx)
+                if not pair:
+                    print(f"   [WARNING] Pair {pair_idx} not in memory, skipping reset")
+                    continue
+                
+                # Step 1: KILL ALL SURVIVORS (close any remaining positions)
+                if new_count > 0:
+                    print(f"   [CLEANUP] Closing {new_count} remaining positions for Pair {pair_idx}")
+                    await self._close_pair_positions(pair_idx, "both")
+                
+                # Step 2: Close hedge if active
+                if pair.hedge_active and pair.hedge_ticket:
+                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
+                    self._close_position(pair.hedge_ticket)
+                
+                # Step 3: Determine restart direction based on PAIR POLARITY
+                # Positive pairs -> Start with SELL
+                # Negative/Zero pairs -> Start with BUY
+                if pair_idx > 0:
+                    restart_direction = "sell"
+                else:
+                    restart_direction = "buy"
+                
+                # Step 4: EXECUTE PHOENIX RESET
+                self._phoenix_reset_pair(pair_idx, restart_direction)
+                
+                # Step 5: SAVE IMMEDIATELY (crash protection)
+                await self.save_state()
+                
+                # Step 6: Force current count to 0 (we just closed everything)
+                current_counts[pair_idx] = 0
+        
+        # Update state for next tick comparison
+        self.last_pair_counts = current_counts
+
+
+    def _phoenix_reset_pair(self, pair_index: int, start_direction: str) -> None:
+        """
+        PHOENIX SYSTEM: Nuclear reset via Destroy & Recreate.
+        
+        Instead of manually resetting fields on an existing GridPair (which risks
+        keeping stale flags like hedge_active, buy_in_zone, etc.), we:
+        1. Capture the old pair's price levels (buy_price, sell_price)
+        2. Delete the old GridPair object entirely
+        3. Create a fresh GridPair at the same price levels
+        4. Apply re-open invariants (trade_count=0, is_reopened=True)
+        
+        Args:
+            pair_index: The index of the pair to reset
+            start_direction: "buy" or "sell" - direction based on what position just closed
+        """
+        old_pair = self.pairs.get(pair_index)
+        if not old_pair:
+            print(f"[PHOENIX] WARNING: Pair {pair_index} not found, cannot reset")
+            return
+        
+        # Step 1: Capture price levels (preserve grid structure)
+        buy_price = old_pair.buy_price
+        sell_price = old_pair.sell_price
+        
+        # Step 2: Destroy old pair (nuclear delete)
+        del self.pairs[pair_index]
+        
+        # Step 3: Create fresh GridPair at same price levels
+        new_pair = GridPair(
+            index=pair_index,
+            buy_price=buy_price,
+            sell_price=sell_price
+        )
+        
+        # Step 4: Apply re-open invariants
+        new_pair.trade_count = 0                    # Forces Lot Size Index 0 -> 0.01
+        new_pair.next_action = start_direction      # Direction of closed deal
+        new_pair.is_reopened = True                 # Bypasses zone latch logic
+        new_pair.hedge_active = False               # Clean hedge state
+        new_pair.buy_filled = False                 # Clean fill state
+        new_pair.sell_filled = False                # Clean fill state
+        new_pair.buy_in_zone = False                # Clean zone state
+        new_pair.sell_in_zone = False               # Clean zone state
+        
+        # Step 5: Re-insert into pairs dict
+        self.pairs[pair_index] = new_pair
+        
+        print(f"[PHOENIX] Reset Pair {pair_index}: Count=0, Next={start_direction}, Reopened=True")
 
     async def _check_tp_sl_from_history(self):
         """
-        SIMPLIFIED: Only reset trade_count when TP/SL is hit.
-        Don't touch any other flags - let position-based logic handle execution.
+        PHOENIX SYSTEM: Detect TP/SL hits and perform nuclear pair reset.
+        
+        Uses _phoenix_reset_pair to destroy and recreate pairs, guaranteeing
+        no stale flags survive the reset.
         """
         try:
             from_time = datetime.fromtimestamp(self.last_deal_check_time)
             deals = mt5.history_deals_get(from_time, datetime.now(), symbol=self.symbol)
+            
+            # DEBUG: Log deal query results
+            if deals:
+                print(f"[DEBUG] {self.symbol}: Found {len(deals)} deals since {from_time}")
+                for d in deals[-5:]:  # Show last 5 deals
+                    print(f"   Deal {d.ticket}: reason={d.reason}, magic={d.magic}, type={d.type}, symbol={d.symbol}")
             
             if not deals:
                 return
@@ -1194,15 +1332,20 @@ class SymbolEngine:
                 elif deal.reason == mt5.DEAL_REASON_SL:
                     reason = "SL"
                 else:
+                    # DEBUG: Show skipped deals
+                    # print(f"[DEBUG] Skipping deal {deal.ticket}: reason={deal.reason} (not TP/SL)")
                     continue
                 
                 if deal.magic < 50000:
+                    print(f"[DEBUG] Skipping {reason} deal {deal.ticket}: magic={deal.magic} < 50000")
                     continue
                 
                 pair_idx = deal.magic - 50000
                 pair = self.pairs.get(pair_idx)
                 
                 if not pair:
+                    print(f"[WARNING] {reason} detected for Pair {pair_idx} but pair not in memory! Creating fresh pair...")
+                    # Don't skip - we should still log this
                     continue
                 
                 # Mark as processed
@@ -1210,43 +1353,44 @@ class SymbolEngine:
                 
                 print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
                 
-                print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
-                
                 # [FIX] CLOSE HEDGE IF ACTIVE (Spec Section 10)
+                # Must do this BEFORE Phoenix reset destroys the pair object
                 if pair.hedge_active and pair.hedge_ticket:
                     print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket} due to Pair {reason}")
                     self._close_position(pair.hedge_ticket)
-                    pair.hedge_active = False
-                    pair.hedge_ticket = 0
-                    pair.hedge_direction = None
+                    # Note: hedge_active will be reset by Phoenix below
 
-                # CRITICAL: Complete Pair Reset on TP/SL
-                old_count = pair.trade_count
-                pair.trade_count = 0
-
-                # 1. Reset Toggle / Next Action based on Polarity
-                # Positive pairs start with SELL, Negative/Zero start with BUY
-                if pair_idx > 0:
-                    pair.next_action = "sell"
-                else:
-                    pair.next_action = "buy"
-
-                # 2. Reset Flags for the CLOSED side
-                # deal.type == SELL means we closed a BUY position (Exit Long)
-                # deal.type == BUY means we closed a SELL position (Exit Short)
+                # [CRITICAL FIX] CLOSE THE SURVIVOR (Opposing Position)
+                # When one side hits TP/SL, the other side must be closed immediately
+                # deal.type == DEAL_TYPE_SELL → Buy closed → Survivor is SELL
+                # deal.type == DEAL_TYPE_BUY  → Sell closed → Survivor is BUY
                 if deal.type == mt5.DEAL_TYPE_SELL:
-                    pair.buy_filled = False
-                    pair.buy_ticket = 0
-                    pair.buy_in_zone = False
-                elif deal.type == mt5.DEAL_TYPE_BUY:
-                    pair.sell_filled = False
-                    pair.sell_ticket = 0
-                    pair.sell_in_zone = False
+                    # Buy position closed, close the Sell survivor
+                    survivor_ticket = pair.sell_ticket
+                    survivor_direction = "SELL"
+                else:
+                    # Sell position closed, close the Buy survivor
+                    survivor_ticket = pair.buy_ticket
+                    survivor_direction = "BUY"
+                
+                if survivor_ticket and survivor_ticket > 0:
+                    print(f"   [CLEANUP] Pair {pair_idx} {reason} Hit: Closing opposing {survivor_direction} position {survivor_ticket}")
+                    self._close_position(survivor_ticket)
 
-                # 3. Enable Immediate Re-entry (Bypass zone entry check)
-                pair.is_reopened = True
-
-                print(f"   [RESET] Pair {pair_idx} count=0, next={pair.next_action}, reopened=True")
+                # PHOENIX SYSTEM: Determine restart direction from closed deal
+                # deal.type == DEAL_TYPE_SELL → We closed a BUY position → Restart with BUY
+                # deal.type == DEAL_TYPE_BUY  → We closed a SELL position → Restart with SELL
+                if deal.type == mt5.DEAL_TYPE_SELL:
+                    restart_direction = "buy"
+                else:
+                    restart_direction = "sell"
+                
+                # EXECUTE PHOENIX RESET (Nuclear: destroy old pair, create fresh one)
+                self._phoenix_reset_pair(pair_idx, restart_direction)
+                
+                # [CRITICAL] SAVE IMMEDIATELY
+                # Ensure the "Count=0" state is persisted before the next tick or crash
+                await self.save_state()
                 
                 # Log to session
                 if self.session_logger:
@@ -1257,8 +1401,6 @@ class SymbolEngine:
                         result="tp" if reason == "TP" else "sl",
                         profit=deal.profit
                     )
-                
-                await self.save_state()
             
             self.last_deal_check_time = time.time()
             

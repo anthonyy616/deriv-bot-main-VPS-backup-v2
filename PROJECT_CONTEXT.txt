@@ -516,3 +516,108 @@ You **MUST**:
 - Stop and ask when unclear
 - Never assume trader intent
 - Ensure zero silent failure paths
+
+---
+
+## 19. Phoenix Re-Open System (Zero-State Reset)
+
+### Purpose
+
+The Phoenix System ensures that a re-opened pair after TP/SL is **mathematically identical** to a fresh pair. It uses a **Destroy & Recreate** pattern instead of manual field resets.
+
+### The Problem with Manual Resets
+
+Manual field resets risk keeping stale flags:
+- `hedge_active` might remain True
+- `buy_in_zone` / `sell_in_zone` might have incorrect values
+- Other flags could persist and cause logic bugs
+
+### Phoenix Protocol
+
+When a position closes (TP/SL):
+
+1. **IDENTIFY**: Which pair index just closed?
+2. **DETERMINE POLARITY**:
+   - If a **BUY** position closed → new start direction is **BUY**
+   - If a **SELL** position closed → new start direction is **SELL**
+   - (Direction follows closed deal, NOT pair's default polarity)
+3. **CLOSE HEDGE**: If hedge is active, close it first
+4. **DESTROY**: `del self.pairs[N]` (Remove old object entirely)
+5. **RECREATE**: Instantiate fresh `GridPair` at exact same price levels
+6. **INITIALIZE**: Apply re-open invariants:
+   - `trade_count = 0` (Forces Lot Size Index 0 → 0.01)
+   - `next_action` = Direction determined in Step 2
+   - `is_reopened = True` (Bypasses zone latch logic)
+   - `hedge_active = False`
+   - `buy_filled = False`, `sell_filled = False`
+   - `buy_in_zone = False`, `sell_in_zone = False`
+
+### Implementation Methods
+
+| Method | Location | Purpose |
+|--------|----------|---------|
+| `_phoenix_reset_pair(pair_index, start_direction)` | `symbol_engine.py` | Destroys old pair, creates fresh one |
+| `_check_tp_sl_from_history()` | `symbol_engine.py` | Detects TP/SL, calls Phoenix reset |
+
+### Phoenix Invariants
+
+| ID | Invariant |
+|----|-----------|
+| PHOENIX-01 | Post-reset `trade_count` MUST be 0 |
+| PHOENIX-02 | Post-reset `is_reopened` MUST be True |
+| PHOENIX-03 | Post-reset `hedge_active` MUST be False |
+| PHOENIX-04 | Restart direction follows closed deal type (not pair polarity) |
+| PHOENIX-05 | Price levels (`buy_price`, `sell_price`) MUST be preserved |
+
+### Verification Checklist
+
+1. **Lot Size Reset**: After TP hit, next trade MUST be 0.01 (Index 0)
+2. **Lot Progression**: Trade after re-open must be 0.02 (Index 1)
+3. **Hedge Clearing**: If hedge was active, new pair has `hedge_active = False`
+4. **Direction Memory**: Direction determined by what closed, not pair polarity
+
+---
+
+## 20. Position Drop Detection (Nuclear Reset Trigger)
+
+### Purpose
+
+The Position Drop Detection system is the **PRIMARY** trigger for Nuclear Reset. It monitors position counts per pair and triggers reset when a decrease is detected.
+
+### Why This Over TP/SL History
+
+The MT5 `history_deals_get` approach is unreliable because:
+- Deals may not return expected `DEAL_REASON_TP` codes
+- Magic number filtering can fail
+- Timing issues with history queries
+
+Position Drop Detection catches ALL cases:
+- TP closures
+- SL closures
+- Manual user closures
+- Broker-side liquidations
+
+### Implementation
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `last_pair_counts` | `__init__` | Tracks position count per pair from previous tick |
+| `_monitor_position_drops()` | `symbol_engine.py` | Compares counts, triggers reset on decrease |
+
+### Detection Logic
+
+```
+For each known pair:
+    IF old_count > 0 AND new_count < old_count:
+        1. Close ALL remaining positions (kill survivors)
+        2. Close hedge if active
+        3. Phoenix reset with polarity-based direction
+        4. Save state immediately
+```
+
+### Restart Direction (Polarity-Based)
+
+| Pair Index | Restart Direction |
+|------------|-------------------|
+| Positive (> 0) | SELL |
+| Zero or Negative (≤ 0) | BUY |
