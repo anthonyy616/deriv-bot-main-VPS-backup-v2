@@ -161,7 +161,15 @@ async def update_config(config: ConfigUpdate, bot = Depends(get_current_bot)):
 
 @app.post("/control/start")
 async def start_all(bot = Depends(get_current_bot)):
-    """Start all enabled symbols"""
+    """Start all enabled symbols - always starts with fresh DB"""
+    # Clean stale DB for fresh session
+    if os.path.exists(DB_PATH):
+        try:
+            os.remove(DB_PATH)
+            print(f"[START] Cleaned DB for fresh session: {DB_PATH}")
+        except Exception as e:
+            print(f"[START] Could not clean DB: {e}")
+    
     await bot.start()
     return {"status": "started", "symbols": bot.config_manager.get_enabled_symbols()}
 
@@ -193,8 +201,17 @@ async def terminate_symbol(symbol: str, bot = Depends(get_current_bot)):
 
 @app.post("/control/terminate-all")
 async def terminate_all(bot = Depends(get_current_bot)):
-    """Nuclear reset - close all positions for all symbols"""
+    """Nuclear reset - close all positions for all symbols and clean DB"""
     await bot.terminate_all()
+    
+    # Clean DB after termination for complete reset
+    if os.path.exists(DB_PATH):
+        try:
+            os.remove(DB_PATH)
+            print(f"[TERMINATE] Cleaned DB after nuclear reset: {DB_PATH}")
+        except Exception as e:
+            print(f"[TERMINATE] Could not clean DB: {e}")
+    
     return {"status": "terminated_all"}
 
 @app.get("/status")

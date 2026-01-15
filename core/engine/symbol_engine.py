@@ -1343,7 +1343,7 @@ class SymbolEngine:
                 pair = self.pairs.get(pair_idx)
                 
                 if not pair:
-                    print(f"[WARNING] {reason} detected for Pair {pair_idx} but pair not in memory! Creating fresh pair...")
+                    #print(f"[WARNING] {reason} detected for Pair {pair_idx} but pair not in memory! Creating fresh pair...")
                     # Don't skip - we should still log this
                     continue
                 
@@ -1972,7 +1972,8 @@ class SymbolEngine:
                     price=exec_sell_price,
                     lot_size=new_pair.get_next_lot(self.lot_sizes) or 0.0,
                     ticket=ticket,
-                    notes=f"Pair {min_idx} -> {new_idx} | SELL@MKT, B@{new_buy_price:.2f}"
+                    notes=f"Pair {min_idx} -> {new_idx} | SELL@MKT, B@{new_buy_price:.2f}",
+                    trade_count=new_pair.trade_count
                 )
             else:
                 # Failed to execute, just set up triggers
@@ -2352,6 +2353,13 @@ class SymbolEngine:
                     print(f" {self.symbol}: {direction.upper()} failed for Pair {pair_idx}")
                     return False
                 
+                # [MONITOR FIX] Update expectation IMMEDIATELY after successful execution
+                # This fixes the "Invisible Trade" blind spot where a trade Opens AND Closes
+                # within the same tick interval (fast TP). Without this, the next tick's
+                # monitor would compare Current(0) vs Last(0) and miss the drop.
+                self.last_pair_counts[pair_idx] += 1
+                # print(f"   [MONITOR] Updated expectation: Pair {pair_idx} now expects {self.last_pair_counts[pair_idx]} positions")
+                
                 # Update pair state
                 if direction == "buy":
                     pair.buy_filled = True
@@ -2418,7 +2426,7 @@ class SymbolEngine:
                              print(f" {self.symbol}: Skipped Chain B{next_idx} (Already Filled)")
                     elif abs(next_idx) <= (self.max_pairs - 1) // 2:
                         print(f" {self.symbol}: Creating Next Negative Pair {next_idx} from Chain")
-                        self._create_next_negative_pair(pair_idx)
+                        await self._create_next_negative_pair(pair_idx)
                 
                 await self.save_state()
                 return True
@@ -2715,7 +2723,8 @@ class SymbolEngine:
                 price=price,
                 lot_size=volume,
                 ticket=result.order,
-                notes=f"Max Pos Reached - Locked (TP={h_tp:.2f}, SL={h_sl:.2f})"
+                notes=f"Max Pos Reached - Locked (TP={h_tp:.2f}, SL={h_sl:.2f})",
+                trade_count=pair.trade_count
             )
             
             await self.save_state()
@@ -2849,6 +2858,7 @@ class SymbolEngine:
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
             # Log trade to history
+            pair = self.pairs.get(index)
             await self._log_trade(
                 event_type="OPEN",
                 pair_index=index,
@@ -2856,7 +2866,8 @@ class SymbolEngine:
                 price=exec_price,
                 lot_size=volume,
                 ticket=result.order,
-                notes=f"TP={tp:.2f} SL={sl:.2f}"
+                notes=f"TP={tp:.2f} SL={sl:.2f}",
+                trade_count=pair.trade_count if pair else 0
             )
             return result.order
         
@@ -2935,7 +2946,7 @@ class SymbolEngine:
     # ========================================================================
     
     async def _log_trade(self, event_type: str, pair_index: int, direction: str, 
-                   price: float, lot_size: float, ticket: int = 0, notes: str = ""):
+                   price: float, lot_size: float, ticket: int = 0, notes: str = "", trade_count: int = 0):
         """
         Log a trade event to the DB and print to console.
         """
@@ -2967,7 +2978,7 @@ class SymbolEngine:
                  direction=direction,
                  price=price,
                  lot=lot_size,
-                 trade_num=0, 
+                 trade_num=trade_count,
                  ticket=ticket
             )
     
