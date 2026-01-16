@@ -57,3 +57,5 @@ supabase_schema_v2.sql
 db/schema.sql
 
 DEPLOYMENT.md
+
+logs/
