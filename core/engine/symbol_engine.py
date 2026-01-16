@@ -19,7 +19,7 @@ from collections import defaultdict, deque
 import asyncio
 import time
 import MetaTrader5 as mt5
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from core.persistence.repository import Repository
 
@@ -378,8 +378,8 @@ class SymbolEngine:
         self.last_deal_check_time: float = time.time()  # Track last history query time
         self.processed_deals: deque = deque(maxlen=1000)  # Auto-cleanup: keeps last 1000 deals only
         
-        # --- Position Drop Detection (Nuclear Reset) ---
-        self.last_pair_counts: Dict[int, int] = defaultdict(int)  # Track position count per pair from previous tick
+        # --- Ticket-Based Drop Detection (replaces count-based) ---
+        # Tickets are tracked via pair.buy_ticket, pair.sell_ticket and verified in _monitor_position_drops
         
         # --- MUTEX LOCKS (Race Condition Prevention) ---
         self.execution_lock = asyncio.Lock()       # Global lock for atomic B[n] + S[n+1] chains
@@ -594,9 +594,6 @@ class SymbolEngine:
         self.phase = self.PHASE_INIT
         self.pairs = {}
         self.center_price = 0.0
-        
-        # Reset position tracking for drop detection
-        self.last_pair_counts = defaultdict(int)
         
         print(f"[TERMINATE] {self.symbol}: Grid reset complete.")
 
@@ -1176,142 +1173,74 @@ class SymbolEngine:
                             return
 
     async def _monitor_position_drops(self):
-
-        # Get all current positions for this symbol
-
-        positions = mt5.positions_get(symbol=self.symbol)
-
-        # Group positions by pair index
-
-        current_counts: Dict[int, int] = defaultdict(int)
-
-        if positions:
-
-            for pos in positions:
-
-                if pos.magic >= 50000:
-
-                    pair_idx = pos.magic - 50000
-
-                    current_counts[pair_idx] += 1
-
-       
-
-        # Check for drops in ALL known pairs (both from last_pair_counts and self.pairs)
-
-        all_pair_indices = set(self.last_pair_counts.keys()) | set(self.pairs.keys())
-
-       
-
-        for pair_idx in all_pair_indices:
-
-            old_count = self.last_pair_counts.get(pair_idx, 0)
-
-            new_count = current_counts.get(pair_idx, 0)
-
-           
-
-            # Get the pair object to check internal state
-
-            pair = self.pairs.get(pair_idx)
-
-           
-
-            # CONDITION 1: Standard Drop (Motion Detection)
-
-            # Detects when position count decreased from one tick to the next
-
-            drop_detected = (old_count > 0 and new_count < old_count)
-
-           
-
-            # CONDITION 2: Ghost State (Internal Memory says Active, Reality says Empty)
-
-            # We check if trade_count > 0 (we think we are active) but MT5 says 0 positions.
-
-            # This catches "Invisible Trades" that open/close between ticks (Fast TP).
-
-            ghost_detected = (pair and pair.trade_count > 0 and new_count == 0)
-
-           
-
-            if drop_detected or ghost_detected:
-
-                reason = "DROP" if drop_detected else "GHOST_DESYNC"
-
-                pair_info = f"MT5: {new_count}, Internal: {pair.trade_count if pair else '?'}"
-
-                print(f"[{reason} DETECTED] {self.symbol} Pair {pair_idx}: Resetting. ({pair_info})")
-
-               
-
-                # Check if pair exists in memory (already fetched above for ghost detection)
-
-                if not pair:
-
-                    print(f"   [WARNING] Pair {pair_idx} not in memory, skipping reset")
-
+        """
+        TICKET LIFECYCLE VERIFICATION: Reliable drop detection using specific ticket checks.
+        """
+        # Iterate over copy of items to allow safe modification during loop
+        for pair_idx, pair in list(self.pairs.items()):
+            active_tickets = []
+            if pair.buy_ticket > 0:
+                active_tickets.append((pair.buy_ticket, "buy"))
+            if pair.sell_ticket > 0:
+                active_tickets.append((pair.sell_ticket, "sell"))
+            
+            if not active_tickets:
+                continue
+            
+            for ticket_id, direction in active_tickets:
+                # CHECK 1: Is it Alive?
+                live_pos = mt5.positions_get(ticket=ticket_id)
+                if live_pos:
                     continue
-
-               
-
-                # Step 1: KILL ALL SURVIVORS (close any remaining positions)
-
-                if new_count > 0:
-
-                    print(f"   [CLEANUP] Closing {new_count} remaining positions for Pair {pair_idx}")
-
-                    await self._close_pair_positions(pair_idx, "both")
-
-               
-
-                # Step 2: Close hedge if active
-
-                if pair.hedge_active and pair.hedge_ticket:
-
-                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
-
-                    self._close_position(pair.hedge_ticket)
-
-               
-
-                # Step 3: Determine restart direction based on PAIR POLARITY
-
-                # Positive pairs -> Start with SELL
-
-                # Negative/Zero pairs -> Start with BUY
-
-                if pair_idx > 0:
-
-                    restart_direction = "sell"
-
+                
+                # CHECK 2: Is it Closed? (Confirmed in History)
+                from_time = datetime.now() - timedelta(hours=24)
+                to_time = datetime.now() + timedelta(hours=1)
+                history = mt5.history_deals_get(from_time, to_time, position=ticket_id)
+                
+                if history:
+                    print(f"[DROP CONFIRMED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} ({direction}) closed. Resetting.")
+                    await self._execute_pair_reset(pair_idx, pair, direction)
+                    break 
+                
+                # CHECK 3: Ghost/Latency (Missing from both)
+                age = pair.get_position_age(ticket_id)
+                if age < 3.0:
+                    continue # Assume Latency
                 else:
+                    print(f"[GHOST DETECTED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} (age={age:.1f}s) missing. Resetting.")
+                    await self._execute_pair_reset(pair_idx, pair, direction)
+                    break
 
-                    restart_direction = "buy"
+    async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
+        """Helper to execute nuclear reset."""
+        await self._close_pair_positions(pair_idx, "both")
+        if pair.hedge_active and pair.hedge_ticket:
+            self._close_position(pair.hedge_ticket)
+        
+        # Phoenix Reset (Reuse closed direction)
+        self._phoenix_reset_pair(pair_idx, closed_direction)
+        await self.save_state()
 
-               
+    async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
+        """Execute nuclear reset for a pair after confirmed position closure."""
+        # Close any remaining positions
+        await self._close_pair_positions(pair_idx, "both")
+        
+        # Close hedge if active
+        if pair.hedge_active and pair.hedge_ticket:
+            print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
+            self._close_position(pair.hedge_ticket)
+        
+        # Use the closed direction for restart (if Buy closed, re-open with Buy)
+        restart_direction = closed_direction
+        
+        # Execute Phoenix reset
+        self._phoenix_reset_pair(pair_idx, restart_direction)
+        
+        # Save immediately
+        await self.save_state()
 
-                # Step 4: EXECUTE PHOENIX RESET
-
-                self._phoenix_reset_pair(pair_idx, restart_direction)
-
-               
-
-                # Step 5: SAVE IMMEDIATELY (crash protection)
-
-                await self.save_state()
-
-               
-
-                # Step 6: Force current count to 0 (we just closed everything)
-
-                current_counts[pair_idx] = 0
-
-       
-
-        # Update state for next tick comparison
-
-        self.last_pair_counts = current_counts
 
     def _phoenix_reset_pair(self, pair_index: int, start_direction: str) -> None:
         """
@@ -2416,13 +2345,7 @@ class SymbolEngine:
                     print(f" {self.symbol}: {direction.upper()} failed for Pair {pair_idx}")
                     return False
                 
-                # [MONITOR FIX] Update expectation IMMEDIATELY after successful execution
-                # This fixes the "Invisible Trade" blind spot where a trade Opens AND Closes
-                # within the same tick interval (fast TP). Without this, the next tick's
-                # monitor would compare Current(0) vs Last(0) and miss the drop.
-                self.last_pair_counts[pair_idx] += 1
-                # print(f"   [MONITOR] Updated expectation: Pair {pair_idx} now expects {self.last_pair_counts[pair_idx]} positions")
-                
+
                 # Update pair state
                 if direction == "buy":
                     pair.buy_filled = True
@@ -2526,18 +2449,20 @@ class SymbolEngine:
             if pair.is_reopened:
                 # Check BUY proximity
                 if pair.next_action == "buy":
-                    buy_proximity = abs(ask - pair.buy_price) <= tolerance
+                    # GAP-PROOF: Fire if price is at level OR BETTER (lower for Buy)
+                    buy_proximity = ask <= (pair.buy_price + tolerance)
                     if buy_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} touched BUY level {pair.buy_price:.2f}")
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} (Level: {pair.buy_price:.2f}) - Triggering BUY.")
                         await self._execute_trade_with_chain("buy", idx)
                     # If not close enough, do nothing - just wait
                     continue  # Skip standard logic for this pair
                 
                 # Check SELL proximity
                 if pair.next_action == "sell":
-                    sell_proximity = abs(bid - pair.sell_price) <= tolerance
+                    # GAP-PROOF: Fire if price is at level OR BETTER (higher for Sell)
+                    sell_proximity = bid >= (pair.sell_price - tolerance)
                     if sell_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} touched SELL level {pair.sell_price:.2f}")
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} (Level: {pair.sell_price:.2f}) - Triggering SELL.")
                         await self._execute_trade_with_chain("sell", idx)
                     # If not close enough, do nothing - just wait
                     continue  # Skip standard logic for this pair
