@@ -19,7 +19,7 @@ from collections import defaultdict, deque
 import asyncio
 import time
 import MetaTrader5 as mt5
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from core.persistence.repository import Repository
 
@@ -378,8 +378,8 @@ class SymbolEngine:
         self.last_deal_check_time: float = time.time()  # Track last history query time
         self.processed_deals: deque = deque(maxlen=1000)  # Auto-cleanup: keeps last 1000 deals only
         
-        # --- Position Drop Detection (Nuclear Reset) ---
-        self.last_pair_counts: Dict[int, int] = defaultdict(int)  # Track position count per pair from previous tick
+        # --- Ticket-Based Drop Detection (replaces count-based) ---
+        # Tickets are tracked via pair.buy_ticket, pair.sell_ticket and verified in _monitor_position_drops
         
         # --- MUTEX LOCKS (Race Condition Prevention) ---
         self.execution_lock = asyncio.Lock()       # Global lock for atomic B[n] + S[n+1] chains
@@ -594,9 +594,6 @@ class SymbolEngine:
         self.phase = self.PHASE_INIT
         self.pairs = {}
         self.center_price = 0.0
-        
-        # Reset position tracking for drop detection
-        self.last_pair_counts = defaultdict(int)
         
         print(f"[TERMINATE] {self.symbol}: Grid reset complete.")
 
@@ -1177,77 +1174,72 @@ class SymbolEngine:
 
     async def _monitor_position_drops(self):
         """
-        POSITION DROP DETECTION: Reliable Nuclear Reset trigger.
-        
-        This method detects when the number of open positions for a pair DECREASES,
-        which indicates a TP, SL, or manual close happened. When detected:
-        1. Close ALL remaining positions for that pair (kill survivors)
-        2. Execute Phoenix reset (destroy & recreate pair)
-        3. Save state immediately
-        
-        This is MORE RELIABLE than the MT5 history check because it catches:
-        - TP closures
-        - SL closures
-        - Manual user closures
-        - Any other position reduction
+        TICKET LIFECYCLE VERIFICATION: Reliable drop detection using specific ticket checks.
         """
-        # Get all current positions for this symbol
-        positions = mt5.positions_get(symbol=self.symbol)
-        
-        # Group positions by pair index
-        current_counts: Dict[int, int] = defaultdict(int)
-        if positions:
-            for pos in positions:
-                if pos.magic >= 50000:
-                    pair_idx = pos.magic - 50000
-                    current_counts[pair_idx] += 1
-        
-        # Check for drops in ALL known pairs (both from last_pair_counts and self.pairs)
-        all_pair_indices = set(self.last_pair_counts.keys()) | set(self.pairs.keys())
-        
-        for pair_idx in all_pair_indices:
-            old_count = self.last_pair_counts.get(pair_idx, 0)
-            new_count = current_counts.get(pair_idx, 0)
+        # Iterate over copy of items to allow safe modification during loop
+        for pair_idx, pair in list(self.pairs.items()):
+            active_tickets = []
+            if pair.buy_ticket > 0:
+                active_tickets.append((pair.buy_ticket, "buy"))
+            if pair.sell_ticket > 0:
+                active_tickets.append((pair.sell_ticket, "sell"))
             
-            # CRITICAL CONDITION: Position count DECREASED
-            if old_count > 0 and new_count < old_count:
-                print(f"[DROP DETECTED] {self.symbol} Pair {pair_idx}: {old_count} -> {new_count} positions. Executing NUCLEAR RESET.")
-                
-                # Check if pair exists in memory
-                pair = self.pairs.get(pair_idx)
-                if not pair:
-                    print(f"   [WARNING] Pair {pair_idx} not in memory, skipping reset")
+            if not active_tickets:
+                continue
+            
+            for ticket_id, direction in active_tickets:
+                # CHECK 1: Is it Alive?
+                live_pos = mt5.positions_get(ticket=ticket_id)
+                if live_pos:
                     continue
                 
-                # Step 1: KILL ALL SURVIVORS (close any remaining positions)
-                if new_count > 0:
-                    print(f"   [CLEANUP] Closing {new_count} remaining positions for Pair {pair_idx}")
-                    await self._close_pair_positions(pair_idx, "both")
+                # CHECK 2: Is it Closed? (Confirmed in History)
+                from_time = datetime.now() - timedelta(hours=24)
+                to_time = datetime.now() + timedelta(hours=1)
+                history = mt5.history_deals_get(from_time, to_time, position=ticket_id)
                 
-                # Step 2: Close hedge if active
-                if pair.hedge_active and pair.hedge_ticket:
-                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
-                    self._close_position(pair.hedge_ticket)
+                if history:
+                    print(f"[DROP CONFIRMED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} ({direction}) closed. Resetting.")
+                    await self._execute_pair_reset(pair_idx, pair, direction)
+                    break 
                 
-                # Step 3: Determine restart direction based on PAIR POLARITY
-                # Positive pairs -> Start with SELL
-                # Negative/Zero pairs -> Start with BUY
-                if pair_idx > 0:
-                    restart_direction = "sell"
+                # CHECK 3: Ghost/Latency (Missing from both)
+                age = pair.get_position_age(ticket_id)
+                if age < 3.0:
+                    continue # Assume Latency
                 else:
-                    restart_direction = "buy"
-                
-                # Step 4: EXECUTE PHOENIX RESET
-                self._phoenix_reset_pair(pair_idx, restart_direction)
-                
-                # Step 5: SAVE IMMEDIATELY (crash protection)
-                await self.save_state()
-                
-                # Step 6: Force current count to 0 (we just closed everything)
-                current_counts[pair_idx] = 0
+                    print(f"[GHOST DETECTED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} (age={age:.1f}s) missing. Resetting.")
+                    await self._execute_pair_reset(pair_idx, pair, direction)
+                    break
+
+    async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
+        """Helper to execute nuclear reset."""
+        await self._close_pair_positions(pair_idx, "both")
+        if pair.hedge_active and pair.hedge_ticket:
+            self._close_position(pair.hedge_ticket)
         
-        # Update state for next tick comparison
-        self.last_pair_counts = current_counts
+        # Phoenix Reset (Reuse closed direction)
+        self._phoenix_reset_pair(pair_idx, closed_direction)
+        await self.save_state()
+
+    async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
+        """Execute nuclear reset for a pair after confirmed position closure."""
+        # Close any remaining positions
+        await self._close_pair_positions(pair_idx, "both")
+        
+        # Close hedge if active
+        if pair.hedge_active and pair.hedge_ticket:
+            print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
+            self._close_position(pair.hedge_ticket)
+        
+        # Use the closed direction for restart (if Buy closed, re-open with Buy)
+        restart_direction = closed_direction
+        
+        # Execute Phoenix reset
+        self._phoenix_reset_pair(pair_idx, restart_direction)
+        
+        # Save immediately
+        await self.save_state()
 
 
     def _phoenix_reset_pair(self, pair_index: int, start_direction: str) -> None:
@@ -2353,13 +2345,7 @@ class SymbolEngine:
                     print(f" {self.symbol}: {direction.upper()} failed for Pair {pair_idx}")
                     return False
                 
-                # [MONITOR FIX] Update expectation IMMEDIATELY after successful execution
-                # This fixes the "Invisible Trade" blind spot where a trade Opens AND Closes
-                # within the same tick interval (fast TP). Without this, the next tick's
-                # monitor would compare Current(0) vs Last(0) and miss the drop.
-                self.last_pair_counts[pair_idx] += 1
-                # print(f"   [MONITOR] Updated expectation: Pair {pair_idx} now expects {self.last_pair_counts[pair_idx]} positions")
-                
+
                 # Update pair state
                 if direction == "buy":
                     pair.buy_filled = True
@@ -2463,20 +2449,28 @@ class SymbolEngine:
             if pair.is_reopened:
                 # Check BUY proximity
                 if pair.next_action == "buy":
-                    buy_proximity = abs(ask - pair.buy_price) <= tolerance
+                    # GAP-PROOF: Fire if price is at level OR BETTER (lower for Buy)
+                    buy_proximity = ask <= (pair.buy_price + tolerance)
                     if buy_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} touched BUY level {pair.buy_price:.2f}")
-                        await self._execute_trade_with_chain("buy", idx)
-                    # If not close enough, do nothing - just wait
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} (Level: {pair.buy_price:.2f}) - Triggering BUY.")
+                        if await self._execute_trade_with_chain("buy", idx):
+                            # [FIX] ALSO EXPAND GRID for Phoenix pairs
+                            indices = sorted(self.pairs.keys())
+                            if idx == indices[-1] and idx >= 0:
+                                await self._create_next_positive_pair(idx)
                     continue  # Skip standard logic for this pair
                 
                 # Check SELL proximity
                 if pair.next_action == "sell":
-                    sell_proximity = abs(bid - pair.sell_price) <= tolerance
+                    # GAP-PROOF: Fire if price is at level OR BETTER (higher for Sell)
+                    sell_proximity = bid >= (pair.sell_price - tolerance)
                     if sell_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} touched SELL level {pair.sell_price:.2f}")
-                        await self._execute_trade_with_chain("sell", idx)
-                    # If not close enough, do nothing - just wait
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} (Level: {pair.sell_price:.2f}) - Triggering SELL.")
+                        if await self._execute_trade_with_chain("sell", idx):
+                            # [FIX] ALSO EXPAND GRID for Phoenix pairs
+                            indices = sorted(self.pairs.keys())
+                            if idx == indices[0] and idx <= 0:
+                                await self._create_next_negative_pair(idx)
                     continue  # Skip standard logic for this pair
                 
                 # If we get here, just skip to next pair
@@ -2527,8 +2521,13 @@ class SymbolEngine:
                         buy_attempt_failed = True
                 
                 else:
-                    # Logic block (capped, no hedge needed) - mark zone as entered to prevent loop
+                    # Logic block (capped)
                     pair.buy_in_zone = True 
+                    # [FIX] STILL EXPAND GRID even if trade is blocked by max_positions
+                    # This ensures the ladder continues up if price keeps rising
+                    indices = sorted(self.pairs.keys())
+                    if idx == indices[-1] and idx >= 0:
+                        await self._create_next_positive_pair(idx)
 
             if not buy_attempt_failed and not pair.buy_in_zone:
                  pair.buy_in_zone = buy_in_zone_now
@@ -2575,6 +2574,11 @@ class SymbolEngine:
                         
                 else:
                     pair.sell_in_zone = True
+                    # [FIX] STILL EXPAND GRID even if trade is blocked by max_positions
+                    # This ensures the ladder continues down if price keeps falling
+                    indices = sorted(self.pairs.keys())
+                    if idx == indices[0] and idx <= 0:
+                        await self._create_next_negative_pair(idx)
 
             if not sell_attempt_failed and not pair.sell_in_zone:
                 pair.sell_in_zone = sell_in_zone_now
@@ -2644,60 +2648,99 @@ class SymbolEngine:
 
     async def _execute_hedge(self, pair_index: int, direction: str) -> bool:
         """
-        Execute a HEDGE order to lock the pair when max_positions is reached.
-        This places a trade in the 'next_action' direction to neutralize exposure.
+        Execute a HEDGE order to lock the pair.
+        Fixes inheritance logic and ensures TP/SL are forced to valid levels.
         """
         pair = self.pairs.get(pair_index)
         if not pair or pair.hedge_active:
             return False
             
-        # Double check config
         if not self.hedge_enabled:
             return False
             
         print(f" {self.symbol}: MAX POSITIONS ({self.max_positions}) REACHED for Pair {pair_index}. Executing HEDGE ({direction.upper()}).")
         
         tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
+        sym_info = mt5.symbol_info(self.symbol)
+        if not tick or not sym_info:
             return False
 
-        # --- HEDGE TP/SL INHERITANCE ---
-        h_tp = 0.0
-        h_sl = 0.0
+        point = sym_info.point
+        stops_level = max(sym_info.trade_stops_level, 10) * point
         
-        grid_price = pair.sell_price if direction == "sell" else pair.buy_price
+        # --- 1. CALCULATE FRESH BOUNDARIES (Don't trust stale pair variables) ---
+        # We define the "Box" of the trade cycle
+        # Upper Limit = Buy Entry + Buy TP Pips (approx) OR Sell Entry + Sell SL Pips
+        # Lower Limit = Sell Entry - Sell TP Pips (approx) OR Buy Entry - Buy SL Pips
         
-        if direction == "sell":
-            # Inherit from existing Buy
-            h_tp = pair.pair_sl
-            h_sl = pair.pair_tp
-            
-            # Fallback
-            if h_tp == 0.0 or h_sl == 0.0:
-                 h_tp = grid_price - 20 * mt5.symbol_info(self.symbol).point
-                 h_sl = grid_price + 20 * mt5.symbol_info(self.symbol).point
+        # Use simple offsets from the grid prices to find the intended levels
+        tp_pips = float(self.config.get('buy_stop_tp', 20.0)) * point # Default assumption
+        sl_pips = float(self.config.get('buy_stop_sl', 20.0)) * point
         
-        else: # direction == "buy"
-            # FIX: Swap TP/SL from the existing Sell positions (same logic as sell hedge)
-            # Sell's SL (ABOVE) becomes Buy's TP (ABOVE)
-            # Sell's TP (BELOW) becomes Buy's SL (BELOW)
-            h_tp = pair.pair_sl
-            h_sl = pair.pair_tp
-            
-            # Fallback
-            if h_tp == 0.0 or h_sl == 0.0:
-                 h_tp = grid_price + 20 * mt5.symbol_info(self.symbol).point
-                 h_sl = grid_price - 20 * mt5.symbol_info(self.symbol).point
+        # If we have existing values, use them to define the range, otherwise calculate
+        # We assume the "Upper" is the Buy's TP level and "Lower" is Sell's TP level
+        # This matches the "Cycle" logic where both sides share exit levels
+        
+        if pair.pair_tp > 0 and pair.pair_sl > 0:
+            # Determine which is Top and Bottom
+            upper_limit = max(pair.pair_tp, pair.pair_sl)
+            lower_limit = min(pair.pair_tp, pair.pair_sl)
+        else:
+            # Fallback calculation
+            upper_limit = pair.buy_price + tp_pips
+            lower_limit = pair.sell_price - tp_pips
 
-        price = tick.ask if direction == "buy" else tick.bid
-        volume = self.hedge_lot_size
+        # --- 2. ASSIGN BASED ON DIRECTION ---
+        if direction == "buy":
+            # Buying to Hedge a Sell
+            # TP must be UP, SL must be DOWN
+            h_tp = upper_limit
+            h_sl = lower_limit
+        else:
+            # Selling to Hedge a Buy
+            # TP must be DOWN, SL must be UP
+            h_tp = lower_limit
+            h_sl = upper_limit
 
+        # --- 3. FORCE VALIDITY (The "Push" Logic) ---
+        # Instead of removing invalid stops, we push them to the nearest valid price
+        
+        bid = tick.bid
+        ask = tick.ask
+        
+        if direction == "buy":
+            # BUY TP Check (Must be > Ask + StopsLevel)
+            min_tp = ask + stops_level
+            if h_tp < min_tp:
+                print(f"   [ADJ] Buy Hedge TP {h_tp:.5f} too low. Pushing to {min_tp:.5f}")
+                h_tp = min_tp
+                
+            # BUY SL Check (Must be < Bid - StopsLevel)
+            max_sl = bid - stops_level
+            if h_sl > max_sl:
+                print(f"   [ADJ] Buy Hedge SL {h_sl:.5f} too high. Pushing to {max_sl:.5f}")
+                h_sl = max_sl
+
+        else: # direction == "sell"
+            # SELL TP Check (Must be < Bid - StopsLevel)
+            max_tp = bid - stops_level
+            if h_tp > max_tp:
+                print(f"   [ADJ] Sell Hedge TP {h_tp:.5f} too high. Pushing to {max_tp:.5f}")
+                h_tp = max_tp
+                
+            # SELL SL Check (Must be > Ask + StopsLevel)
+            min_sl = ask + stops_level
+            if h_sl < min_sl:
+                print(f"   [ADJ] Sell Hedge SL {h_sl:.5f} too low. Pushing to {min_sl:.5f}")
+                h_sl = min_sl
+
+        # --- 4. EXECUTION ---
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
-            "volume": volume,
+            "volume": self.hedge_lot_size,
             "type": mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL,
-            "price": price,
+            "price": ask if direction == "buy" else bid,
             "magic": 90000 + pair_index,
             "comment": f"Hedge L{pair_index}",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -2709,28 +2752,29 @@ class SymbolEngine:
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f" {self.symbol}: HEDGE EXECUTED for Pair {pair_index} @ {price:.2f} | Ticket: {result.order}")
+            print(f" {self.symbol}: HEDGE EXECUTED for Pair {pair_index} @ {request['price']:.2f} | Ticket: {result.order}")
             
             pair.hedge_active = True
             pair.hedge_ticket = result.order
             pair.hedge_direction = direction
             
-            # Log to DB
             await self._log_trade(
                 event_type="HEDGE",
                 pair_index=pair_index,
                 direction=direction.upper(),
-                price=price,
-                lot_size=volume,
+                price=request['price'],
+                lot_size=self.hedge_lot_size,
                 ticket=result.order,
-                notes=f"Max Pos Reached - Locked (TP={h_tp:.2f}, SL={h_sl:.2f})",
-                trade_count=pair.trade_count
+                notes=f"Locked (TP={h_tp:.2f}, SL={h_sl:.2f})"
             )
             
             await self.save_state()
             return True
-            
-        print(f" {self.symbol}: HEDGE FAILED for Pair {pair_index}: {result.comment if result else 'Unknown'}")
+        
+        # Log precise error for debugging
+        err_desc = result.comment if result else "Unknown"
+        ret_code = result.retcode if result else 0
+        print(f" {self.symbol}: HEDGE FAILED for Pair {pair_index}: {err_desc} ({ret_code})")
         return False
 
     async def _execute_market_order(self, direction: str, price: float, index: int) -> int:
