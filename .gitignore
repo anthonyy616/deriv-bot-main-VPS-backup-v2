@@ -58,4 +58,8 @@ db/schema.sql
 
 DEPLOYMENT.md
 
+<<<<<<< HEAD
 logs/
+=======
+logs/
+>>>>>>> test
