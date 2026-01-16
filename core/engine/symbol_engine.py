@@ -1176,79 +1176,142 @@ class SymbolEngine:
                             return
 
     async def _monitor_position_drops(self):
-        """
-        POSITION DROP DETECTION: Reliable Nuclear Reset trigger.
-        
-        This method detects when the number of open positions for a pair DECREASES,
-        which indicates a TP, SL, or manual close happened. When detected:
-        1. Close ALL remaining positions for that pair (kill survivors)
-        2. Execute Phoenix reset (destroy & recreate pair)
-        3. Save state immediately
-        
-        This is MORE RELIABLE than the MT5 history check because it catches:
-        - TP closures
-        - SL closures
-        - Manual user closures
-        - Any other position reduction
-        """
-        # Get all current positions for this symbol
-        positions = mt5.positions_get(symbol=self.symbol)
-        
-        # Group positions by pair index
-        current_counts: Dict[int, int] = defaultdict(int)
-        if positions:
-            for pos in positions:
-                if pos.magic >= 50000:
-                    pair_idx = pos.magic - 50000
-                    current_counts[pair_idx] += 1
-        
-        # Check for drops in ALL known pairs (both from last_pair_counts and self.pairs)
-        all_pair_indices = set(self.last_pair_counts.keys()) | set(self.pairs.keys())
-        
-        for pair_idx in all_pair_indices:
-            old_count = self.last_pair_counts.get(pair_idx, 0)
-            new_count = current_counts.get(pair_idx, 0)
-            
-            # CRITICAL CONDITION: Position count DECREASED
-            if old_count > 0 and new_count < old_count:
-                print(f"[DROP DETECTED] {self.symbol} Pair {pair_idx}: {old_count} -> {new_count} positions. Executing NUCLEAR RESET.")
-                
-                # Check if pair exists in memory
-                pair = self.pairs.get(pair_idx)
-                if not pair:
-                    print(f"   [WARNING] Pair {pair_idx} not in memory, skipping reset")
-                    continue
-                
-                # Step 1: KILL ALL SURVIVORS (close any remaining positions)
-                if new_count > 0:
-                    print(f"   [CLEANUP] Closing {new_count} remaining positions for Pair {pair_idx}")
-                    await self._close_pair_positions(pair_idx, "both")
-                
-                # Step 2: Close hedge if active
-                if pair.hedge_active and pair.hedge_ticket:
-                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
-                    self._close_position(pair.hedge_ticket)
-                
-                # Step 3: Determine restart direction based on PAIR POLARITY
-                # Positive pairs -> Start with SELL
-                # Negative/Zero pairs -> Start with BUY
-                if pair_idx > 0:
-                    restart_direction = "sell"
-                else:
-                    restart_direction = "buy"
-                
-                # Step 4: EXECUTE PHOENIX RESET
-                self._phoenix_reset_pair(pair_idx, restart_direction)
-                
-                # Step 5: SAVE IMMEDIATELY (crash protection)
-                await self.save_state()
-                
-                # Step 6: Force current count to 0 (we just closed everything)
-                current_counts[pair_idx] = 0
-        
-        # Update state for next tick comparison
-        self.last_pair_counts = current_counts
 
+        # Get all current positions for this symbol
+
+        positions = mt5.positions_get(symbol=self.symbol)
+
+        # Group positions by pair index
+
+        current_counts: Dict[int, int] = defaultdict(int)
+
+        if positions:
+
+            for pos in positions:
+
+                if pos.magic >= 50000:
+
+                    pair_idx = pos.magic - 50000
+
+                    current_counts[pair_idx] += 1
+
+       
+
+        # Check for drops in ALL known pairs (both from last_pair_counts and self.pairs)
+
+        all_pair_indices = set(self.last_pair_counts.keys()) | set(self.pairs.keys())
+
+       
+
+        for pair_idx in all_pair_indices:
+
+            old_count = self.last_pair_counts.get(pair_idx, 0)
+
+            new_count = current_counts.get(pair_idx, 0)
+
+           
+
+            # Get the pair object to check internal state
+
+            pair = self.pairs.get(pair_idx)
+
+           
+
+            # CONDITION 1: Standard Drop (Motion Detection)
+
+            # Detects when position count decreased from one tick to the next
+
+            drop_detected = (old_count > 0 and new_count < old_count)
+
+           
+
+            # CONDITION 2: Ghost State (Internal Memory says Active, Reality says Empty)
+
+            # We check if trade_count > 0 (we think we are active) but MT5 says 0 positions.
+
+            # This catches "Invisible Trades" that open/close between ticks (Fast TP).
+
+            ghost_detected = (pair and pair.trade_count > 0 and new_count == 0)
+
+           
+
+            if drop_detected or ghost_detected:
+
+                reason = "DROP" if drop_detected else "GHOST_DESYNC"
+
+                pair_info = f"MT5: {new_count}, Internal: {pair.trade_count if pair else '?'}"
+
+                print(f"[{reason} DETECTED] {self.symbol} Pair {pair_idx}: Resetting. ({pair_info})")
+
+               
+
+                # Check if pair exists in memory (already fetched above for ghost detection)
+
+                if not pair:
+
+                    print(f"   [WARNING] Pair {pair_idx} not in memory, skipping reset")
+
+                    continue
+
+               
+
+                # Step 1: KILL ALL SURVIVORS (close any remaining positions)
+
+                if new_count > 0:
+
+                    print(f"   [CLEANUP] Closing {new_count} remaining positions for Pair {pair_idx}")
+
+                    await self._close_pair_positions(pair_idx, "both")
+
+               
+
+                # Step 2: Close hedge if active
+
+                if pair.hedge_active and pair.hedge_ticket:
+
+                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
+
+                    self._close_position(pair.hedge_ticket)
+
+               
+
+                # Step 3: Determine restart direction based on PAIR POLARITY
+
+                # Positive pairs -> Start with SELL
+
+                # Negative/Zero pairs -> Start with BUY
+
+                if pair_idx > 0:
+
+                    restart_direction = "sell"
+
+                else:
+
+                    restart_direction = "buy"
+
+               
+
+                # Step 4: EXECUTE PHOENIX RESET
+
+                self._phoenix_reset_pair(pair_idx, restart_direction)
+
+               
+
+                # Step 5: SAVE IMMEDIATELY (crash protection)
+
+                await self.save_state()
+
+               
+
+                # Step 6: Force current count to 0 (we just closed everything)
+
+                current_counts[pair_idx] = 0
+
+       
+
+        # Update state for next tick comparison
+
+        self.last_pair_counts = current_counts
 
     def _phoenix_reset_pair(self, pair_index: int, start_direction: str) -> None:
         """
