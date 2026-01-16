@@ -2453,8 +2453,11 @@ class SymbolEngine:
                     buy_proximity = ask <= (pair.buy_price + tolerance)
                     if buy_proximity and pair.trade_count < self.max_positions:
                         print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} (Level: {pair.buy_price:.2f}) - Triggering BUY.")
-                        await self._execute_trade_with_chain("buy", idx)
-                    # If not close enough, do nothing - just wait
+                        if await self._execute_trade_with_chain("buy", idx):
+                            # [FIX] ALSO EXPAND GRID for Phoenix pairs
+                            indices = sorted(self.pairs.keys())
+                            if idx == indices[-1] and idx >= 0:
+                                await self._create_next_positive_pair(idx)
                     continue  # Skip standard logic for this pair
                 
                 # Check SELL proximity
@@ -2463,8 +2466,11 @@ class SymbolEngine:
                     sell_proximity = bid >= (pair.sell_price - tolerance)
                     if sell_proximity and pair.trade_count < self.max_positions:
                         print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} (Level: {pair.sell_price:.2f}) - Triggering SELL.")
-                        await self._execute_trade_with_chain("sell", idx)
-                    # If not close enough, do nothing - just wait
+                        if await self._execute_trade_with_chain("sell", idx):
+                            # [FIX] ALSO EXPAND GRID for Phoenix pairs
+                            indices = sorted(self.pairs.keys())
+                            if idx == indices[0] and idx <= 0:
+                                await self._create_next_negative_pair(idx)
                     continue  # Skip standard logic for this pair
                 
                 # If we get here, just skip to next pair
@@ -2515,8 +2521,13 @@ class SymbolEngine:
                         buy_attempt_failed = True
                 
                 else:
-                    # Logic block (capped, no hedge needed) - mark zone as entered to prevent loop
+                    # Logic block (capped)
                     pair.buy_in_zone = True 
+                    # [FIX] STILL EXPAND GRID even if trade is blocked by max_positions
+                    # This ensures the ladder continues up if price keeps rising
+                    indices = sorted(self.pairs.keys())
+                    if idx == indices[-1] and idx >= 0:
+                        await self._create_next_positive_pair(idx)
 
             if not buy_attempt_failed and not pair.buy_in_zone:
                  pair.buy_in_zone = buy_in_zone_now
@@ -2563,6 +2574,11 @@ class SymbolEngine:
                         
                 else:
                     pair.sell_in_zone = True
+                    # [FIX] STILL EXPAND GRID even if trade is blocked by max_positions
+                    # This ensures the ladder continues down if price keeps falling
+                    indices = sorted(self.pairs.keys())
+                    if idx == indices[0] and idx <= 0:
+                        await self._create_next_negative_pair(idx)
 
             if not sell_attempt_failed and not pair.sell_in_zone:
                 pair.sell_in_zone = sell_in_zone_now
@@ -2632,60 +2648,99 @@ class SymbolEngine:
 
     async def _execute_hedge(self, pair_index: int, direction: str) -> bool:
         """
-        Execute a HEDGE order to lock the pair when max_positions is reached.
-        This places a trade in the 'next_action' direction to neutralize exposure.
+        Execute a HEDGE order to lock the pair.
+        Fixes inheritance logic and ensures TP/SL are forced to valid levels.
         """
         pair = self.pairs.get(pair_index)
         if not pair or pair.hedge_active:
             return False
             
-        # Double check config
         if not self.hedge_enabled:
             return False
             
         print(f" {self.symbol}: MAX POSITIONS ({self.max_positions}) REACHED for Pair {pair_index}. Executing HEDGE ({direction.upper()}).")
         
         tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
+        sym_info = mt5.symbol_info(self.symbol)
+        if not tick or not sym_info:
             return False
 
-        # --- HEDGE TP/SL INHERITANCE ---
-        h_tp = 0.0
-        h_sl = 0.0
+        point = sym_info.point
+        stops_level = max(sym_info.trade_stops_level, 10) * point
         
-        grid_price = pair.sell_price if direction == "sell" else pair.buy_price
+        # --- 1. CALCULATE FRESH BOUNDARIES (Don't trust stale pair variables) ---
+        # We define the "Box" of the trade cycle
+        # Upper Limit = Buy Entry + Buy TP Pips (approx) OR Sell Entry + Sell SL Pips
+        # Lower Limit = Sell Entry - Sell TP Pips (approx) OR Buy Entry - Buy SL Pips
         
-        if direction == "sell":
-            # Inherit from existing Buy
-            h_tp = pair.pair_sl
-            h_sl = pair.pair_tp
-            
-            # Fallback
-            if h_tp == 0.0 or h_sl == 0.0:
-                 h_tp = grid_price - 20 * mt5.symbol_info(self.symbol).point
-                 h_sl = grid_price + 20 * mt5.symbol_info(self.symbol).point
+        # Use simple offsets from the grid prices to find the intended levels
+        tp_pips = float(self.config.get('buy_stop_tp', 20.0)) * point # Default assumption
+        sl_pips = float(self.config.get('buy_stop_sl', 20.0)) * point
         
-        else: # direction == "buy"
-            # FIX: Swap TP/SL from the existing Sell positions (same logic as sell hedge)
-            # Sell's SL (ABOVE) becomes Buy's TP (ABOVE)
-            # Sell's TP (BELOW) becomes Buy's SL (BELOW)
-            h_tp = pair.pair_sl
-            h_sl = pair.pair_tp
-            
-            # Fallback
-            if h_tp == 0.0 or h_sl == 0.0:
-                 h_tp = grid_price + 20 * mt5.symbol_info(self.symbol).point
-                 h_sl = grid_price - 20 * mt5.symbol_info(self.symbol).point
+        # If we have existing values, use them to define the range, otherwise calculate
+        # We assume the "Upper" is the Buy's TP level and "Lower" is Sell's TP level
+        # This matches the "Cycle" logic where both sides share exit levels
+        
+        if pair.pair_tp > 0 and pair.pair_sl > 0:
+            # Determine which is Top and Bottom
+            upper_limit = max(pair.pair_tp, pair.pair_sl)
+            lower_limit = min(pair.pair_tp, pair.pair_sl)
+        else:
+            # Fallback calculation
+            upper_limit = pair.buy_price + tp_pips
+            lower_limit = pair.sell_price - tp_pips
 
-        price = tick.ask if direction == "buy" else tick.bid
-        volume = self.hedge_lot_size
+        # --- 2. ASSIGN BASED ON DIRECTION ---
+        if direction == "buy":
+            # Buying to Hedge a Sell
+            # TP must be UP, SL must be DOWN
+            h_tp = upper_limit
+            h_sl = lower_limit
+        else:
+            # Selling to Hedge a Buy
+            # TP must be DOWN, SL must be UP
+            h_tp = lower_limit
+            h_sl = upper_limit
 
+        # --- 3. FORCE VALIDITY (The "Push" Logic) ---
+        # Instead of removing invalid stops, we push them to the nearest valid price
+        
+        bid = tick.bid
+        ask = tick.ask
+        
+        if direction == "buy":
+            # BUY TP Check (Must be > Ask + StopsLevel)
+            min_tp = ask + stops_level
+            if h_tp < min_tp:
+                print(f"   [ADJ] Buy Hedge TP {h_tp:.5f} too low. Pushing to {min_tp:.5f}")
+                h_tp = min_tp
+                
+            # BUY SL Check (Must be < Bid - StopsLevel)
+            max_sl = bid - stops_level
+            if h_sl > max_sl:
+                print(f"   [ADJ] Buy Hedge SL {h_sl:.5f} too high. Pushing to {max_sl:.5f}")
+                h_sl = max_sl
+
+        else: # direction == "sell"
+            # SELL TP Check (Must be < Bid - StopsLevel)
+            max_tp = bid - stops_level
+            if h_tp > max_tp:
+                print(f"   [ADJ] Sell Hedge TP {h_tp:.5f} too high. Pushing to {max_tp:.5f}")
+                h_tp = max_tp
+                
+            # SELL SL Check (Must be > Ask + StopsLevel)
+            min_sl = ask + stops_level
+            if h_sl < min_sl:
+                print(f"   [ADJ] Sell Hedge SL {h_sl:.5f} too low. Pushing to {min_sl:.5f}")
+                h_sl = min_sl
+
+        # --- 4. EXECUTION ---
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": self.symbol,
-            "volume": volume,
+            "volume": self.hedge_lot_size,
             "type": mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL,
-            "price": price,
+            "price": ask if direction == "buy" else bid,
             "magic": 90000 + pair_index,
             "comment": f"Hedge L{pair_index}",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -2697,28 +2752,29 @@ class SymbolEngine:
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            print(f" {self.symbol}: HEDGE EXECUTED for Pair {pair_index} @ {price:.2f} | Ticket: {result.order}")
+            print(f" {self.symbol}: HEDGE EXECUTED for Pair {pair_index} @ {request['price']:.2f} | Ticket: {result.order}")
             
             pair.hedge_active = True
             pair.hedge_ticket = result.order
             pair.hedge_direction = direction
             
-            # Log to DB
             await self._log_trade(
                 event_type="HEDGE",
                 pair_index=pair_index,
                 direction=direction.upper(),
-                price=price,
-                lot_size=volume,
+                price=request['price'],
+                lot_size=self.hedge_lot_size,
                 ticket=result.order,
-                notes=f"Max Pos Reached - Locked (TP={h_tp:.2f}, SL={h_sl:.2f})",
-                trade_count=pair.trade_count
+                notes=f"Locked (TP={h_tp:.2f}, SL={h_sl:.2f})"
             )
             
             await self.save_state()
             return True
-            
-        print(f" {self.symbol}: HEDGE FAILED for Pair {pair_index}: {result.comment if result else 'Unknown'}")
+        
+        # Log precise error for debugging
+        err_desc = result.comment if result else "Unknown"
+        ret_code = result.retcode if result else 0
+        print(f" {self.symbol}: HEDGE FAILED for Pair {pair_index}: {err_desc} ({ret_code})")
         return False
 
     async def _execute_market_order(self, direction: str, price: float, index: int) -> int:

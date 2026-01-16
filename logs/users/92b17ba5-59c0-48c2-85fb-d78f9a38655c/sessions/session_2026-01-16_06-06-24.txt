@@ -1,0 +1,24 @@
+=====================================
+SESSION: 2026-01-16 06:06:47
+USER ID: 92b17ba5-59c0-48c2-85fb-d78f9a38655c
+=====================================
+
+[06:06:47] BUTTON: Start All
+[06:06:47] TRADE #1
+  Symbol: FX Vol 20
+  Pair: 0
+  Direction: BUY
+  Price: 112389.26
+  Lot: 0.01
+  Trade #: 0
+  Ticket: 238573187
+
+[06:06:47] TRADE #2
+  Symbol: FX Vol 20
+  Pair: 1
+  Direction: SELL
+  Price: 112385.26
+  Lot: 0.01
+  Trade #: 0
+  Ticket: 238573188
+
