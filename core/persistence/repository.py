@@ -2,7 +2,7 @@
 import aiosqlite
 import logging
 import time
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 import os
 
 # Ensure db directory exists
@@ -40,7 +40,7 @@ class Repository:
         await self.db.commit()
 
     async def get_state(self) -> Dict[str, Any]:
-        """Load symbol-level state (phase, center_price)."""
+        """Load symbol-level state (phase, center_price, cycle_id, anchor_price)."""
         async with self.db.execute(
             "SELECT * FROM symbol_state WHERE symbol = ?", (self.symbol,)
         ) as cursor:
@@ -49,19 +49,22 @@ class Repository:
                 return dict(row)
             return {}
 
-    async def save_state(self, phase: str, center_price: float, iteration: int):
-        """Upsert symbol state."""
+    async def save_state(self, phase: str, center_price: float, iteration: int,
+                         cycle_id: int = 0, anchor_price: float = 0.0):
+        """Upsert symbol state including cycle management fields."""
         await self.db.execute(
             """
-            INSERT INTO symbol_state (symbol, phase, center_price, iteration, last_update_time)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO symbol_state (symbol, phase, center_price, iteration, last_update_time, cycle_id, anchor_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 phase=excluded.phase,
                 center_price=excluded.center_price,
                 iteration=excluded.iteration,
-                last_update_time=excluded.last_update_time
+                last_update_time=excluded.last_update_time,
+                cycle_id=excluded.cycle_id,
+                anchor_price=excluded.anchor_price
             """,
-            (self.symbol, phase, center_price, iteration, time.time())
+            (self.symbol, phase, center_price, iteration, time.time(), cycle_id, anchor_price)
         )
         await self.db.commit()
 
@@ -126,6 +129,60 @@ class Repository:
             (self.symbol, pair_index)
         )
         await self.db.commit()
+
+    # ========================================================================
+    # TICKET MAP (Groups + 3-Cap Strategy)
+    # ========================================================================
+
+    async def save_ticket(self, ticket: int, cycle_id: int, pair_index: int, 
+                          leg: str, trade_count: int = 0):
+        """Save ticket → (cycle, pair, leg) mapping for TP detection."""
+        await self.db.execute(
+            """
+            INSERT INTO ticket_map (ticket, symbol, cycle_id, pair_index, leg, trade_count)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticket) DO UPDATE SET
+                cycle_id=excluded.cycle_id,
+                pair_index=excluded.pair_index,
+                leg=excluded.leg,
+                trade_count=excluded.trade_count
+            """,
+            (ticket, self.symbol, cycle_id, pair_index, leg, trade_count)
+        )
+        await self.db.commit()
+
+    async def get_ticket_map(self) -> Dict[int, Tuple[int, int, str]]:
+        """Load all ticket mappings for this symbol.
+        
+        Returns:
+            Dict[ticket, (cycle_id, pair_index, leg)]
+        """
+        async with self.db.execute(
+            "SELECT ticket, cycle_id, pair_index, leg FROM ticket_map WHERE symbol = ?",
+            (self.symbol,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {row['ticket']: (row['cycle_id'], row['pair_index'], row['leg']) for row in rows}
+
+    async def delete_ticket(self, ticket: int):
+        """Remove a ticket from the map (on position close)."""
+        await self.db.execute(
+            "DELETE FROM ticket_map WHERE ticket = ?",
+            (ticket,)
+        )
+        await self.db.commit()
+
+    async def clear_ticket_map(self):
+        """Clear all tickets for this symbol (on fresh start)."""
+        await self.db.execute(
+            "DELETE FROM ticket_map WHERE symbol = ?",
+            (self.symbol,)
+        )
+        await self.db.commit()
+
+    # ========================================================================
+    # TRADE HISTORY
+    # ========================================================================
 
     async def log_trade(self, event: Dict[str, Any]):
         """Log a trade event to history table (Permanent storage)."""

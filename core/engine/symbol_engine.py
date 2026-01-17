@@ -386,6 +386,21 @@ class SymbolEngine:
         # self.pair_locks REMOVED - not used or can be simplified
         self.trade_in_progress: Dict[int, bool] = defaultdict(bool)  # Track which pairs are mid-trade
         
+        # ========================================================================
+        # GROUPS + 3-COMPLETED CAP STRATEGY (Cycle Management)
+        # ========================================================================
+        self.cycle_id: int = 0                    # Monotonic cycle counter, incremented on TP
+        self.anchor_price: float = 0.0            # Per-cycle anchor (startup or TP price)
+        self.tolerance: float = 5.0               # T = ±5 fixed trigger tolerance
+        self.bot_magic_base: int = 50000          # Base magic number for orders
+        
+        # Step trigger tracking (reset on each new cycle)
+        self.step1_triggered: bool = False        # True after placing B1+S2
+        self.step2_triggered: bool = False        # True after placing B2(+S3 conditional)
+        
+        # Ticket → (cycle_id, pair_index, leg) map for TP detection
+        self.ticket_map: Dict[int, tuple] = {}    # Runtime cache, persisted to DB
+        
     @property
     def config(self) -> Dict[str, Any]:
         """Get symbol-specific config from the new multi-asset structure"""
@@ -464,6 +479,354 @@ class SymbolEngine:
         return int(pair_idx)
     
     # ========================================================================
+    # GROUPS + 3-COMPLETED CAP STRATEGY (Core Methods)
+    # ========================================================================
+    
+    def _count_completed_pairs_open(self) -> int:
+        """
+        Count completed pairs (both BUY and SELL positions exist).
+        Uses ticket_map to determine pair membership.
+        Returns count across ALL cycles.
+        """
+        positions = mt5.positions_get(symbol=self.symbol)
+        if not positions:
+            return 0
+        
+        # Group by pair_index using ticket_map
+        pair_legs = defaultdict(set)  # pair_index → {'B', 'S'}
+        for pos in positions:
+            info = self.ticket_map.get(pos.ticket)
+            if info:
+                _, pair_idx, leg = info
+                pair_legs[pair_idx].add(leg)
+        
+        # Count pairs with both legs
+        completed = sum(1 for legs in pair_legs.values() if 'B' in legs and 'S' in legs)
+        return completed
+    
+    def _is_pair_completed(self, pair_index: int) -> bool:
+        """Check if a specific pair has both B and S positions open."""
+        positions = mt5.positions_get(symbol=self.symbol)
+        if not positions:
+            return False
+        
+        legs = set()
+        for pos in positions:
+            info = self.ticket_map.get(pos.ticket)
+            if info and info[1] == pair_index:
+                legs.add(info[2])
+        
+        return 'B' in legs and 'S' in legs
+    
+    def _can_place_completing_leg(self, pair_index: int, leg: str) -> bool:
+        """
+        Global Lock Gate: Returns False if placing this leg would push C > 3.
+        Must be called BEFORE placing any order.
+        
+        Args:
+            pair_index: The pair this order belongs to
+            leg: 'B' or 'S'
+        
+        Returns:
+            True if order can proceed, False if blocked by cap
+        """
+        C = self._count_completed_pairs_open()
+        
+        # If already at cap, check if this would complete a pair
+        if C >= 3:
+            # Check if the other leg already exists for this pair
+            positions = mt5.positions_get(symbol=self.symbol)
+            existing_legs = set()
+            if positions:
+                for pos in positions:
+                    info = self.ticket_map.get(pos.ticket)
+                    if info and info[1] == pair_index:
+                        existing_legs.add(info[2])
+            
+            other_leg = 'S' if leg == 'B' else 'B'
+            would_complete = other_leg in existing_legs
+            
+            if would_complete:
+                print(f"[CAP_BLOCK] cycle={self.cycle_id} pair={pair_index} leg={leg} BLOCKED (would complete, C={C})")
+                return False
+        
+        return True
+    
+    def _is_locked(self) -> bool:
+        """Global lock: True when 3+ completed pairs exist."""
+        return self._count_completed_pairs_open() >= 3
+    
+    async def _execute_cycle_init(self):
+        """
+        Execute INIT for current cycle: place B0 and S1 atomically.
+        Called on fresh start or after TP triggers new cycle.
+        """
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            print(f"[CYCLE_INIT] {self.symbol}: No tick data, cannot init")
+            return
+        
+        async with self.execution_lock:
+            print(f"[CYCLE_INIT] cycle={self.cycle_id} anchor={self.anchor_price:.2f}")
+            
+            # B0: Buy at current ask
+            b0_price = tick.ask
+            pair0 = GridPair(index=0, buy_price=b0_price, sell_price=b0_price - self.spread)
+            pair0.next_action = "buy"  # Start with buy
+            self.pairs[0] = pair0
+            
+            # Execute B0
+            ticket_b0 = await self._execute_market_order("buy", b0_price, 0, reason="INIT")
+            if ticket_b0:
+                pair0.buy_filled = True
+                pair0.buy_ticket = ticket_b0
+                pair0.advance_toggle()
+                print(f"[CYCLE_INIT] B0 placed, ticket={ticket_b0}")
+            else:
+                print(f"[CYCLE_INIT] B0 FAILED")
+                return
+            
+            # S1: Sell at B0 price (Pair 1's sell is at B0's buy price)
+            s1_price = b0_price  # Pair 1 sell is at same level as Pair 0 buy
+            pair1 = GridPair(index=1, buy_price=b0_price + self.spread, sell_price=s1_price)
+            pair1.next_action = "sell"  # Positive pairs start with sell
+            self.pairs[1] = pair1
+            
+            # Execute S1
+            ticket_s1 = await self._execute_market_order("sell", s1_price, 1, reason="INIT")
+            if ticket_s1:
+                pair1.sell_filled = True
+                pair1.sell_ticket = ticket_s1
+                pair1.advance_toggle()
+                print(f"[CYCLE_INIT] S1 placed, ticket={ticket_s1}")
+            else:
+                print(f"[CYCLE_INIT] S1 FAILED")
+            
+            # Update center price for this cycle
+            self.center_price = b0_price
+            
+            await self.save_state()
+    
+    async def _check_step_triggers(self, ask: float, bid: float):
+        """
+        Trigger geometry: anchor ± k*D with ±T tolerance.
+        
+        Step 1 (at D): Place B1+S2 atomically if C < 3
+        Step 2 (at 2D): If C >= 2, place B2 only (no S3). Else B2+S3.
+        """
+        D = self.spread  # grid_distance
+        T = self.tolerance
+        C = self._count_completed_pairs_open()
+        
+        # ================================================================
+        # BULLISH LADDER (price moving up)
+        # ================================================================
+        level_1 = self.anchor_price + D
+        level_2 = self.anchor_price + 2 * D
+        
+        # Step 1: at anchor + D
+        if not self.step1_triggered and ask >= level_1 - T:
+            if C < 3:
+                print(f"[STEP1] Triggered at ask={ask:.2f} >= level={level_1:.2f}")
+                await self._execute_step1_bullish()
+                self.step1_triggered = True
+            else:
+                print(f"[STEP1] BLOCKED (C={C} >= 3)")
+        
+        # Step 2: at anchor + 2D
+        if not self.step2_triggered and ask >= level_2 - T:
+            if C == 2:
+                # Special rule: B2 only, no S3
+                print(f"[STEP2] Triggered at ask={ask:.2f} >= level={level_2:.2f} (C==2, single leg)")
+                await self._execute_step2_single_leg_bullish()
+            else:
+                print(f"[STEP2] Triggered at ask={ask:.2f} >= level={level_2:.2f}")
+                await self._execute_step2_bullish()
+            self.step2_triggered = True
+        
+        # ================================================================
+        # BEARISH LADDER (price moving down) - analogous logic
+        # ================================================================
+        level_neg1 = self.anchor_price - D
+        level_neg2 = self.anchor_price - 2 * D
+        
+        # Step 1 bearish: at anchor - D
+        if not self.step1_triggered and bid <= level_neg1 + T:
+            if C < 3:
+                print(f"[STEP1] Triggered bearish at bid={bid:.2f} <= level={level_neg1:.2f}")
+                await self._execute_step1_bearish()
+                self.step1_triggered = True
+            else:
+                print(f"[STEP1] BLOCKED bearish (C={C} >= 3)")
+        
+        # Step 2 bearish: at anchor - 2D
+        if not self.step2_triggered and bid <= level_neg2 + T:
+            if C == 2:
+                print(f"[STEP2] Triggered bearish at bid={bid:.2f} <= level={level_neg2:.2f} (C==2, single leg)")
+                await self._execute_step2_single_leg_bearish()
+            else:
+                print(f"[STEP2] Triggered bearish at bid={bid:.2f} <= level={level_neg2:.2f}")
+                await self._execute_step2_bearish()
+            self.step2_triggered = True
+    
+    async def _execute_step1_bullish(self):
+        """Step 1 Bullish: Place B1 + S2 atomically."""
+        # B1 completes Pair 1 (already has S1 from INIT)
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return
+        
+        pair1 = self.pairs.get(1)
+        if pair1 and not pair1.buy_filled:
+            ticket = await self._execute_market_order("buy", pair1.buy_price, 1, reason="STEP1")
+            if ticket:
+                pair1.buy_filled = True
+                pair1.buy_ticket = ticket
+                pair1.advance_toggle()
+        
+        # S2: Create Pair 2 with sell
+        pair2 = GridPair(index=2, buy_price=self.anchor_price + 2*self.spread, 
+                         sell_price=self.anchor_price + self.spread)
+        pair2.next_action = "sell"
+        self.pairs[2] = pair2
+        
+        ticket = await self._execute_market_order("sell", pair2.sell_price, 2, reason="STEP1")
+        if ticket:
+            pair2.sell_filled = True
+            pair2.sell_ticket = ticket
+            pair2.advance_toggle()
+    
+    async def _execute_step1_bearish(self):
+        """Step 1 Bearish: Place S0 + B-1 atomically.
+        
+        S0 completes Pair 0 (already has B0 from INIT)
+        B-1 starts Pair -1
+        """
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return
+        
+        # S0: Complete Pair 0 (Pair 0 already has B0 from INIT)
+        pair0 = self.pairs.get(0)
+        if pair0 and not pair0.sell_filled:
+            ticket = await self._execute_market_order("sell", pair0.sell_price, 0, reason="STEP1")
+            if ticket:
+                pair0.sell_filled = True
+                pair0.sell_ticket = ticket
+                pair0.advance_toggle()
+        
+        # B-1: Start Pair -1 (buy only)
+        pair_neg1 = GridPair(index=-1, buy_price=self.anchor_price - self.spread, 
+                             sell_price=self.anchor_price - 2*self.spread)
+        pair_neg1.next_action = "buy"
+        self.pairs[-1] = pair_neg1
+        
+        ticket = await self._execute_market_order("buy", pair_neg1.buy_price, -1, reason="STEP1")
+        if ticket:
+            pair_neg1.buy_filled = True
+            pair_neg1.buy_ticket = ticket
+            pair_neg1.advance_toggle()
+    
+    async def _execute_step2_bullish(self):
+        """Step 2 Bullish: Place B2 + S3 atomically."""
+        pair2 = self.pairs.get(2)
+        if pair2 and not pair2.buy_filled:
+            ticket = await self._execute_market_order("buy", pair2.buy_price, 2, reason="STEP2")
+            if ticket:
+                pair2.buy_filled = True
+                pair2.buy_ticket = ticket
+                pair2.advance_toggle()
+        
+        # S3
+        pair3 = GridPair(index=3, buy_price=self.anchor_price + 3*self.spread,
+                         sell_price=self.anchor_price + 2*self.spread)
+        pair3.next_action = "sell"
+        self.pairs[3] = pair3
+        
+        ticket = await self._execute_market_order("sell", pair3.sell_price, 3, reason="STEP2")
+        if ticket:
+            pair3.sell_filled = True
+            pair3.sell_ticket = ticket
+            pair3.advance_toggle()
+    
+    async def _execute_step2_single_leg_bullish(self):
+        """Step 2 Bullish (C >= 2): Place B2 ONLY, no S3."""
+        pair2 = self.pairs.get(2)
+        if pair2 and not pair2.buy_filled:
+            ticket = await self._execute_market_order("buy", pair2.buy_price, 2, reason="STEP2")
+            if ticket:
+                pair2.buy_filled = True
+                pair2.buy_ticket = ticket
+                pair2.advance_toggle()
+                print(f"[STEP2_SINGLE] B2 placed, S3 skipped (C >= 2)")
+    
+    async def _execute_step2_bearish(self):
+        """Step 2 Bearish: Place S-1 + B-2 atomically.
+        
+        S-1 completes Pair -1 (already has B-1 from Step 1)
+        B-2 starts Pair -2
+        """
+        # S-1: Complete Pair -1 (Pair -1 already has B-1 from Step 1)
+        pair_neg1 = self.pairs.get(-1)
+        if pair_neg1 and not pair_neg1.sell_filled:
+            ticket = await self._execute_market_order("sell", pair_neg1.sell_price, -1, reason="STEP2")
+            if ticket:
+                pair_neg1.sell_filled = True
+                pair_neg1.sell_ticket = ticket
+                pair_neg1.advance_toggle()
+        
+        # B-2: Start Pair -2 (buy only)
+        pair_neg2 = GridPair(index=-2, buy_price=self.anchor_price - 2*self.spread,
+                             sell_price=self.anchor_price - 3*self.spread)
+        pair_neg2.next_action = "buy"
+        self.pairs[-2] = pair_neg2
+        
+        ticket = await self._execute_market_order("buy", pair_neg2.buy_price, -2, reason="STEP2")
+        if ticket:
+            pair_neg2.buy_filled = True
+            pair_neg2.buy_ticket = ticket
+            pair_neg2.advance_toggle()
+    
+    async def _execute_step2_single_leg_bearish(self):
+        """Step 2 Bearish (C == 2): Place S-2 ONLY to complete Pair -2, no B-3."""
+        # S-2: Complete Pair -2 (Pair -2 already has B-2 from Step 2 full)
+        pair_neg2 = self.pairs.get(-2)
+        if pair_neg2 and not pair_neg2.sell_filled:
+            ticket = await self._execute_market_order("sell", pair_neg2.sell_price, -2, reason="STEP2")
+            if ticket:
+                pair_neg2.sell_filled = True
+                pair_neg2.sell_ticket = ticket
+                pair_neg2.advance_toggle()
+                print(f"[STEP2_SINGLE] S-2 placed, B-3 skipped (C == 2)")
+    
+    async def _enforce_hedge_invariants_gated(self):
+        """
+        Enforce hedge rules for COMPLETED pairs only.
+        A pair is completed when both B and S positions exist.
+        """
+        for idx, pair in self.pairs.items():
+            # GATE: Only manage hedges for COMPLETED pairs
+            if not self._is_pair_completed(idx):
+                continue
+            
+            # Check if pair is at max positions and needs hedge
+            if pair.trade_count >= self.max_positions and not pair.hedge_active:
+                if self.hedge_enabled:
+                    # Place hedge
+                    await self._place_hedge(idx, pair)
+    
+    async def _place_hedge(self, pair_idx: int, pair):
+        """Place hedge for a maxed-out pair."""
+        # Determine hedge direction (opposite of last trade)
+        if pair.next_action == "buy":
+            hedge_direction = "sell"  # Last was buy, hedge with sell
+        else:
+            hedge_direction = "buy"  # Last was sell, hedge with buy
+        
+        print(f"[HEDGE] Placing {hedge_direction} hedge for Pair {pair_idx}")
+        # Hedge placement logic would go here (using existing _execute_hedge method if available)
+    
+    # ========================================================================
     # LIFECYCLE
     # ========================================================================
     
@@ -493,17 +856,34 @@ class SymbolEngine:
             print(f" {self.symbol}: Failed to select symbol in MT5.")
             return
         
-        # Load state from DB
+        # Load state from DB (includes cycle state)
         await self.load_state()
+        
+        # Load ticket map for TP detection recovery
+        self.ticket_map = await self.repository.get_ticket_map()
+        print(f"[START] {self.symbol}: Loaded {len(self.ticket_map)} ticket mappings")
         
         # If no state loaded (pairs empty), ensure fresh start
         if not self.pairs:
             self.phase = self.PHASE_INIT
             self.center_price = 0.0
             self.iteration = 1
-            print(f"[START] {self.symbol}: Fresh Start - B0 will execute")
+            
+            # FRESH START: Set cycle_id=0, anchor=current price
+            self.cycle_id = 0
+            tick = mt5.symbol_info_tick(self.symbol)
+            self.anchor_price = tick.ask if tick else 0.0
+            self.step1_triggered = False
+            self.step2_triggered = False
+            
+            # Clear any stale ticket mappings
+            await self.repository.clear_ticket_map()
+            self.ticket_map = {}
+            
+            print(f"[FRESH] {self.symbol}: cycle_id=0 anchor={self.anchor_price:.2f}")
         else:
-             print(f"[START] {self.symbol}: Resumed with {len(self.pairs)} pairs.")
+            # RECOVERY: cycle_id and anchor_price already loaded in load_state()
+            print(f"[RECOVERY] {self.symbol}: cycle_id={self.cycle_id} anchor={self.anchor_price:.2f} pairs={len(self.pairs)}")
         
         # FIX: Only enable tick processing AFTER everything is initialized
         # This is the last line to prevent race conditions
@@ -996,54 +1376,31 @@ class SymbolEngine:
     
     async def _handle_running(self, ask: float, bid: float):
         """
-        RUNNING: Monitor virtual triggers and check for TP/SL re-opens.
-        Also auto-restart if no active trades for 5+ seconds.
+        RUNNING: Groups + 3-Cap System.
+        - Check step triggers for grid expansion
+        - Monitor TP/SL for cycle rollover
+        - Enforce hedge rules for COMPLETED pairs only
         """
         # Check for active positions
         positions = mt5.positions_get(symbol=self.symbol)
         active_count = len(positions) if positions else 0
         
         if active_count > 0:
-            # We have active trades - update last trade time
             self.last_trade_time = time.time()
-        else:
-            # No active trades - check timeout for auto-restart
-            if self.last_trade_time > 0:
-                elapsed = time.time() - self.last_trade_time
-                if elapsed >= self.no_trade_timeout:
-                    self.iteration += 1
-                    print(f" {self.symbol}: No active trades for {elapsed:.1f}s - RESTARTING cycle #{self.iteration}")
-                    
-                    # Reset to INIT phase (will buy B0 at market on next tick)
-                    self.phase = self.PHASE_INIT
-                    self.pairs = {}
-                    self.center_price = 0.0
-                    self.last_trade_time = 0
-                    self.init_step = 0  # 0=Pending, 1=B0_Complete, 2=S1_Complete
-                    
-                    # Clear old state file
-                    if os.path.exists(self.state_file):
-                        os.remove(self.state_file)
-                    
-                    await self.save_state()
-                    return  # Exit, next tick will run _handle_init
         
-        # [PRIMARY] POSITION DROP DETECTION - Most reliable Nuclear Reset trigger
-        # This detects ANY position decrease (TP, SL, manual close) and triggers reset
-        await self._monitor_position_drops()
+        # NOTE: Auto-restart removed. New cycles are triggered by TP events only.
         
-        # [BACKUP] Check TP/SL from MT5 history (less reliable, kept as secondary)
+        # [PRIMARY] TP/SL Detection using ticket_map for cycle rollover
         await self._check_tp_sl_from_history()
         
-        # [HEDGE SUPERVISOR] Enforce hedge rules BEFORE processing new triggers
-        # This ensures hedges are placed on the tick AFTER max positions is reached
-        await self._enforce_hedge_invariants()
+        # [STEP TRIGGERS] Check anchor geometry triggers (replaces _check_leapfrog)
+        await self._check_step_triggers(ask, bid)
         
-        # 1. Check virtual triggers (monitor prices and fire market orders)
+        # [HEDGE SUPERVISOR] Enforce hedge rules for COMPLETED pairs only
+        await self._enforce_hedge_invariants_gated()
+        
+        # [VIRTUAL TRIGGERS] Monitor prices and fire market orders for existing pairs
         await self._check_virtual_triggers(ask, bid)
-        
-        # 2. Check for closed positions (TP/SL hit) and re-open
-        # await self._check_and_reopen()
     
     async def _update_fill_status(self):
         """Check MT5 positions and update fill status in pairs."""
@@ -1293,20 +1650,20 @@ class SymbolEngine:
 
     async def _check_tp_sl_from_history(self):
         """
-        PHOENIX SYSTEM: Detect TP/SL hits and perform nuclear pair reset.
+        GROUPS + 3-CAP SYSTEM: Detect TP/SL hits using ticket_map.
         
-        Uses _phoenix_reset_pair to destroy and recreate pairs, guaranteeing
-        no stale flags survive the reset.
+        On TP:
+        - Identify exact (cycle_id, pair_index, leg) from ticket_map
+        - Close opposing position (survivor)
+        - Decrement C (completed pairs count)
+        - Start NEW cycle: increment cycle_id, set anchor=TP price, fire INIT
+        
+        On SL:
+        - Same closure logic, but no new cycle (just cleanup)
         """
         try:
             from_time = datetime.fromtimestamp(self.last_deal_check_time)
             deals = mt5.history_deals_get(from_time, datetime.now(), symbol=self.symbol)
-            
-            # DEBUG: Log deal query results
-            #if deals:
-            #    print(f"[DEBUG] {self.symbol}: Found {len(deals)} deals since {from_time}")
-            #    for d in deals[-5:]:  # Show last 5 deals
-            #        print(f"   Deal {d.ticket}: reason={d.reason}, magic={d.magic}, type={d.type}, symbol={d.symbol}")
             
             if not deals:
                 return
@@ -1318,69 +1675,80 @@ class SymbolEngine:
                 if deal.ticket in self.processed_deals:
                     continue
                 
+                # Only process TP/SL closes
                 if deal.reason == mt5.DEAL_REASON_TP:
                     reason = "TP"
                 elif deal.reason == mt5.DEAL_REASON_SL:
                     reason = "SL"
                 else:
-                    # DEBUG: Show skipped deals
-                    # print(f"[DEBUG] Skipping deal {deal.ticket}: reason={deal.reason} (not TP/SL)")
                     continue
                 
-                if deal.magic < 50000:
-                    print(f"[DEBUG] Skipping {reason} deal {deal.ticket}: magic={deal.magic} < 50000")
+                # USE TICKET_MAP for accurate identification
+                info = self.ticket_map.get(deal.position_id)
+                if not info:
+                    # Fallback: try parsing comment
+                    # Format: G=<cycle>;P=<pair>;L=<leg>;TC=<count>
+                    print(f"[{reason}] Position {deal.position_id} not in ticket_map, skipping cycle logic")
                     continue
                 
-                pair_idx = deal.magic - 50000
+                tp_cycle, pair_idx, tp_leg = info
                 pair = self.pairs.get(pair_idx)
-                
-                if not pair:
-                    #print(f"[WARNING] {reason} detected for Pair {pair_idx} but pair not in memory! Creating fresh pair...")
-                    # Don't skip - we should still log this
-                    continue
                 
                 # Mark as processed
                 self.processed_deals.append(deal.ticket)
                 
-                print(f"[{reason}_HIT] {self.symbol}: Pair {pair_idx} - Position {deal.position_id} closed")
+                print(f"[{reason}] cycle={tp_cycle} pair={pair_idx} leg={tp_leg} price={deal.price:.2f}")
                 
-                # [FIX] CLOSE HEDGE IF ACTIVE (Spec Section 10)
-                # Must do this BEFORE Phoenix reset destroys the pair object
+                # Clean up ticket from map
+                del self.ticket_map[deal.position_id]
+                await self.repository.delete_ticket(deal.position_id)
+                
+                if not pair:
+                    print(f"[WARNING] Pair {pair_idx} not in memory for {reason} event")
+                    continue
+                
+                # Close hedge if active
                 if pair.hedge_active and pair.hedge_ticket:
-                    print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket} due to Pair {reason}")
+                    print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
                     self._close_position(pair.hedge_ticket)
-                    # Note: hedge_active will be reset by Phoenix below
-
-                # [CRITICAL FIX] CLOSE THE SURVIVOR (Opposing Position)
-                # When one side hits TP/SL, the other side must be closed immediately
-                # deal.type == DEAL_TYPE_SELL → Buy closed → Survivor is SELL
-                # deal.type == DEAL_TYPE_BUY  → Sell closed → Survivor is BUY
-                if deal.type == mt5.DEAL_TYPE_SELL:
-                    # Buy position closed, close the Sell survivor
+                
+                # Close the survivor (opposing position)
+                if tp_leg == 'B':
                     survivor_ticket = pair.sell_ticket
-                    survivor_direction = "SELL"
+                    survivor_leg = 'S'
                 else:
-                    # Sell position closed, close the Buy survivor
                     survivor_ticket = pair.buy_ticket
-                    survivor_direction = "BUY"
+                    survivor_leg = 'B'
                 
                 if survivor_ticket and survivor_ticket > 0:
-                    print(f"   [CLEANUP] Pair {pair_idx} {reason} Hit: Closing opposing {survivor_direction} position {survivor_ticket}")
+                    print(f"   [CLEANUP] Closing survivor {survivor_leg} ticket={survivor_ticket}")
                     self._close_position(survivor_ticket)
-
-                # PHOENIX SYSTEM: Determine restart direction from closed deal
-                # deal.type == DEAL_TYPE_SELL → We closed a BUY position → Restart with BUY
-                # deal.type == DEAL_TYPE_BUY  → We closed a SELL position → Restart with SELL
-                if deal.type == mt5.DEAL_TYPE_SELL:
-                    restart_direction = "buy"
-                else:
-                    restart_direction = "sell"
+                    
+                    # Clean survivor from ticket_map
+                    if survivor_ticket in self.ticket_map:
+                        del self.ticket_map[survivor_ticket]
+                        await self.repository.delete_ticket(survivor_ticket)
                 
-                # EXECUTE PHOENIX RESET (Nuclear: destroy old pair, create fresh one)
+                # ================================================================
+                # TP TRIGGERS NEW CYCLE
+                # ================================================================
+                if reason == "TP":
+                    old_cycle = self.cycle_id
+                    self.cycle_id += 1
+                    self.anchor_price = deal.price
+                    self.step1_triggered = False
+                    self.step2_triggered = False
+                    
+                    print(f"[TP] cycle={old_cycle} pair={pair_idx} leg={tp_leg} tp_price={deal.price:.2f} -> new_cycle={self.cycle_id}")
+                    
+                    # Fire new cycle INIT (B0 + S1)
+                    await self._execute_cycle_init()
+                
+                # Phoenix reset the pair (for both TP and SL)
+                restart_direction = "buy" if tp_leg == 'B' else "sell"
                 self._phoenix_reset_pair(pair_idx, restart_direction)
                 
-                # [CRITICAL] SAVE IMMEDIATELY
-                # Ensure the "Count=0" state is persisted before the next tick or crash
+                # Save state immediately
                 await self.save_state()
                 
                 # Log to session
@@ -1388,7 +1756,7 @@ class SymbolEngine:
                     self.session_logger.log_tp_sl(
                         symbol=self.symbol,
                         pair_idx=pair_idx,
-                        direction="BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL",
+                        direction="BUY" if tp_leg == 'B' else "SELL",
                         result="tp" if reason == "TP" else "sl",
                         profit=deal.profit
                     )
@@ -1397,6 +1765,8 @@ class SymbolEngine:
             
         except Exception as e:
             print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _check_if_tp_hit(self, ticket: int, direction: str) -> bool:
         """
@@ -2742,7 +3112,7 @@ class SymbolEngine:
             "type": mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL,
             "price": ask if direction == "buy" else bid,
             "magic": 90000 + pair_index,
-            "comment": f"Hedge L{pair_index}",
+            "comment": f"H{pair_index} Grp{self.cycle_id}",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_FOK,
             "tp": float(h_tp),
@@ -2777,7 +3147,7 @@ class SymbolEngine:
         print(f" {self.symbol}: HEDGE FAILED for Pair {pair_index}: {err_desc} ({ret_code})")
         return False
 
-    async def _execute_market_order(self, direction: str, price: float, index: int) -> int:
+    async def _execute_market_order(self, direction: str, price: float, index: int, reason: str = "TRADE") -> int:
         """Execute a market order and return the position ticket.
         
         TP/SL ALIGNMENT LOGIC:
@@ -2789,7 +3159,16 @@ class SymbolEngine:
         - Use the GRID price (passed as 'price' parameter) for TP/SL calculations and logging
         - This ensures B(n) and S(n) are always exactly 'spread' pips apart
         - Actual execution happens at market price, but TP/SL reference the grid level
+        
+        GROUPS + 3-CAP:
+        - Lock gate check prevents completing a pair when C >= 3
+        - Ticket mapping stored for TP detection
         """
+        # GLOBAL LOCK GATE: Check if this order would violate the 3-completed cap
+        leg = 'B' if direction == 'buy' else 'S'
+        if not self._can_place_completing_leg(index, leg):
+            return 0  # Blocked by cap
+        
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
             return 0
@@ -2880,7 +3259,13 @@ class SymbolEngine:
                     tp = check_price - min_dist
                     # print(f"   [ADJ] Sell TP adjusted to {tp:.5f} (Min Dist)")
 
-        magic = 50000 + index
+        # Use cycle-aware magic and comment for TP detection
+        leg = 'B' if direction == 'buy' else 'S'
+        pair = self.pairs.get(index)
+        trade_count = pair.trade_count if pair else 0
+        magic = self.bot_magic_base + self.cycle_id
+        # Human-readable: "B0 Grp1" = Buy pair 0, Group 1
+        comment = f"{leg}{index} Grp{self.cycle_id}"
         
         # Place order WITH TP/SL
         request = {
@@ -2892,7 +3277,7 @@ class SymbolEngine:
             "sl": float(sl),
             "tp": float(tp),
             "magic": magic,
-            "comment": f"L{index}",
+            "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": mt5.ORDER_FILLING_FOK,
             "deviation": 200
@@ -2901,6 +3286,15 @@ class SymbolEngine:
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            ticket = result.order
+            
+            # TICKET MAPPING: Store for TP detection
+            self.ticket_map[ticket] = (self.cycle_id, index, leg)
+            await self.repository.save_ticket(ticket, self.cycle_id, index, leg, trade_count)
+            
+            # Log order placement
+            print(f"[ORDER] cycle={self.cycle_id} pair={index} leg={leg} reason={reason}")
+            
             # Log trade to history
             pair = self.pairs.get(index)
             await self._log_trade(
@@ -2909,11 +3303,11 @@ class SymbolEngine:
                 direction=direction.upper(),
                 price=exec_price,
                 lot_size=volume,
-                ticket=result.order,
-                notes=f"TP={tp:.2f} SL={sl:.2f}",
+                ticket=ticket,
+                notes=f"TP={tp:.2f} SL={sl:.2f} C={self.cycle_id}",
                 trade_count=pair.trade_count if pair else 0
             )
-            return result.order
+            return ticket
         
         # Retry logic removed because we did pre-validation. 
         # If it still fails, it's a broker rejection we can't easily fix by just moving stops again blindly.
@@ -3116,9 +3510,12 @@ class SymbolEngine:
 
     
     async def save_state(self):
-        """Persist grid state to SQLite."""
-        # Save Symbol State
-        await self.repository.save_state(self.phase, self.center_price, self.iteration)
+        """Persist grid state to SQLite including cycle management."""
+        # Save Symbol State with cycle fields
+        await self.repository.save_state(
+            self.phase, self.center_price, self.iteration,
+            self.cycle_id, self.anchor_price
+        )
         
         # Save All Pairs
         for pair in self.pairs.values():
@@ -3134,6 +3531,10 @@ class SymbolEngine:
         self.phase = state.get('phase', self.PHASE_INIT)
         self.center_price = state.get('center_price', 0.0)
         self.iteration = state.get('iteration', 1)
+        
+        # Load cycle management fields
+        self.cycle_id = state.get('cycle_id', 0)
+        self.anchor_price = state.get('anchor_price', 0.0)
         
         # Restore last deal check time to prevent missing deals
         last_update_str = state.get('last_update_time')

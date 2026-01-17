@@ -6,7 +6,10 @@ CREATE TABLE IF NOT EXISTS symbol_state (
     phase TEXT NOT NULL,
     center_price REAL,
     iteration INTEGER DEFAULT 1,
-    last_update_time REAL
+    last_update_time REAL,
+    -- New: Cycle Management (Groups + 3-Cap Strategy)
+    cycle_id INTEGER DEFAULT 0,
+    anchor_price REAL DEFAULT 0.0
 );
 
 -- 2. Grid Pairs (Replaces 'pairs' dict in JSON)
@@ -57,6 +60,18 @@ CREATE TABLE IF NOT EXISTS trade_history (
     notes TEXT
 );
 
+-- 4. Ticket Map (Groups + 3-Cap Strategy: tracks ticket → cycle/pair/leg)
+CREATE TABLE IF NOT EXISTS ticket_map (
+    ticket INTEGER PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    cycle_id INTEGER NOT NULL,
+    pair_index INTEGER NOT NULL,
+    leg TEXT NOT NULL CHECK (leg IN ('B', 'S')),
+    trade_count INTEGER DEFAULT 0
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_pairs_symbol ON grid_pairs(symbol);
 CREATE INDEX IF NOT EXISTS idx_history_symbol ON trade_history(symbol);
+CREATE INDEX IF NOT EXISTS idx_ticket_map_symbol ON ticket_map(symbol);
+CREATE INDEX IF NOT EXISTS idx_ticket_map_cycle ON ticket_map(cycle_id);
