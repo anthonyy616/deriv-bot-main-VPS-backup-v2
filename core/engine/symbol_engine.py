@@ -387,16 +387,29 @@ class SymbolEngine:
         self.trade_in_progress: Dict[int, bool] = defaultdict(bool)  # Track which pairs are mid-trade
         
         # ========================================================================
-        # GROUPS + 3-COMPLETED CAP STRATEGY (Cycle Management)
+        # GROUPS + TP-DRIVEN STRATEGY (Multi-Group Cycle Management)
         # ========================================================================
-        self.cycle_id: int = 0                    # Monotonic cycle counter, incremented on TP
+        # Group numbering: Group 0 = pairs 0-99, Group 1 = 100-199, etc.
+        self.GROUP_OFFSET: int = 100              # Pair offset per group
+        self.current_group: int = 0               # Active group being traded
+        self.group_anchors: Dict[int, float] = {} # group_id -> anchor_price
+        
+        # Legacy fields (maintained for compatibility)
+        self.cycle_id: int = 0                    # Maps to current_group for now
         self.anchor_price: float = 0.0            # Per-cycle anchor (startup or TP price)
         self.tolerance: float = 5.0               # T = ±5 fixed trigger tolerance
         self.bot_magic_base: int = 50000          # Base magic number for orders
         
-        # Step trigger tracking (reset on each new cycle)
-        self.step1_triggered: bool = False        # True after placing B1+S2
-        self.step2_triggered: bool = False        # True after placing B2(+S3 conditional)
+        # Step trigger tracking - SEPARATE for bullish and bearish directions
+        # This allows price reversals to properly trigger the other direction's ladder
+        self.step1_bullish_triggered: bool = False
+        self.step1_bearish_triggered: bool = False
+        self.step2_bullish_triggered: bool = False
+        self.step2_bearish_triggered: bool = False
+        
+        # Legacy flags (kept for compatibility, now derived)
+        self.step1_triggered: bool = False
+        self.step2_triggered: bool = False
         
         # Ticket → (cycle_id, pair_index, leg) map for TP detection
         self.ticket_map: Dict[int, tuple] = {}    # Runtime cache, persisted to DB
@@ -556,118 +569,321 @@ class SymbolEngine:
         """Global lock: True when 3+ completed pairs exist."""
         return self._count_completed_pairs_open() >= 3
     
+    # ========================================================================
+    # GROUP HELPER METHODS (TP-Driven Multi-Group System)
+    # ========================================================================
+    
+    def _get_group_from_pair(self, pair_idx: int) -> int:
+        """Extract group number from pair index. E.g., 145 → Group 1."""
+        if pair_idx >= 0:
+            return pair_idx // self.GROUP_OFFSET
+        else:
+            # Negative pairs: -1 to -99 = Group 0, -100 to -199 = Group 1, etc.
+            return (-pair_idx - 1) // self.GROUP_OFFSET
+    
+    def _get_pair_offset(self, group_id: int) -> int:
+        """Get the base pair offset for a group. Group 0 → 0, Group 1 → 100."""
+        return group_id * self.GROUP_OFFSET
+    
+    def _find_incomplete_pair(self) -> Optional[int]:
+        """
+        Find the incomplete pair (trade_count < 2 AND has at least one filled leg).
+        Returns pair index or None if all pairs are complete or empty.
+        """
+        for idx, pair in self.pairs.items():
+            if pair.trade_count < 2:
+                # Check if at least one leg is filled
+                if pair.buy_filled or pair.sell_filled:
+                    return idx
+        return None
+    
+    def _count_completed_pairs_for_group(self, group_id: int) -> int:
+        """Count completed pairs (C) for a specific group only."""
+        offset = self._get_pair_offset(group_id)
+        count = 0
+        
+        # Check positive pairs in group range
+        for idx, pair in self.pairs.items():
+            pair_group = self._get_group_from_pair(idx)
+            if pair_group == group_id:
+                if pair.buy_filled and pair.sell_filled:
+                    count += 1
+        
+        return count
+    
+    def _is_group_locked(self, group_id: int) -> bool:
+        """Check if a specific group is locked (C >= 3)."""
+        return self._count_completed_pairs_for_group(group_id) >= 3
+    
     async def _execute_cycle_init(self):
         """
-        Execute INIT for current cycle: place B0 and S1 atomically.
-        Called on fresh start or after TP triggers new cycle.
+        RENAMED: See _execute_group_init for new implementation.
+        Kept for backward compatibility, routes to group init.
+        """
+        await self._execute_group_init(self.current_group, self.anchor_price)
+    
+    async def _execute_group_init(self, group_id: int, anchor_price: float):
+        """
+        Execute INIT for a new group: place B(offset) and S(offset+1) atomically.
+        Both trades use lot index 0 (first lot size in config).
+        
+        Called when:
+        - Fresh start (Group 0)
+        - Incomplete pair hits TP (creates new Group N+1)
+        
+        Args:
+            group_id: The group number (0, 1, 2, ...)
+            anchor_price: The anchor/reference price for this group
         """
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
-            print(f"[CYCLE_INIT] {self.symbol}: No tick data, cannot init")
+            print(f"[GROUP_INIT] {self.symbol}: No tick data, cannot init")
             return
         
         async with self.execution_lock:
-            print(f"[CYCLE_INIT] cycle={self.cycle_id} anchor={self.anchor_price:.2f}")
+            offset = self._get_pair_offset(group_id)
+            b_idx = offset      # e.g., 0 for Group 0, 100 for Group 1
+            s_idx = offset + 1  # e.g., 1 for Group 0, 101 for Group 1
             
-            # B0: Buy at current ask
-            b0_price = tick.ask
-            pair0 = GridPair(index=0, buy_price=b0_price, sell_price=b0_price - self.spread)
-            pair0.next_action = "buy"  # Start with buy
-            self.pairs[0] = pair0
+            # Update group tracking
+            self.current_group = group_id
+            self.group_anchors[group_id] = anchor_price
+            self.anchor_price = anchor_price
+            self.cycle_id = group_id  # Keep legacy field in sync
             
-            # Execute B0
-            ticket_b0 = await self._execute_market_order("buy", b0_price, 0, reason="INIT")
-            if ticket_b0:
-                pair0.buy_filled = True
-                pair0.buy_ticket = ticket_b0
-                pair0.advance_toggle()
-                print(f"[CYCLE_INIT] B0 placed, ticket={ticket_b0}")
+            # Reset step triggers for new group (all directions)
+            self.step1_bullish_triggered = False
+            self.step1_bearish_triggered = False
+            self.step2_bullish_triggered = False
+            self.step2_bearish_triggered = False
+            self.step1_triggered = False  # Legacy
+            self.step2_triggered = False  # Legacy
+            
+            print(f"[GROUP_INIT] group={group_id} anchor={anchor_price:.2f} B{b_idx}+S{s_idx}")
+            
+            # B(offset): Buy at current ask
+            b_price = tick.ask
+            pair_b = GridPair(index=b_idx, buy_price=b_price, sell_price=b_price - self.spread)
+            pair_b.next_action = "buy"
+            pair_b.trade_count = 0  # INIT uses lot index 0
+            self.pairs[b_idx] = pair_b
+            
+            # Execute B(offset)
+            ticket_b = await self._execute_market_order("buy", b_price, b_idx, reason="INIT")
+            if ticket_b:
+                pair_b.buy_filled = True
+                pair_b.buy_ticket = ticket_b
+                pair_b.advance_toggle()
+                print(f"[GROUP_INIT] B{b_idx} placed, ticket={ticket_b}")
             else:
-                print(f"[CYCLE_INIT] B0 FAILED")
+                print(f"[GROUP_INIT] B{b_idx} FAILED")
                 return
             
-            # S1: Sell at B0 price (Pair 1's sell is at B0's buy price)
-            s1_price = b0_price  # Pair 1 sell is at same level as Pair 0 buy
-            pair1 = GridPair(index=1, buy_price=b0_price + self.spread, sell_price=s1_price)
-            pair1.next_action = "sell"  # Positive pairs start with sell
-            self.pairs[1] = pair1
+            # S(offset+1): Sell at B price (Pair 1's sell is at Pair 0's buy price)
+            s_price = b_price
+            pair_s = GridPair(index=s_idx, buy_price=b_price + self.spread, sell_price=s_price)
+            pair_s.next_action = "sell"
+            pair_s.trade_count = 0  # INIT uses lot index 0
+            self.pairs[s_idx] = pair_s
             
-            # Execute S1
-            ticket_s1 = await self._execute_market_order("sell", s1_price, 1, reason="INIT")
-            if ticket_s1:
-                pair1.sell_filled = True
-                pair1.sell_ticket = ticket_s1
-                pair1.advance_toggle()
-                print(f"[CYCLE_INIT] S1 placed, ticket={ticket_s1}")
+            # Execute S(offset+1)
+            ticket_s = await self._execute_market_order("sell", s_price, s_idx, reason="INIT")
+            if ticket_s:
+                pair_s.sell_filled = True
+                pair_s.sell_ticket = ticket_s
+                pair_s.advance_toggle()
+                print(f"[GROUP_INIT] S{s_idx} placed, ticket={ticket_s}")
             else:
-                print(f"[CYCLE_INIT] S1 FAILED")
+                print(f"[GROUP_INIT] S{s_idx} FAILED")
             
-            # Update center price for this cycle
-            self.center_price = b0_price
+            # Update center price for this group
+            self.center_price = b_price
             
             await self.save_state()
+    
+    async def _execute_tp_expansion(self, group_id: int, tp_price: float, is_bullish: bool, C: int):
+        """
+        Execute grid expansion when a COMPLETED pair hits TP.
+        
+        - Bullish TP (Buy hit): Place B(next) + S(next+1) or B(next) only if C==2
+        - Bearish TP (Sell hit): Place S(anchor) + B(anchor-1) or S only if C==2
+        """
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return
+        
+        async with self.execution_lock:
+            offset = self._get_pair_offset(group_id)
+            group_pairs = [idx for idx in self.pairs.keys() 
+                          if self._get_group_from_pair(idx) == group_id]
+            
+            if is_bullish:
+                # BULLISH: B(next) + S(next+1)
+                next_b_idx = max(group_pairs) + 1 if group_pairs else offset + 2
+                next_s_idx = next_b_idx + 1
+                
+                if C == 2:
+                    print(f"[TP_EXPAND] Bullish C==2: B{next_b_idx} only")
+                    await self._place_single_leg_tp("buy", tp_price, next_b_idx)
+                else:
+                    print(f"[TP_EXPAND] Bullish: B{next_b_idx} + S{next_s_idx}")
+                    await self._place_atomic_bullish_tp(tp_price, next_b_idx, next_s_idx)
+            else:
+                # BEARISH: S(next) + B(next-1)
+                next_s_idx = min(group_pairs) - 1 if group_pairs else offset - 1
+                next_b_idx = next_s_idx - 1
+                
+                if C == 2:
+                    print(f"[TP_EXPAND] Bearish C==2: S{next_s_idx} only")
+                    await self._place_single_leg_tp("sell", tp_price, next_s_idx)
+                else:
+                    print(f"[TP_EXPAND] Bearish: S{next_s_idx} + B{next_b_idx}")
+                    await self._place_atomic_bearish_tp(tp_price, next_s_idx, next_b_idx)
+            
+            await self.save_state()
+    
+    async def _place_single_leg_tp(self, direction: str, price: float, pair_idx: int):
+        """Place single leg for TP expansion when C==2."""
+        pair = self.pairs.get(pair_idx)
+        if not pair:
+            if direction == "buy":
+                pair = GridPair(index=pair_idx, buy_price=price, sell_price=price - self.spread)
+            else:
+                pair = GridPair(index=pair_idx, buy_price=price + self.spread, sell_price=price)
+            pair.next_action = direction
+            self.pairs[pair_idx] = pair
+        
+        ticket = await self._execute_market_order(direction, price, pair_idx, reason="TP_EXPAND")
+        if ticket:
+            if direction == "buy":
+                pair.buy_filled = True
+                pair.buy_ticket = ticket
+            else:
+                pair.sell_filled = True
+                pair.sell_ticket = ticket
+            pair.advance_toggle()
+    
+    async def _place_atomic_bullish_tp(self, price: float, b_idx: int, s_idx: int):
+        """Place B(n) + S(n+1) atomically for bullish TP expansion."""
+        # B(n)
+        pair_b = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
+        pair_b.next_action = "buy"
+        self.pairs[b_idx] = pair_b
+        
+        ticket_b = await self._execute_market_order("buy", price, b_idx, reason="TP_EXPAND")
+        if ticket_b:
+            pair_b.buy_filled = True
+            pair_b.buy_ticket = ticket_b
+            pair_b.advance_toggle()
+        
+        # S(n+1)
+        pair_s = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
+        pair_s.next_action = "sell"
+        self.pairs[s_idx] = pair_s
+        
+        ticket_s = await self._execute_market_order("sell", price, s_idx, reason="TP_EXPAND")
+        if ticket_s:
+            pair_s.sell_filled = True
+            pair_s.sell_ticket = ticket_s
+            pair_s.advance_toggle()
+    
+    async def _place_atomic_bearish_tp(self, price: float, s_idx: int, b_idx: int):
+        """Place S(n) + B(n-1) atomically for bearish TP expansion."""
+        # S(n)
+        pair_s = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
+        pair_s.next_action = "sell"
+        self.pairs[s_idx] = pair_s
+        
+        ticket_s = await self._execute_market_order("sell", price, s_idx, reason="TP_EXPAND")
+        if ticket_s:
+            pair_s.sell_filled = True
+            pair_s.sell_ticket = ticket_s
+            pair_s.advance_toggle()
+        
+        # B(n-1)
+        pair_b = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
+        pair_b.next_action = "buy"
+        self.pairs[b_idx] = pair_b
+        
+        ticket_b = await self._execute_market_order("buy", price, b_idx, reason="TP_EXPAND")
+        if ticket_b:
+            pair_b.buy_filled = True
+            pair_b.buy_ticket = ticket_b
+            pair_b.advance_toggle()
     
     async def _check_step_triggers(self, ask: float, bid: float):
         """
         Trigger geometry: anchor ± k*D with ±T tolerance.
         
-        Step 1 (at D): Place B1+S2 atomically if C < 3
-        Step 2 (at 2D): If C >= 2, place B2 only (no S3). Else B2+S3.
+        C==2 RULE: Only fire completing leg (no new incomplete pairs)
+        - Positive pairs: Buy only (completes pair)
+        - Negative pairs: Sell only (completes pair)
         """
         D = self.spread  # grid_distance
         T = self.tolerance
         C = self._count_completed_pairs_open()
         
         # ================================================================
-        # BULLISH LADDER (price moving up)
+        # BULLISH LADDER (price moving up) - uses bullish-specific flags
         # ================================================================
         level_1 = self.anchor_price + D
         level_2 = self.anchor_price + 2 * D
         
-        # Step 1: at anchor + D
-        if not self.step1_triggered and ask >= level_1 - T:
-            if C < 3:
-                print(f"[STEP1] Triggered at ask={ask:.2f} >= level={level_1:.2f}")
-                await self._execute_step1_bullish()
-                self.step1_triggered = True
-            else:
-                print(f"[STEP1] BLOCKED (C={C} >= 3)")
-        
-        # Step 2: at anchor + 2D
-        if not self.step2_triggered and ask >= level_2 - T:
+        # Step 1 Bullish: at anchor + D
+        if not self.step1_bullish_triggered and ask >= level_1 - T:
             if C == 2:
-                # Special rule: B2 only, no S3
-                print(f"[STEP2] Triggered at ask={ask:.2f} >= level={level_2:.2f} (C==2, single leg)")
-                await self._execute_step2_single_leg_bullish()
+                print(f"[STEP1-BULL] ask={ask:.2f} (C==2, B1 only)")
+                await self._execute_step1_single_leg_bullish()
+                self.step1_bullish_triggered = True
+            elif C < 3:
+                print(f"[STEP1-BULL] ask={ask:.2f} >= level={level_1:.2f}")
+                await self._execute_step1_bullish()
+                self.step1_bullish_triggered = True
             else:
-                print(f"[STEP2] Triggered at ask={ask:.2f} >= level={level_2:.2f}")
+                print(f"[STEP1-BULL] BLOCKED (C={C} >= 3)")
+        
+        # Step 2 Bullish: at anchor + 2D (requires Step 1 Bullish first)
+        if self.step1_bullish_triggered and not self.step2_bullish_triggered and ask >= level_2 - T:
+            if C == 2:
+                print(f"[STEP2-BULL] ask={ask:.2f} (C==2, B2 only)")
+                await self._execute_step2_single_leg_bullish()
+            elif C < 3:
+                print(f"[STEP2-BULL] ask={ask:.2f} >= level={level_2:.2f}")
                 await self._execute_step2_bullish()
-            self.step2_triggered = True
+            else:
+                print(f"[STEP2-BULL] BLOCKED (C={C} >= 3)")
+            self.step2_bullish_triggered = True
         
         # ================================================================
-        # BEARISH LADDER (price moving down) - analogous logic
+        # BEARISH LADDER (price moving down) - uses bearish-specific flags
         # ================================================================
         level_neg1 = self.anchor_price - D
         level_neg2 = self.anchor_price - 2 * D
         
-        # Step 1 bearish: at anchor - D
-        if not self.step1_triggered and bid <= level_neg1 + T:
-            if C < 3:
-                print(f"[STEP1] Triggered bearish at bid={bid:.2f} <= level={level_neg1:.2f}")
-                await self._execute_step1_bearish()
-                self.step1_triggered = True
-            else:
-                print(f"[STEP1] BLOCKED bearish (C={C} >= 3)")
-        
-        # Step 2 bearish: at anchor - 2D
-        if not self.step2_triggered and bid <= level_neg2 + T:
+        # Step 1 Bearish: at anchor - D
+        if not self.step1_bearish_triggered and bid <= level_neg1 + T:
             if C == 2:
-                print(f"[STEP2] Triggered bearish at bid={bid:.2f} <= level={level_neg2:.2f} (C==2, single leg)")
-                await self._execute_step2_single_leg_bearish()
+                print(f"[STEP1-BEAR] bid={bid:.2f} (C==2, S0 only)")
+                await self._execute_step1_single_leg_bearish()
+                self.step1_bearish_triggered = True
+            elif C < 3:
+                print(f"[STEP1-BEAR] bid={bid:.2f} <= level={level_neg1:.2f}")
+                await self._execute_step1_bearish()
+                self.step1_bearish_triggered = True
             else:
-                print(f"[STEP2] Triggered bearish at bid={bid:.2f} <= level={level_neg2:.2f}")
+                print(f"[STEP1-BEAR] BLOCKED (C={C} >= 3)")
+        
+        # Step 2 Bearish: at anchor - 2D (requires Step 1 Bearish first)
+        if self.step1_bearish_triggered and not self.step2_bearish_triggered and bid <= level_neg2 + T:
+            if C == 2:
+                print(f"[STEP2-BEAR] bid={bid:.2f} (C==2, S-2 only)")
+                await self._execute_step2_single_leg_bearish()
+            elif C < 3:
+                print(f"[STEP2-BEAR] bid={bid:.2f} <= level={level_neg2:.2f}")
                 await self._execute_step2_bearish()
-            self.step2_triggered = True
+            else:
+                print(f"[STEP2-BEAR] BLOCKED (C={C} >= 3)")
+            self.step2_bearish_triggered = True
     
     async def _execute_step1_bullish(self):
         """Step 1 Bullish: Place B1 + S2 atomically."""
@@ -695,6 +911,19 @@ class SymbolEngine:
             pair2.sell_filled = True
             pair2.sell_ticket = ticket
             pair2.advance_toggle()
+    
+    async def _execute_step1_single_leg_bullish(self):
+        """Step 1 Bullish (C==2): Place B1 ONLY to complete Pair 1, no S2."""
+        pair1 = self.pairs.get(1)
+        if pair1 and not pair1.buy_filled:
+            ticket = await self._execute_market_order("buy", pair1.buy_price, 1, reason="STEP1")
+            if ticket:
+                pair1.buy_filled = True
+                pair1.buy_ticket = ticket
+                pair1.advance_toggle() # S2 skipped, Advanced toggle incremenents the trade count but does not execute a trade ie B1, so it won't fire
+                print(f"[STEP1_SINGLE] B1 placed, S2 skipped (C==2)")
+
+
     
     async def _execute_step1_bearish(self):
         """Step 1 Bearish: Place S0 + B-1 atomically.
@@ -726,6 +955,18 @@ class SymbolEngine:
             pair_neg1.buy_filled = True
             pair_neg1.buy_ticket = ticket
             pair_neg1.advance_toggle()
+    
+    async def _execute_step1_single_leg_bearish(self):
+        """Step 1 Bearish (C==2): Place S0 ONLY to complete Pair 0, no B-1."""
+        # S0: Complete Pair 0 (Pair 0 already has B0 from INIT)
+        pair0 = self.pairs.get(0)
+        if pair0 and not pair0.sell_filled:
+            ticket = await self._execute_market_order("sell", pair0.sell_price, 0, reason="STEP1")
+            if ticket:
+                pair0.sell_filled = True
+                pair0.sell_ticket = ticket
+                pair0.advance_toggle()
+                print(f"[STEP1_SINGLE] S0 placed, B-1 skipped (C==2)")
     
     async def _execute_step2_bullish(self):
         """Step 2 Bullish: Place B2 + S3 atomically."""
@@ -1280,42 +1521,13 @@ class SymbolEngine:
     
     async def _handle_expanding(self, ask: float, bid: float):
         """
-        EXPANDING: Create ALL pairs up to max_level.
-        
-        max_pairs=3 → max_level=1 → pairs: -1, 0, +1
-        max_pairs=5 → max_level=2 → pairs: -2, -1, 0, +1, +2
-        max_pairs=7 → max_level=3 → pairs: -3, -2, -1, 0, +1, +2, +3
+        EXPANDING: Groups + Cap system - skip old expansion logic.
+        Step triggers now handle all expansion based on anchor geometry.
+        Just transition directly to RUNNING phase.
         """
-        center_pair = self.pairs.get(0)
-        if not center_pair:
-            self.phase = self.PHASE_INIT
-            return
-        
-        max_level = (self.max_pairs - 1) // 2
-        
-        # Create positive pairs (1, 2, 3, ...) up to max_level
-        for level in range(1, max_level + 1):
-            if level not in self.pairs:
-                # Use the previous pair as reference
-                ref_pair = self.pairs.get(level - 1)
-                if ref_pair:
-                    await self._create_expansion_pair(level, ref_pair, ask, bid)
-        
-        # Create negative pairs (-1, -2, -3, ...) down to -max_level
-        for level in range(-1, -max_level - 1, -1):
-            if level not in self.pairs:
-                # Use the previous pair (less negative) as reference
-                ref_pair = self.pairs.get(level + 1)
-                if ref_pair:
-                    await self._create_expansion_pair(level, ref_pair, ask, bid)
-        
-        # Transition to RUNNING
+        # Transition to RUNNING immediately - step triggers handle expansion
         self.phase = self.PHASE_RUNNING
-        print(f" {self.symbol}: Grid expanded to {len(self.pairs)} pairs (max_level={max_level}). Running...")
-        
-        # Print grid table for debug visualization
-        self.print_grid_table()
-        
+        print(f" {self.symbol}: Transitioning to RUNNING. Step triggers handle expansion.")
         await self.save_state()
     
     async def _create_expansion_pair(self, index: int, reference_pair: GridPair, ask: float, bid: float):
@@ -1399,7 +1611,8 @@ class SymbolEngine:
         # [HEDGE SUPERVISOR] Enforce hedge rules for COMPLETED pairs only
         await self._enforce_hedge_invariants_gated()
         
-        # [VIRTUAL TRIGGERS] Monitor prices and fire market orders for existing pairs
+        # [TOGGLE TRIGGERS] For completed pairs: continue trading to max_positions
+        # This allows completed pairs to toggle (buy→sell→buy...) until max then hedge
         await self._check_virtual_triggers(ask, bid)
     
     async def _update_fill_status(self):
@@ -1730,19 +1943,29 @@ class SymbolEngine:
                         await self.repository.delete_ticket(survivor_ticket)
                 
                 # ================================================================
-                # TP TRIGGERS NEW CYCLE
+                # TP-DRIVEN MULTI-GROUP SYSTEM
                 # ================================================================
                 if reason == "TP":
-                    old_cycle = self.cycle_id
-                    self.cycle_id += 1
-                    self.anchor_price = deal.price
-                    self.step1_triggered = False
-                    self.step2_triggered = False
+                    incomplete_idx = self._find_incomplete_pair()
+                    is_incomplete_tp = (pair_idx == incomplete_idx)
                     
-                    print(f"[TP] cycle={old_cycle} pair={pair_idx} leg={tp_leg} tp_price={deal.price:.2f} -> new_cycle={self.cycle_id}")
-                    
-                    # Fire new cycle INIT (B0 + S1)
-                    await self._execute_cycle_init()
+                    if is_incomplete_tp:
+                        # INCOMPLETE PAIR TP → CREATE NEW GROUP
+                        new_group_id = self.current_group + 1
+                        print(f"[TP-INCOMPLETE] pair={pair_idx} → Creating Group {new_group_id}")
+                        await self._execute_group_init(new_group_id, deal.price)
+                    else:
+                        # COMPLETED PAIR TP → EXPAND CURRENT/NEW GROUP
+                        # Determine direction from which leg hit TP
+                        is_bullish = (tp_leg == 'B')  # Buy TP = price went up
+                        
+                        # Use current group for expansion
+                        group_id = self.current_group
+                        C = self._count_completed_pairs_for_group(group_id)
+                        
+                        print(f"[TP-COMPLETE] pair={pair_idx} leg={tp_leg} → Expand Group {group_id} (C={C})")
+                        
+                        await self._execute_tp_expansion(group_id, deal.price, is_bullish, C)
                 
                 # Phoenix reset the pair (for both TP and SL)
                 restart_direction = "buy" if tp_leg == 'B' else "sell"
@@ -2805,6 +3028,11 @@ class SymbolEngine:
         tolerance = self.spread * 0.1  # 10% of spread, or use fixed 5.0 points
         
         for idx, pair in sorted_items:
+            # GROUPS+CAP GATE: Only process COMPLETED pairs (both B+S exist)
+            # Expansion is handled by step triggers, this is only for toggle trading
+            if not self._is_pair_completed(idx):
+                continue
+            
             # Validation: Ensure spread consistency
             expected_buy_price = pair.sell_price + self.spread
             if abs(pair.buy_price - expected_buy_price) > 0.5:
@@ -2822,12 +3050,8 @@ class SymbolEngine:
                     # GAP-PROOF: Fire if price is at level OR BETTER (lower for Buy)
                     buy_proximity = ask <= (pair.buy_price + tolerance)
                     if buy_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {ask:.2f} (Level: {pair.buy_price:.2f}) - Triggering BUY.")
-                        if await self._execute_trade_with_chain("buy", idx):
-                            # [FIX] ALSO EXPAND GRID for Phoenix pairs
-                            indices = sorted(self.pairs.keys())
-                            if idx == indices[-1] and idx >= 0:
-                                await self._create_next_positive_pair(idx)
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Triggering BUY.")
+                        await self._execute_trade_with_chain("buy", idx)
                     continue  # Skip standard logic for this pair
                 
                 # Check SELL proximity
@@ -2835,12 +3059,8 @@ class SymbolEngine:
                     # GAP-PROOF: Fire if price is at level OR BETTER (higher for Sell)
                     sell_proximity = bid >= (pair.sell_price - tolerance)
                     if sell_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Price {bid:.2f} (Level: {pair.sell_price:.2f}) - Triggering SELL.")
-                        if await self._execute_trade_with_chain("sell", idx):
-                            # [FIX] ALSO EXPAND GRID for Phoenix pairs
-                            indices = sorted(self.pairs.keys())
-                            if idx == indices[0] and idx <= 0:
-                                await self._create_next_negative_pair(idx)
+                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Triggering SELL.")
+                        await self._execute_trade_with_chain("sell", idx)
                     continue  # Skip standard logic for this pair
                 
                 # If we get here, just skip to next pair
