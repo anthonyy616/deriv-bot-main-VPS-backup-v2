@@ -929,6 +929,12 @@ class SymbolEngine:
                 pair.buy_ticket = ticket
                 pair.advance_toggle()
         
+        # NON-ATOMIC EXCEPTION: When C==2, completing this pair makes C==3
+        # Don't seed the next pair - only 1 incomplete pair should exist at C==3
+        if C == 2:
+            print(f"[NON-ATOMIC] C was 2, now 3 after B{pair_to_complete} - NOT seeding S{pair_to_complete + 1}")
+            return
+        
         # S(pair_to_complete + 1) - starts new incomplete pair
         new_pair_idx = pair_to_complete + 1
         new_pair = GridPair(
@@ -964,6 +970,12 @@ class SymbolEngine:
                 pair.sell_filled = True
                 pair.sell_ticket = ticket
                 pair.advance_toggle()
+        
+        # NON-ATOMIC EXCEPTION: When C==2, completing this pair makes C==3
+        # Don't seed the next pair - only 1 incomplete pair should exist at C==3
+        if C == 2:
+            print(f"[NON-ATOMIC] C was 2, now 3 after S{pair_to_complete} - NOT seeding B{pair_to_complete - 1}")
+            return
         
         # B(pair_to_complete - 1) - starts new incomplete pair
         new_pair_idx = pair_to_complete - 1

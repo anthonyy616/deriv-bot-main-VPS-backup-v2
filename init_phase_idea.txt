@@ -1,0 +1,29 @@
+I'm pivoting to using position drops PER pair whether incomplete or completed. 
+So basically when it detects a position drop in a pair in the grid it is basically running a check to see if the pair is complete or incomplete.
+
+
+If incomplete to determine whether it was actually the TP or SL of that incomplete pair that hit, 
+    it will then check the order type and based on the current market price at the tick it received the position drop signal for that pair it will determine whether it was a TP or SL.
+    if order type == Buy 
+        if CMP (current market price at tick) > entry price of that incomplete pair THEN it's a TP
+            return incomplete_pair_tp_hit == True #incomplete_pair_tp_hit is a boolean variable
+        else
+            return "SL"
+
+    else # order type == Sell
+        if CMP (current market price at tick) < entry price of that incomplete pair THEN it's a TP
+            return incomplete_pair_tp_hit == True #incomplete_pair_tp_hit is a boolean variable
+        else
+            return "SL"
+
+    This is just the checking block for whether it was a TP or SL of that incomplete pair.
+
+    Now another block so if TP (for any order Type i.e. either buy or || sell) fhen run INIT phase for new group with lot index 0 for both buy and sell that fire atomically at trigger when INIT phase is ran
+
+
+If complete it will just continue the expansion but for the second group.
+    Since the way I will configured the bot from the UI, for both buy and sell configs they will always be the same 
+    so buy TP will always be the same grid distance as sell TP AND buy SL will always be the same grid distance as sell SL. 
+So having checks whether TP hit or not for a completed pair is redundant. It only fails if they're not equal which I dont plan on making it right now
+
+
