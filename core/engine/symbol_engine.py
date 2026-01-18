@@ -1710,8 +1710,8 @@ class SymbolEngine:
         
         # NOTE: Auto-restart removed. New cycles are triggered by TP events only.
         
-        # [PRIMARY] TP/SL Detection using ticket_map for cycle rollover
-        await self._check_tp_sl_from_history()
+        # [PRIMARY] Position drop detection for TP/SL and group rollover
+        await self._check_position_drops(ask, bid)
         
         # [STEP TRIGGERS] Check anchor geometry triggers (replaces _check_leapfrog)
         await self._check_step_triggers(ask, bid)
@@ -2103,6 +2103,116 @@ class SymbolEngine:
             
         except Exception as e:
             print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _check_position_drops(self, ask: float, bid: float):
+        """
+        POSITION DROP DETECTION: Detect closed positions by comparing ticket_map against MT5 positions.
+        
+        For incomplete pairs (one leg only):
+        - Infer TP/SL using Current Market Price (CMP) vs entry price
+        - Buy: CMP > entry → TP, else SL
+        - Sell: CMP < entry → TP, else SL
+        - TP → Create new group INIT
+        
+        For completed pairs:
+        - Just continue strategy (no TP/SL distinction needed since configs are equal)
+        """
+        try:
+            # Get current MT5 positions
+            positions = mt5.positions_get(symbol=self.symbol)
+            current_tickets = set(pos.ticket for pos in positions) if positions else set()
+            
+            # Find dropped tickets (in ticket_map but no longer in MT5)
+            tracked_tickets = set(self.ticket_map.keys())
+            dropped_tickets = tracked_tickets - current_tickets
+            
+            if not dropped_tickets:
+                return
+            
+            # Current market price for TP/SL inference
+            cmp = (ask + bid) / 2  # Midpoint as reference
+            
+            for ticket in dropped_tickets:
+                info = self.ticket_map.get(ticket)
+                if not info:
+                    continue
+                
+                cycle_id, pair_idx, leg = info
+                pair = self.pairs.get(pair_idx)
+                
+                if not pair:
+                    # Clean up orphan ticket
+                    del self.ticket_map[ticket]
+                    await self.repository.delete_ticket(ticket)
+                    continue
+                
+                # Determine if this was an incomplete or completed pair
+                was_incomplete = not (pair.buy_filled and pair.sell_filled)
+                
+                # Get entry price for this leg
+                if leg == 'B':
+                    entry_price = pair.buy_price
+                else:
+                    entry_price = pair.sell_price
+                
+                # Infer TP or SL based on CMP vs entry_price
+                if was_incomplete:
+                    # INCOMPLETE PAIR: Must determine TP vs SL
+                    if leg == 'B':  # Buy position closed
+                        is_tp = cmp > entry_price
+                    else:  # Sell position closed
+                        is_tp = cmp < entry_price
+                    
+                    reason = "TP" if is_tp else "SL"
+                    print(f"[DROP-INCOMPLETE] pair={pair_idx} leg={leg} entry={entry_price:.2f} CMP={cmp:.2f} → {reason}")
+                    
+                    if is_tp:
+                        # INCOMPLETE PAIR TP → CREATE NEW GROUP INIT
+                        new_group_id = self.current_group + 1
+                        print(f"[TP-INCOMPLETE] pair={pair_idx} → Creating Group {new_group_id} at CMP={cmp:.2f}")
+                        
+                        # First complete any pending pair leg if needed (same tick scenario)
+                        # This handles the case where B0 TP and B3 should fire together
+                        await self._execute_group_init(new_group_id, cmp)
+                else:
+                    # COMPLETED PAIR: Just continue (no TP/SL distinction needed)
+                    print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} → Strategy continues")
+                
+                # Clean up ticket from map
+                del self.ticket_map[ticket]
+                await self.repository.delete_ticket(ticket)
+                
+                # Close survivor if this was from a completed pair
+                if not was_incomplete:
+                    if leg == 'B' and pair.sell_ticket and pair.sell_ticket > 0:
+                        print(f"   [CLEANUP] Closing survivor S ticket={pair.sell_ticket}")
+                        self._close_position(pair.sell_ticket)
+                        if pair.sell_ticket in self.ticket_map:
+                            del self.ticket_map[pair.sell_ticket]
+                            await self.repository.delete_ticket(pair.sell_ticket)
+                    elif leg == 'S' and pair.buy_ticket and pair.buy_ticket > 0:
+                        print(f"   [CLEANUP] Closing survivor B ticket={pair.buy_ticket}")
+                        self._close_position(pair.buy_ticket)
+                        if pair.buy_ticket in self.ticket_map:
+                            del self.ticket_map[pair.buy_ticket]
+                            await self.repository.delete_ticket(pair.buy_ticket)
+                
+                # Close hedge if active
+                if pair.hedge_active and pair.hedge_ticket:
+                    print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
+                    self._close_position(pair.hedge_ticket)
+                
+                # Phoenix reset the pair
+                restart_direction = "buy" if leg == 'B' else "sell"
+                self._phoenix_reset_pair(pair_idx, restart_direction)
+                
+                # Save state
+                await self.save_state()
+                
+        except Exception as e:
+            print(f"[ERROR] _check_position_drops failed: {e}")
             import traceback
             traceback.print_exc()
 
