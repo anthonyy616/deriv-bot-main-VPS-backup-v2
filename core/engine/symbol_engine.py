@@ -831,6 +831,158 @@ class SymbolEngine:
             pair_b.buy_ticket = ticket_b
             pair_b.advance_toggle()
     
+    async def _handle_completed_pair_expansion(self, cmp: float):
+        """
+        Handle expansion in the current active group when a COMPLETED pair from a prior group drops.
+        
+        After INIT (B100, S101):
+        - Pair 100: Only B100 exists (incomplete - buy side)
+        - Pair 101: Only S101 exists (incomplete - sell side)
+        
+        When completed pair drops:
+        - If CMP > S101.sell_price → Complete pair 101 with B101 (lot 1), seed pair 102 with S102 (lot 0)
+        - If CMP < B100.buy_price → Complete pair 100 with S100 (lot 1), seed pair 99 with B99 (lot 0)
+        
+        Respects C==2 non-atomic rule: only fire the completing leg when C==2.
+        """
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return
+        
+        async with self.execution_lock:
+            group_id = self.current_group
+            offset = self._get_pair_offset(group_id)
+            
+            # Find edge pairs for this group (the incomplete pairs at the edges)
+            group_pairs = {idx: pair for idx, pair in self.pairs.items()
+                          if self._get_group_from_pair(idx) == group_id}
+            
+            if not group_pairs:
+                print(f"[COMP-EXPAND] No pairs found in group {group_id}")
+                return
+            
+            # Get C for this group
+            C = self._count_completed_pairs_for_group(group_id)
+            
+            # C >= 3 means group is locked, no more expansion
+            if C >= 3:
+                print(f"[COMP-EXPAND] Group {group_id} locked (C={C}), no expansion")
+                return
+            
+            # Find the bullish edge (highest pair with only sell filled = incomplete buy side)
+            # and bearish edge (lowest pair with only buy filled = incomplete sell side)
+            bullish_edge = None  # Pair where we check CMP > pair.sell_price
+            bearish_edge = None  # Pair where we check CMP < pair.buy_price
+            
+            # Get sorted pair indices for this group
+            sorted_indices = sorted(group_pairs.keys())
+            
+            # Check highest pair for bullish expansion (should have sell_filled but not buy_filled)
+            for idx in reversed(sorted_indices):
+                pair = group_pairs[idx]
+                if pair.sell_filled and not pair.buy_filled:
+                    bullish_edge = pair
+                    break
+            
+            # Check lowest pair for bearish expansion (should have buy_filled but not sell_filled)
+            for idx in sorted_indices:
+                pair = group_pairs[idx]
+                if pair.buy_filled and not pair.sell_filled:
+                    bearish_edge = pair
+                    break
+            
+            expansion_done = False
+            
+            # BULLISH CHECK: CMP > bullish_edge.sell_price
+            if bullish_edge and cmp > bullish_edge.sell_price:
+                complete_idx = bullish_edge.index
+                seed_idx = complete_idx + 1
+                
+                print(f"[COMP-EXPAND] Bullish: CMP {cmp:.2f} > S{complete_idx} price {bullish_edge.sell_price:.2f}")
+                
+                if C == 2:
+                    # NON-ATOMIC: Only complete the pair (B on the bullish edge)
+                    print(f"[COMP-EXPAND] C==2 Non-atomic: B{complete_idx} only")
+                    bullish_edge.trade_count = 1  # Lot index 1 (completing leg)
+                    ticket = await self._execute_market_order("buy", tick.ask, complete_idx, reason="COMP_EXPAND")
+                    if ticket:
+                        bullish_edge.buy_filled = True
+                        bullish_edge.buy_ticket = ticket
+                        bullish_edge.advance_toggle()
+                        print(f"[COMP-EXPAND] B{complete_idx} placed (lot 1), ticket={ticket}")
+                else:
+                    # ATOMIC: Complete pair + seed next
+                    print(f"[COMP-EXPAND] C={C} Atomic: B{complete_idx} (lot 1) + S{seed_idx} (lot 0)")
+                    
+                    # B on complete_idx (lot 1)
+                    bullish_edge.trade_count = 1
+                    ticket_b = await self._execute_market_order("buy", tick.ask, complete_idx, reason="COMP_EXPAND")
+                    if ticket_b:
+                        bullish_edge.buy_filled = True
+                        bullish_edge.buy_ticket = ticket_b
+                        bullish_edge.advance_toggle()
+                        print(f"[COMP-EXPAND] B{complete_idx} placed (lot 1), ticket={ticket_b}")
+                    
+                    # S on seed_idx (lot 0) - new pair
+                    seed_pair = GridPair(index=seed_idx, buy_price=tick.ask + self.spread, sell_price=tick.ask)
+                    seed_pair.next_action = "sell"
+                    seed_pair.trade_count = 0  # Lot index 0
+                    self.pairs[seed_idx] = seed_pair
+                    
+                    ticket_s = await self._execute_market_order("sell", tick.bid, seed_idx, reason="COMP_EXPAND")
+                    if ticket_s:
+                        seed_pair.sell_filled = True
+                        seed_pair.sell_ticket = ticket_s
+                        seed_pair.advance_toggle()
+                        print(f"[COMP-EXPAND] S{seed_idx} placed (lot 0), ticket={ticket_s}")
+                
+                expansion_done = True
+            
+            # BEARISH CHECK: CMP < bearish_edge.buy_price (only if no bullish expansion)
+            if not expansion_done and bearish_edge and cmp < bearish_edge.buy_price:
+                complete_idx = bearish_edge.index
+                seed_idx = complete_idx - 1
+                
+                print(f"[COMP-EXPAND] Bearish: CMP {cmp:.2f} < B{complete_idx} price {bearish_edge.buy_price:.2f}")
+                
+                if C == 2:
+                    # NON-ATOMIC: Only complete the pair (S on the bearish edge)
+                    print(f"[COMP-EXPAND] C==2 Non-atomic: S{complete_idx} only")
+                    bearish_edge.trade_count = 1  # Lot index 1 (completing leg)
+                    ticket = await self._execute_market_order("sell", tick.bid, complete_idx, reason="COMP_EXPAND")
+                    if ticket:
+                        bearish_edge.sell_filled = True
+                        bearish_edge.sell_ticket = ticket
+                        bearish_edge.advance_toggle()
+                        print(f"[COMP-EXPAND] S{complete_idx} placed (lot 1), ticket={ticket}")
+                else:
+                    # ATOMIC: Complete pair + seed next
+                    print(f"[COMP-EXPAND] C={C} Atomic: S{complete_idx} (lot 1) + B{seed_idx} (lot 0)")
+                    
+                    # S on complete_idx (lot 1)
+                    bearish_edge.trade_count = 1
+                    ticket_s = await self._execute_market_order("sell", tick.bid, complete_idx, reason="COMP_EXPAND")
+                    if ticket_s:
+                        bearish_edge.sell_filled = True
+                        bearish_edge.sell_ticket = ticket_s
+                        bearish_edge.advance_toggle()
+                        print(f"[COMP-EXPAND] S{complete_idx} placed (lot 1), ticket={ticket_s}")
+                    
+                    # B on seed_idx (lot 0) - new pair
+                    seed_pair = GridPair(index=seed_idx, buy_price=tick.bid, sell_price=tick.bid - self.spread)
+                    seed_pair.next_action = "buy"
+                    seed_pair.trade_count = 0  # Lot index 0
+                    self.pairs[seed_idx] = seed_pair
+                    
+                    ticket_b = await self._execute_market_order("buy", tick.ask, seed_idx, reason="COMP_EXPAND")
+                    if ticket_b:
+                        seed_pair.buy_filled = True
+                        seed_pair.buy_ticket = ticket_b
+                        seed_pair.advance_toggle()
+                        print(f"[COMP-EXPAND] B{seed_idx} placed (lot 0), ticket={ticket_b}")
+            
+            await self.save_state()
+
     async def _check_step_triggers(self, ask: float, bid: float):
         """
         DYNAMIC GRID EXPANSION: Expand grid at each new level until C >= 3.
@@ -2177,8 +2329,12 @@ class SymbolEngine:
                         # This handles the case where B0 TP and B3 should fire together
                         await self._execute_group_init(new_group_id, cmp)
                 else:
-                    # COMPLETED PAIR: Just continue (no TP/SL distinction needed)
-                    print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} → Strategy continues")
+                    # COMPLETED PAIR: Trigger expansion in active group if applicable
+                    print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} → Checking expansion")
+                    
+                    # If we have an active group > 0, trigger expansion check
+                    if self.current_group > 0:
+                        await self._handle_completed_pair_expansion(cmp)
                 
                 # Clean up ticket from map
                 del self.ticket_map[ticket]
@@ -3813,8 +3969,18 @@ class SymbolEngine:
                 if pos.magic - 50000 == pair.index:
                     self._close_position(pos)
     
-    def _close_position(self, position):
-        """Close a specific position."""
+    def _close_position(self, position_or_ticket):
+        """Close a specific position. Accepts either position object or ticket (int)."""
+        # Handle ticket (int) input - lookup position
+        if isinstance(position_or_ticket, int):
+            positions = mt5.positions_get(ticket=position_or_ticket)
+            if not positions or len(positions) == 0:
+                print(f"   [CLOSE] Position ticket={position_or_ticket} not found (already closed?)")
+                return
+            position = positions[0]
+        else:
+            position = position_or_ticket
+        
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
             return
@@ -3831,7 +3997,9 @@ class SymbolEngine:
             "price": close_price,
             "deviation": 200,
         }
-        mt5.order_send(request)
+        result = mt5.order_send(request)
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f"   [CLOSE] Position {position.ticket} closed successfully")
     
     # ========================================================================
     # STATE MANAGEMENT
