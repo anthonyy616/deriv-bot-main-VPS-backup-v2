@@ -534,7 +534,10 @@ class SymbolEngine:
     def _can_place_completing_leg(self, pair_index: int, leg: str) -> bool:
         """
         Global Lock Gate: Returns False if placing this leg would push C > 3.
-        Must be called BEFORE placing any order.
+        
+        IMPORTANT DISTINCTION:
+        - BLOCK: Trades that would COMPLETE an INCOMPLETE pair (creating a NEW completed pair)
+        - ALLOW: Toggle trades on ALREADY COMPLETE pairs (they don't increase C)
         
         Args:
             pair_index: The pair this order belongs to
@@ -545,23 +548,22 @@ class SymbolEngine:
         """
         C = self._count_completed_pairs_open()
         
-        # If already at cap, check if this would complete a pair
+        # If already at cap (C >= 3), check if this would complete an INCOMPLETE pair
         if C >= 3:
-            # Check if the other leg already exists for this pair
-            positions = mt5.positions_get(symbol=self.symbol)
-            existing_legs = set()
-            if positions:
-                for pos in positions:
-                    info = self.ticket_map.get(pos.ticket)
-                    if info and info[1] == pair_index:
-                        existing_legs.add(info[2])
+            pair = self.pairs.get(pair_index)
+            if not pair:
+                return True  # New pair creation blocked by step triggers, not here
             
-            other_leg = 'S' if leg == 'B' else 'B'
-            would_complete = other_leg in existing_legs
+            # Check if pair is currently incomplete (only one leg filled)
+            pair_is_incomplete = pair.buy_filled != pair.sell_filled
             
-            if would_complete:
-                print(f"[CAP_BLOCK] cycle={self.cycle_id} pair={pair_index} leg={leg} BLOCKED (would complete, C={C})")
+            if pair_is_incomplete:
+                # This trade would complete an incomplete pair → BLOCK
+                #print(f"[CAP_BLOCK] pair={pair_index} leg={leg} BLOCKED (would complete incomplete pair, C={C})")
                 return False
+            
+            # Pair is already complete → ALLOW toggle trades
+            # (This doesn't increase C, just continues trading on existing pair)
         
         return True
     
@@ -830,8 +832,9 @@ class SymbolEngine:
         Trigger geometry: anchor ± k*D with ±T tolerance.
         
         C==2 RULE: Only fire completing leg (no new incomplete pairs)
-        - Positive pairs: Buy only (completes pair)
-        - Negative pairs: Sell only (completes pair)
+        C==2 RULE: REMOVED - Always fire atomically to ensure 2 incomplete pairs exist
+        (one on bullish end, one on bearish end) so one always hits TP for new group INIT.
+        C>=3 blocks NEW pair leg creation in _can_place_completing_leg.
         """
         D = self.spread  # grid_distance
         T = self.tolerance
@@ -845,12 +848,8 @@ class SymbolEngine:
         
         # Step 1 Bullish: at anchor + D
         if not self.step1_bullish_triggered and ask >= level_1 - T:
-            if C == 2:
-                print(f"[STEP1-BULL] ask={ask:.2f} (C==2, B1 only)")
-                await self._execute_step1_single_leg_bullish()
-                self.step1_bullish_triggered = True
-            elif C < 3:
-                print(f"[STEP1-BULL] ask={ask:.2f} >= level={level_1:.2f}")
+            if C < 3:
+                print(f"[STEP1-BULL] ask={ask:.2f} >= level={level_1:.2f} (C={C})")
                 await self._execute_step1_bullish()
                 self.step1_bullish_triggered = True
             else:
@@ -858,11 +857,8 @@ class SymbolEngine:
         
         # Step 2 Bullish: at anchor + 2D (requires Step 1 Bullish first)
         if self.step1_bullish_triggered and not self.step2_bullish_triggered and ask >= level_2 - T:
-            if C == 2:
-                print(f"[STEP2-BULL] ask={ask:.2f} (C==2, B2 only)")
-                await self._execute_step2_single_leg_bullish()
-            elif C < 3:
-                print(f"[STEP2-BULL] ask={ask:.2f} >= level={level_2:.2f}")
+            if C < 3:
+                print(f"[STEP2-BULL] ask={ask:.2f} >= level={level_2:.2f} (C={C})")
                 await self._execute_step2_bullish()
             else:
                 print(f"[STEP2-BULL] BLOCKED (C={C} >= 3)")
@@ -876,12 +872,8 @@ class SymbolEngine:
         
         # Step 1 Bearish: at anchor - D
         if not self.step1_bearish_triggered and bid <= level_neg1 + T:
-            if C == 2:
-                print(f"[STEP1-BEAR] bid={bid:.2f} (C==2, S0 only)")
-                await self._execute_step1_single_leg_bearish()
-                self.step1_bearish_triggered = True
-            elif C < 3:
-                print(f"[STEP1-BEAR] bid={bid:.2f} <= level={level_neg1:.2f}")
+            if C < 3:
+                print(f"[STEP1-BEAR] bid={bid:.2f} <= level={level_neg1:.2f} (C={C})")
                 await self._execute_step1_bearish()
                 self.step1_bearish_triggered = True
             else:
@@ -889,11 +881,8 @@ class SymbolEngine:
         
         # Step 2 Bearish: at anchor - 2D (requires Step 1 Bearish first)
         if self.step1_bearish_triggered and not self.step2_bearish_triggered and bid <= level_neg2 + T:
-            if C == 2:
-                print(f"[STEP2-BEAR] bid={bid:.2f} (C==2, S-2 only)")
-                await self._execute_step2_single_leg_bearish()
-            elif C < 3:
-                print(f"[STEP2-BEAR] bid={bid:.2f} <= level={level_neg2:.2f}")
+            if C < 3:
+                print(f"[STEP2-BEAR] bid={bid:.2f} <= level={level_neg2:.2f} (C={C})")
                 await self._execute_step2_bearish()
             else:
                 print(f"[STEP2-BEAR] BLOCKED (C={C} >= 3)")
