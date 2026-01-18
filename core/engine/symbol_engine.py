@@ -587,15 +587,29 @@ class SymbolEngine:
     
     def _find_incomplete_pair(self) -> Optional[int]:
         """
-        Find the incomplete pair (trade_count < 2 AND has at least one filled leg).
-        Returns pair index or None if all pairs are complete or empty.
+        Find the incomplete pair (has exactly ONE leg filled, not both).
+        
+        Incomplete pair: buy_filled XOR sell_filled = True
+        - Only buy filled: buy_filled=True, sell_filled=False → incomplete
+        - Only sell filled: buy_filled=False, sell_filled=True → incomplete
+        - Both filled: buy_filled=True, sell_filled=True → COMPLETE
+        - Neither filled: buy_filled=False, sell_filled=False → empty (not incomplete)
+        
+        Returns pair index or None if no incomplete pairs exist.
         """
         for idx, pair in self.pairs.items():
-            if pair.trade_count < 2:
-                # Check if at least one leg is filled
-                if pair.buy_filled or pair.sell_filled:
-                    return idx
+            # XOR: exactly one leg filled (not both, not neither)
+            is_incomplete = pair.buy_filled != pair.sell_filled
+            if is_incomplete:
+                return idx
         return None
+    
+    def _is_pair_incomplete(self, pair_idx: int) -> bool:
+        """Check if a specific pair is incomplete (exactly one leg filled)."""
+        pair = self.pairs.get(pair_idx)
+        if not pair:
+            return False
+        return pair.buy_filled != pair.sell_filled
     
     def _count_completed_pairs_for_group(self, group_id: int) -> int:
         """Count completed pairs (C) for a specific group only."""
@@ -1946,8 +1960,10 @@ class SymbolEngine:
                 # TP-DRIVEN MULTI-GROUP SYSTEM
                 # ================================================================
                 if reason == "TP":
-                    incomplete_idx = self._find_incomplete_pair()
-                    is_incomplete_tp = (pair_idx == incomplete_idx)
+                    # Check if THIS SPECIFIC pair is incomplete (only one leg filled)
+                    is_incomplete_tp = self._is_pair_incomplete(pair_idx)
+                    
+                    print(f"[TP] pair={pair_idx} is_incomplete={is_incomplete_tp}")
                     
                     if is_incomplete_tp:
                         # INCOMPLETE PAIR TP → CREATE NEW GROUP
