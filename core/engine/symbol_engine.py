@@ -505,6 +505,10 @@ class SymbolEngine:
         if not positions:
             return 0
         
+        # Debug: Check what positions exist vs what's in ticket_map
+        print(f"[DEBUG C] positions: {[p.ticket for p in positions]}")
+        print(f"[DEBUG C] ticket_map keys: {list(self.ticket_map.keys())}")
+        
         # Group by pair_index using ticket_map
         pair_legs = defaultdict(set)  # pair_index → {'B', 'S'}
         for pos in positions:
@@ -3511,11 +3515,14 @@ class SymbolEngine:
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            ticket = result.order
+            # For market orders (TRADE_ACTION_DEAL), result.order IS the position ticket
+            position_ticket = result.order
             
-            # TICKET MAPPING: Store for TP detection
-            self.ticket_map[ticket] = (self.cycle_id, index, leg)
-            await self.repository.save_ticket(ticket, self.cycle_id, index, leg, trade_count)
+            # TICKET MAPPING: Store POSITION ticket for TP detection
+            self.ticket_map[position_ticket] = (self.cycle_id, index, leg)
+            await self.repository.save_ticket(position_ticket, self.cycle_id, index, leg, trade_count)
+            
+            print(f"[TICKET_MAP] pos={position_ticket} -> (cycle={self.cycle_id}, pair={index}, leg={leg})")
             
             # Log order placement
             print(f"[ORDER] cycle={self.cycle_id} pair={index} leg={leg} reason={reason}")
@@ -3528,11 +3535,11 @@ class SymbolEngine:
                 direction=direction.upper(),
                 price=exec_price,
                 lot_size=volume,
-                ticket=ticket,
+                ticket=position_ticket,
                 notes=f"TP={tp:.2f} SL={sl:.2f} C={self.cycle_id}",
                 trade_count=pair.trade_count if pair else 0
             )
-            return ticket
+            return position_ticket
         
         # Retry logic removed because we did pre-validation. 
         # If it still fails, it's a broker rejection we can't easily fix by just moving stops again blindly.
