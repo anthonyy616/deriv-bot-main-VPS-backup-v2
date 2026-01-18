@@ -505,9 +505,9 @@ class SymbolEngine:
         if not positions:
             return 0
         
-        # Debug: Check what positions exist vs what's in ticket_map
-        print(f"[DEBUG C] positions: {[p.ticket for p in positions]}")
-        print(f"[DEBUG C] ticket_map keys: {list(self.ticket_map.keys())}")
+        # Debug: Check what positions exist vs what's in ticket_map (commented - too noisy)
+        # print(f"[DEBUG C] positions: {[p.ticket for p in positions]}")
+        # print(f"[DEBUG C] ticket_map keys: {list(self.ticket_map.keys())}")
         
         # Group by pair_index using ticket_map
         pair_legs = defaultdict(set)  # pair_index → {'B', 'S'}
@@ -833,64 +833,153 @@ class SymbolEngine:
     
     async def _check_step_triggers(self, ask: float, bid: float):
         """
-        Trigger geometry: anchor ± k*D with ±T tolerance.
+        DYNAMIC GRID EXPANSION: Expand grid at each new level until C >= 3.
         
-        C==2 RULE: Only fire completing leg (no new incomplete pairs)
-        C==2 RULE: REMOVED - Always fire atomically to ensure 2 incomplete pairs exist
-        (one on bullish end, one on bearish end) so one always hits TP for new group INIT.
-        C>=3 blocks NEW pair leg creation in _can_place_completing_leg.
+        The grid expands in WHICHEVER direction price moves:
+        - Bullish: When price reaches anchor + (max_pair+1)*D, fire B(max+1) + S(max+2)
+        - Bearish: When price reaches anchor + (min_pair-1)*D, fire S(min-1) + B(min-2)
+        
+        This continues until 3 completed pairs exist (C >= 3).
         """
-        D = self.spread  # grid_distance
+        D = self.spread
         T = self.tolerance
         C = self._count_completed_pairs_open()
         
-        # ================================================================
-        # BULLISH LADDER (price moving up) - uses bullish-specific flags
-        # ================================================================
-        level_1 = self.anchor_price + D
-        level_2 = self.anchor_price + 2 * D
+        # Don't expand if we already have 3 completed pairs
+        if C >= 3:
+            return
         
-        # Step 1 Bullish: at anchor + D
-        if not self.step1_bullish_triggered and ask >= level_1 - T:
-            if C < 3:
-                print(f"[STEP1-BULL] ask={ask:.2f} >= level={level_1:.2f} (C={C})")
-                await self._execute_step1_bullish()
-                self.step1_bullish_triggered = True
-            else:
-                print(f"[STEP1-BULL] BLOCKED (C={C} >= 3)")
+        # Find current grid bounds from existing pairs
+        if not self.pairs:
+            return
         
-        # Step 2 Bullish: at anchor + 2D (requires Step 1 Bullish first)
-        if self.step1_bullish_triggered and not self.step2_bullish_triggered and ask >= level_2 - T:
-            if C < 3:
-                print(f"[STEP2-BULL] ask={ask:.2f} >= level={level_2:.2f} (C={C})")
-                await self._execute_step2_bullish()
-            else:
-                print(f"[STEP2-BULL] BLOCKED (C={C} >= 3)")
-            self.step2_bullish_triggered = True
+        positive_pairs = [idx for idx in self.pairs.keys() if idx > 0]
+        negative_pairs = [idx for idx in self.pairs.keys() if idx < 0]
+        
+        max_positive = max(positive_pairs) if positive_pairs else 0
+        min_negative = min(negative_pairs) if negative_pairs else 0
         
         # ================================================================
-        # BEARISH LADDER (price moving down) - uses bearish-specific flags
+        # BULLISH EXPANSION: Price moving up
         # ================================================================
-        level_neg1 = self.anchor_price - D
-        level_neg2 = self.anchor_price - 2 * D
+        # Find the highest INCOMPLETE positive pair (has S, no B)
+        # That's the pair we need to complete when price rises
         
-        # Step 1 Bearish: at anchor - D
-        if not self.step1_bearish_triggered and bid <= level_neg1 + T:
-            if C < 3:
-                print(f"[STEP1-BEAR] bid={bid:.2f} <= level={level_neg1:.2f} (C={C})")
-                await self._execute_step1_bearish()
-                self.step1_bearish_triggered = True
-            else:
-                print(f"[STEP1-BEAR] BLOCKED (C={C} >= 3)")
+        incomplete_bull_pair = None
+        for idx in sorted(positive_pairs, reverse=True):  # Check from highest
+            pair = self.pairs.get(idx)
+            if pair and pair.sell_filled and not pair.buy_filled:
+                incomplete_bull_pair = idx
+                break
         
-        # Step 2 Bearish: at anchor - 2D (requires Step 1 Bearish first)
-        if self.step1_bearish_triggered and not self.step2_bearish_triggered and bid <= level_neg2 + T:
-            if C < 3:
-                print(f"[STEP2-BEAR] bid={bid:.2f} <= level={level_neg2:.2f} (C={C})")
-                await self._execute_step2_bearish()
-            else:
-                print(f"[STEP2-BEAR] BLOCKED (C={C} >= 3)")
-            self.step2_bearish_triggered = True
+        if incomplete_bull_pair is not None:
+            # Level for B(incomplete) is anchor + incomplete * D
+            bull_level = self.anchor_price + incomplete_bull_pair * D
+            
+            if ask >= bull_level - T:
+                print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
+                await self._expand_bullish(incomplete_bull_pair)
+        
+        # ================================================================
+        # BEARISH EXPANSION: Price moving down
+        # ================================================================
+        # Find the lowest INCOMPLETE pair (has B, no S) - including Pair 0
+        # That's the pair we need to complete when price falls
+        
+        incomplete_bear_pair = None
+        # Check Pair 0 first
+        pair0 = self.pairs.get(0)
+        if pair0 and pair0.buy_filled and not pair0.sell_filled:
+            incomplete_bear_pair = 0
+        else:
+            # Check negative pairs from highest (closest to 0) to lowest
+            for idx in sorted(negative_pairs, reverse=True):
+                pair = self.pairs.get(idx)
+                if pair and pair.buy_filled and not pair.sell_filled:
+                    incomplete_bear_pair = idx
+                    break
+        
+        if incomplete_bear_pair is not None:
+            # Level for S(incomplete) is anchor + (incomplete - 1) * D = anchor - D for pair 0
+            # For Pair 0: sell at anchor - D
+            # For Pair -1: sell at anchor - 2D, etc.
+            bear_level = self.anchor_price + (incomplete_bear_pair - 1) * D
+            
+            if bid <= bear_level + T:
+                print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
+                await self._expand_bearish(incomplete_bear_pair)
+    
+    async def _expand_bullish(self, pair_to_complete: int):
+        """Expand grid in bullish direction: complete pair N with B, start pair N+1 with S."""
+        C = self._count_completed_pairs_open()
+        if C >= 3:
+            print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
+            return
+        
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return
+        
+        # B(pair_to_complete) - completes the pair
+        pair = self.pairs.get(pair_to_complete)
+        if pair and not pair.buy_filled:
+            ticket = await self._execute_market_order("buy", pair.buy_price, pair_to_complete, reason="EXPAND")
+            if ticket:
+                pair.buy_filled = True
+                pair.buy_ticket = ticket
+                pair.advance_toggle()
+        
+        # S(pair_to_complete + 1) - starts new incomplete pair
+        new_pair_idx = pair_to_complete + 1
+        new_pair = GridPair(
+            index=new_pair_idx,
+            buy_price=self.anchor_price + (new_pair_idx + 1) * self.spread,
+            sell_price=self.anchor_price + new_pair_idx * self.spread
+        )
+        new_pair.next_action = "sell"
+        self.pairs[new_pair_idx] = new_pair
+        
+        ticket = await self._execute_market_order("sell", new_pair.sell_price, new_pair_idx, reason="EXPAND")
+        if ticket:
+            new_pair.sell_filled = True
+            new_pair.sell_ticket = ticket
+            new_pair.advance_toggle()
+    
+    async def _expand_bearish(self, pair_to_complete: int):
+        """Expand grid in bearish direction: complete pair N with S, start pair N-1 with B."""
+        C = self._count_completed_pairs_open()
+        if C >= 3:
+            print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
+            return
+        
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick:
+            return
+        
+        # S(pair_to_complete) - completes the pair
+        pair = self.pairs.get(pair_to_complete)
+        if pair and not pair.sell_filled:
+            ticket = await self._execute_market_order("sell", pair.sell_price, pair_to_complete, reason="EXPAND")
+            if ticket:
+                pair.sell_filled = True
+                pair.sell_ticket = ticket
+                pair.advance_toggle()
+        
+        # B(pair_to_complete - 1) - starts new incomplete pair
+        new_pair_idx = pair_to_complete - 1
+        new_pair = GridPair(
+            index=new_pair_idx,
+            buy_price=self.anchor_price + new_pair_idx * self.spread,
+            sell_price=self.anchor_price + (new_pair_idx - 1) * self.spread
+        )
+        new_pair.next_action = "buy"
+        self.pairs[new_pair_idx] = new_pair
+        
+        ticket = await self._execute_market_order("buy", new_pair.buy_price, new_pair_idx, reason="EXPAND")
+        if ticket:
+            new_pair.buy_filled = True
+            new_pair.buy_ticket = ticket
+            new_pair.advance_toggle()
     
     async def _execute_step1_bullish(self):
         """Step 1 Bullish: Place B1 + S2 atomically."""
@@ -1887,6 +1976,11 @@ class SymbolEngine:
             
             if not deals:
                 return
+            
+            # Debug: log all deals found and their reasons
+            tp_sl_deals = [d for d in deals if d.reason in (mt5.DEAL_REASON_TP, mt5.DEAL_REASON_SL)]
+            if tp_sl_deals:
+                print(f"[DEBUG TP] Found {len(tp_sl_deals)} TP/SL deals: {[(d.ticket, d.reason, d.position_id) for d in tp_sl_deals]}")
             
             for deal in deals:
                 if deal.symbol != self.symbol:
@@ -3515,8 +3609,29 @@ class SymbolEngine:
         result = mt5.order_send(request)
         
         if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            # For market orders (TRADE_ACTION_DEAL), result.order IS the position ticket
-            position_ticket = result.order
+            # result.order is the ORDER ticket, NOT the POSITION ticket
+            # For market orders, we need to find the actual position that was created
+            # The position ticket can be found by querying positions with our magic number
+            
+            import time
+            time.sleep(0.05)  # Small delay to ensure position is registered
+            
+            # Find the position we just created
+            # Look for positions NOT already in ticket_map (these are new)
+            positions = mt5.positions_get(symbol=self.symbol)
+            position_ticket = None
+            
+            if positions:
+                # Find positions with matching magic that aren't tracked yet
+                for pos in positions:
+                    if pos.magic == magic and pos.ticket not in self.ticket_map:
+                        position_ticket = pos.ticket
+                        break
+            
+            # Fallback to result.order if position not found
+            if not position_ticket:
+                position_ticket = result.order
+                print(f"[WARNING] Could not find new position, using order ticket: {position_ticket}")
             
             # TICKET MAPPING: Store POSITION ticket for TP detection
             self.ticket_map[position_ticket] = (self.cycle_id, index, leg)
