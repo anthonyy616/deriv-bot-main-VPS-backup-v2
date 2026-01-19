@@ -53,3 +53,13 @@ so if the signal for position drop for a complete pair (last one in group 0 is r
 Then if the incomplete pairs now hit TP and are verified with the original check we use to know if it hit TP then create another init but for group 2 (group 2 has the same exact behaviour as group 3...infinity)
 
 Note: The toggle trigger logic should always still hit for completed pairs in any group with the correct lot size config in group 1 and the code has to be dynamic to adapt for any group possible no matter how long the bot is left running for so hardcoded variables like B100 or S101 for checks is wrong and will fail past group 1. The code should be adaptable for different groups
+
+
+
+Done!
+
+Cosmetic fix for accuracy and to minimize degradation and risk minimization of init not happening:
+
+It was correctly implemented. 
+But i think this current version might slightly degrade overtime because the design of this system is meant to be when the non-atomic leg fires, we are meant to be placing init too by design of how it will be configured. 
+The TP of this system is always configured to 3x the grid distance value. As you can see i have been testing with spread 30 and TP 90. this has always been consistent. But now, I want to introduce something new - artificial Take Profits to execute init. You know when C=2 we fire non-atomically, well after doing that we then check IF the incomplete pair has hit TP (or if it's still open) - anyone that's easier to judge, then if it's true (i.e. incomplete pair still open ) we will then close the incomplete pair ourselves and ASSUME the incomplete pair has hit TP so that init fires almost at the same price as the non-atomic pair because once a position drop is detected for that incomplete pair and we run the check it will always return true so we will create init. So it's like an artificial TP hit for to make sure that the grid is consistent and we always init because 
