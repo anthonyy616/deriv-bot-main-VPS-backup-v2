@@ -2081,8 +2081,7 @@ class SymbolEngine:
         if pair.hedge_active and pair.hedge_ticket:
             self._close_position(pair.hedge_ticket)
         
-        # Phoenix Reset (Reuse closed direction)
-        self._phoenix_reset_pair(pair_idx, closed_direction)
+        # NOTE: Phoenix reset removed - pairs are no longer recycled
         await self.save_state()
 
     async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
@@ -2095,64 +2094,8 @@ class SymbolEngine:
             print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
             self._close_position(pair.hedge_ticket)
         
-        # Use the closed direction for restart (if Buy closed, re-open with Buy)
-        restart_direction = closed_direction
-        
-        # Execute Phoenix reset
-        self._phoenix_reset_pair(pair_idx, restart_direction)
-        
         # Save immediately
         await self.save_state()
-
-
-    def _phoenix_reset_pair(self, pair_index: int, start_direction: str) -> None:
-        """
-        PHOENIX SYSTEM: Nuclear reset via Destroy & Recreate.
-        
-        Instead of manually resetting fields on an existing GridPair (which risks
-        keeping stale flags like hedge_active, buy_in_zone, etc.), we:
-        1. Capture the old pair's price levels (buy_price, sell_price)
-        2. Delete the old GridPair object entirely
-        3. Create a fresh GridPair at the same price levels
-        4. Apply re-open invariants (trade_count=0, is_reopened=True)
-        
-        Args:
-            pair_index: The index of the pair to reset
-            start_direction: "buy" or "sell" - direction based on what position just closed
-        """
-        old_pair = self.pairs.get(pair_index)
-        if not old_pair:
-            print(f"[PHOENIX] WARNING: Pair {pair_index} not found, cannot reset")
-            return
-        
-        # Step 1: Capture price levels (preserve grid structure)
-        buy_price = old_pair.buy_price
-        sell_price = old_pair.sell_price
-        
-        # Step 2: Destroy old pair (nuclear delete)
-        del self.pairs[pair_index]
-        
-        # Step 3: Create fresh GridPair at same price levels
-        new_pair = GridPair(
-            index=pair_index,
-            buy_price=buy_price,
-            sell_price=sell_price
-        )
-        
-        # Step 4: Apply re-open invariants
-        new_pair.trade_count = 0                    # Forces Lot Size Index 0 -> 0.01
-        new_pair.next_action = start_direction      # Direction of closed deal
-        new_pair.is_reopened = True                 # Bypasses zone latch logic
-        new_pair.hedge_active = False               # Clean hedge state
-        new_pair.buy_filled = False                 # Clean fill state
-        new_pair.sell_filled = False                # Clean fill state
-        new_pair.buy_in_zone = False                # Clean zone state
-        new_pair.sell_in_zone = False               # Clean zone state
-        
-        # Step 5: Re-insert into pairs dict
-        self.pairs[pair_index] = new_pair
-        
-        print(f"[PHOENIX] Reset Pair {pair_index}: Count=0, Next={start_direction}, Reopened=True")
 
     async def _check_tp_sl_from_history(self):
         """
@@ -2267,9 +2210,7 @@ class SymbolEngine:
                         
                         await self._execute_tp_expansion(group_id, deal.price, is_bullish, C)
                 
-                # Phoenix reset the pair (for both TP and SL)
-                restart_direction = "buy" if tp_leg == 'B' else "sell"
-                self._phoenix_reset_pair(pair_idx, restart_direction)
+                # NOTE: Phoenix reset removed - pairs are no longer recycled
                 
                 # Save state immediately
                 await self.save_state()
@@ -2404,9 +2345,7 @@ class SymbolEngine:
                     print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
                     self._close_position(pair.hedge_ticket)
                 
-                # Phoenix reset the pair
-                restart_direction = "buy" if leg == 'B' else "sell"
-                self._phoenix_reset_pair(pair_idx, restart_direction)
+                # NOTE: Phoenix reset removed - pairs are no longer recycled
                 
                 # Save state
                 await self.save_state()
@@ -3464,33 +3403,7 @@ class SymbolEngine:
                 pair.buy_price = pair.sell_price + self.spread
                 await self.save_state()
             
-            # ================================================================
-            # PROXIMITY-BASED RE-ENTRY FOR PHOENIX PAIRS
-            # When is_reopened=True, we ONLY use proximity check (price must TOUCH level)
-            # This prevents firing when price is far away (e.g., price 60 vs level 90)
-            # ================================================================
-            if pair.is_reopened:
-                # Check BUY proximity
-                if pair.next_action == "buy":
-                    # GAP-PROOF: Fire if price is at level OR BETTER (lower for Buy)
-                    buy_proximity = ask <= (pair.buy_price + tolerance)
-                    if buy_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Triggering BUY.")
-                        await self._execute_trade_with_chain("buy", idx)
-                    continue  # Skip standard logic for this pair
-                
-                # Check SELL proximity
-                if pair.next_action == "sell":
-                    # GAP-PROOF: Fire if price is at level OR BETTER (higher for Sell)
-                    sell_proximity = bid >= (pair.sell_price - tolerance)
-                    if sell_proximity and pair.trade_count < self.max_positions:
-                        print(f"[PROXIMITY] {self.symbol} Pair {idx}: Triggering SELL.")
-                        await self._execute_trade_with_chain("sell", idx)
-                    continue  # Skip standard logic for this pair
-                
-                # If we get here, just skip to next pair
-                continue
-            
+            # NOTE: Proximity-based re-entry for Phoenix pairs removed - no longer used
             # ================================================================
             # STANDARD DIRECTIONAL LOGIC (for normal pairs, not reopened)
             # ================================================================
@@ -3836,29 +3749,20 @@ class SymbolEngine:
         pair = self.pairs.get(index)
         
         # --- ROBUST TP/SL CALCULATION ---
-        # 1. Base Calculation from Config (Grid Price based)
+        # Use EXECUTION PRICE (actual entry), NOT grid price, for TP/SL
+        # This ensures consistent pip distance regardless of slippage/market conditions
         tp_pips = float(self.config.get(f'{direction}_stop_tp', 20.0))
         sl_pips = float(self.config.get(f'{direction}_stop_sl', 20.0))
         
         if direction == "buy":
-            tp = grid_price + tp_pips
-            sl = grid_price - sl_pips
+            tp = exec_price + tp_pips
+            sl = exec_price - sl_pips
         else:
-            tp = grid_price - tp_pips
-            sl = grid_price + sl_pips
+            tp = exec_price - tp_pips
+            sl = exec_price + sl_pips
         
-        # 2. Alignment Logic (Shared TP/SL for cycle)
-        if pair and (pair.trade_count % 2 == 1) and pair.pair_tp != 0.0 and pair.pair_sl != 0.0:
-            if direction == "buy":
-                tp = pair.pair_sl
-                sl = pair.pair_tp
-            else:
-                tp = pair.pair_sl
-                sl = pair.pair_tp
-        else:
-            if pair:
-                pair.pair_tp = tp
-                pair.pair_sl = sl
+        # DEBUG: Log TP/SL calculation
+        print(f"[TP/SL] {direction.upper()} Pair {index}: exec_price={exec_price:.2f} tp_pips={tp_pips} sl_pips={sl_pips} → TP={tp:.2f} SL={sl:.2f}")
 
         # 3. SAFETY CHECK: Validate against Current Market Price (Execution Price)
         # MT5 'Invalid Stops' happens if TP/SL are too close to CURRENT Ask/Bid
@@ -3897,12 +3801,12 @@ class SymbolEngine:
                 # Enforce SL distance
                 if sl < check_price + min_dist:
                     sl = check_price + min_dist
-                    # print(f"   [ADJ] Sell SL adjusted to {sl:.5f} (Min Dist)")
+                    print(f"   [ADJ] Sell SL adjusted to {sl:.5f} (Min Dist)")
                     
                 # Enforce TP distance
                 if tp > check_price - min_dist:
                     tp = check_price - min_dist
-                    # print(f"   [ADJ] Sell TP adjusted to {tp:.5f} (Min Dist)")
+                    print(f"   [ADJ] Sell TP adjusted to {tp:.5f} (was farther but clipped)")
 
         # Use cycle-aware magic and comment for TP detection
         leg = 'B' if direction == 'buy' else 'S'
@@ -3927,6 +3831,9 @@ class SymbolEngine:
             "type_filling": mt5.ORDER_FILLING_FOK,
             "deviation": 200
         }
+        
+        # DEBUG: Final values sent to MT5
+        print(f"[MT5-SEND] {direction.upper()} Pair {index}: exec={exec_price:.2f} TP={tp:.2f} SL={sl:.2f}")
         
         result = mt5.order_send(request)
         
