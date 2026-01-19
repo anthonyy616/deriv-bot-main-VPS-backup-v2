@@ -27,3 +27,22 @@ If complete it will just continue the expansion but for the second group.
 So having checks whether TP hit or not for a completed pair is redundant. It only fails if they're not equal which I dont plan on making it right now
 
 
+
+
+
+Fix:
+
+@session_2026-01-18_20-50-33.txt#L1-122
+
+The implementation seems to be correct but honestly the way it's configured looks wrong. 
+I gave it a spread of 30 pips, 90 pips TP for both buy and sell and look. up till Trade 11 everything's correct.  but the logs are kinda confusing me because at trade 11. 
+the way it's structured we honestly shouldn't be going to group 2 till pairs in group 0 no longer exist.  
+let me explain why. we first started with B0,S1 then B-1, S0 -> B-2, S-1 and S-2 fired alone because C at that stage was 2. 
+Now, when S-2 fired the incomplete pair in group 1 (i.e. S1 )also hit TP so we opened B100 and S101 basically almost at the price of S-2 which is CORRECT.
+Then the first pair i.e. B0,S1 then went down again  to TP and we opened S100 and B99 (which is correct) - so atp there is only 1 complete pair in group 1 which is pair 100. And 2 complete ones in group 0 which are -1 and -2 pair. 
+So there are 2 incomplete pairs as of now in group 1 B99 and S101 but we CANNOT trigger init even if B99 TP hit why? 
+because we havent hit 3 complete pairs in group 1. So init can only be triggered when C == 3 for a group (The logic was spot on actually, it was my fault for not clarifying). 
+The correct behaviour should've actually been at this stage that since C!=3 yet for the group 1 (so if a group doesn't have C ==3 yet then block init from happening and just focus on completed pairs from the other group hitting TP to continue the chain in the next group, only when C is 3 can init happen).
+No init, instead we wait till TP hits for the completed pairs. 
+If not, in scenarios like this we will be having 3 different groups and this breaks the logic we're trying to attain. 
+Before trying to implement, please explain to me to make sure you understand

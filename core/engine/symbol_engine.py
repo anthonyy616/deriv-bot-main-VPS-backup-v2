@@ -393,6 +393,7 @@ class SymbolEngine:
         self.GROUP_OFFSET: int = 100              # Pair offset per group
         self.current_group: int = 0               # Active group being traded
         self.group_anchors: Dict[int, float] = {} # group_id -> anchor_price
+        self.pending_init: bool = False           # True = incomplete TP hit but C < 3, queue INIT
         
         # Legacy fields (maintained for compatibility)
         self.cycle_id: int = 0                    # Maps to current_group for now
@@ -982,6 +983,15 @@ class SymbolEngine:
                         print(f"[COMP-EXPAND] B{seed_idx} placed (lot 0), ticket={ticket_b}")
             
             await self.save_state()
+            
+            # CHECK: If pending INIT and C just became 3, fire the queued INIT
+            C_after = self._count_completed_pairs_for_group(group_id)
+            if self.pending_init and C_after >= 3:
+                self.pending_init = False
+                new_group_id = group_id + 1
+                current_price = (tick.ask + tick.bid) / 2
+                print(f"[INIT-FIRED] Group {group_id} C={C_after} → Firing queued INIT for Group {new_group_id} at {current_price:.2f}")
+                await self._execute_group_init(new_group_id, current_price)
 
     async def _check_step_triggers(self, ask: float, bid: float):
         """
@@ -1085,6 +1095,13 @@ class SymbolEngine:
         # Don't seed the next pair - only 1 incomplete pair should exist at C==3
         if C == 2:
             print(f"[NON-ATOMIC] C was 2, now 3 after B{pair_to_complete} - NOT seeding S{pair_to_complete + 1}")
+            # Check if pending INIT should fire now that C==3
+            if self.pending_init:
+                self.pending_init = False
+                new_group_id = self.current_group + 1
+                current_price = (tick.ask + tick.bid) / 2
+                print(f"[INIT-FIRED] Group {self.current_group} C=3 → Firing queued INIT for Group {new_group_id}")
+                await self._execute_group_init(new_group_id, current_price)
             return
         
         # S(pair_to_complete + 1) - starts new incomplete pair
@@ -1127,6 +1144,13 @@ class SymbolEngine:
         # Don't seed the next pair - only 1 incomplete pair should exist at C==3
         if C == 2:
             print(f"[NON-ATOMIC] C was 2, now 3 after S{pair_to_complete} - NOT seeding B{pair_to_complete - 1}")
+            # Check if pending INIT should fire now that C==3
+            if self.pending_init:
+                self.pending_init = False
+                new_group_id = self.current_group + 1
+                current_price = (tick.ask + tick.bid) / 2
+                print(f"[INIT-FIRED] Group {self.current_group} C=3 → Firing queued INIT for Group {new_group_id}")
+                await self._execute_group_init(new_group_id, current_price)
             return
         
         # B(pair_to_complete - 1) - starts new incomplete pair
@@ -2321,13 +2345,18 @@ class SymbolEngine:
                     print(f"[DROP-INCOMPLETE] pair={pair_idx} leg={leg} entry={entry_price:.2f} CMP={cmp:.2f} → {reason}")
                     
                     if is_tp:
-                        # INCOMPLETE PAIR TP → CREATE NEW GROUP INIT
+                        # INCOMPLETE PAIR TP → Check if we can create new group
                         new_group_id = self.current_group + 1
-                        print(f"[TP-INCOMPLETE] pair={pair_idx} → Creating Group {new_group_id} at CMP={cmp:.2f}")
+                        C = self._count_completed_pairs_for_group(self.current_group)
                         
-                        # First complete any pending pair leg if needed (same tick scenario)
-                        # This handles the case where B0 TP and B3 should fire together
-                        await self._execute_group_init(new_group_id, cmp)
+                        if C >= 3:
+                            # Current group has C==3, can fire INIT
+                            print(f"[TP-INCOMPLETE] pair={pair_idx} C={C} → Creating Group {new_group_id} at CMP={cmp:.2f}")
+                            await self._execute_group_init(new_group_id, cmp)
+                        else:
+                            # C < 3, queue INIT for later
+                            self.pending_init = True
+                            print(f"[INIT-QUEUED] pair={pair_idx} C={C} < 3 → INIT queued, waiting for C==3")
                 else:
                     # COMPLETED PAIR: Trigger expansion in active group if applicable
                     print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} → Checking expansion")
