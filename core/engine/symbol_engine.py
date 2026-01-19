@@ -86,6 +86,10 @@ class GridPair:
     # New field for position age tracking (Bug 3 fix)
     position_timestamps: Dict[int, float] = field(default_factory=dict)  # ticket -> opening time
     
+    # Group tracking: Explicitly track which group this pair belongs to
+    # This fixes the issue where bearish expansion pairs (e.g., 99) were miscategorized
+    group_id: int = 0  # Group 0 by default, set explicitly when pair is created
+    
     def get_next_lot(self, lot_sizes: list) -> float:
         """
         Get the next lot size for a trade based on trade_count.
@@ -538,11 +542,14 @@ class SymbolEngine:
     
     def _can_place_completing_leg(self, pair_index: int, leg: str) -> bool:
         """
-        Global Lock Gate: Returns False if placing this leg would push C > 3.
+        Group-Specific Lock Gate: Returns False if placing this leg would push C > 3 for THIS group.
         
         IMPORTANT DISTINCTION:
         - BLOCK: Trades that would COMPLETE an INCOMPLETE pair (creating a NEW completed pair)
         - ALLOW: Toggle trades on ALREADY COMPLETE pairs (they don't increase C)
+        
+        FIX: Uses group-specific C counting, not global count!
+        This allows Group 1 to expand even when Group 0 has 3 completed pairs.
         
         Args:
             pair_index: The pair this order belongs to
@@ -551,20 +558,22 @@ class SymbolEngine:
         Returns:
             True if order can proceed, False if blocked by cap
         """
-        C = self._count_completed_pairs_open()
+        pair = self.pairs.get(pair_index)
+        if not pair:
+            return True  # New pair creation blocked by step triggers, not here
+        
+        # Get group-specific C count (not global!)
+        group_id = pair.group_id
+        C = self._count_completed_pairs_for_group(group_id)
         
         # If already at cap (C >= 3), check if this would complete an INCOMPLETE pair
         if C >= 3:
-            pair = self.pairs.get(pair_index)
-            if not pair:
-                return True  # New pair creation blocked by step triggers, not here
-            
             # Check if pair is currently incomplete (only one leg filled)
             pair_is_incomplete = pair.buy_filled != pair.sell_filled
             
             if pair_is_incomplete:
                 # This trade would complete an incomplete pair → BLOCK
-                #print(f"[CAP_BLOCK] pair={pair_index} leg={leg} BLOCKED (would complete incomplete pair, C={C})")
+                print(f"[CAP_BLOCK] pair={pair_index} leg={leg} BLOCKED (would complete incomplete pair, Group={group_id} C={C})")
                 return False
             
             # Pair is already complete → ALLOW toggle trades
@@ -581,7 +590,18 @@ class SymbolEngine:
     # ========================================================================
     
     def _get_group_from_pair(self, pair_idx: int) -> int:
-        """Extract group number from pair index. E.g., 145 → Group 1."""
+        """
+        Get group number for a pair index.
+        
+        PRIORITY: Use stored group_id if pair exists (handles bearish expansion correctly).
+        FALLBACK: Calculate from index for legacy pairs or missing entries.
+        """
+        # First, check if pair exists and has explicit group_id
+        pair = self.pairs.get(pair_idx)
+        if pair is not None:
+            return pair.group_id
+        
+        # Fallback: Calculate from index (legacy behavior)
         if pair_idx >= 0:
             return pair_idx // self.GROUP_OFFSET
         else:
@@ -687,6 +707,7 @@ class SymbolEngine:
             pair_b = GridPair(index=b_idx, buy_price=b_price, sell_price=b_price - self.spread)
             pair_b.next_action = "buy"
             pair_b.trade_count = 0  # INIT uses lot index 0
+            pair_b.group_id = group_id  # Explicitly track group membership
             self.pairs[b_idx] = pair_b
             
             # Execute B(offset)
@@ -705,6 +726,7 @@ class SymbolEngine:
             pair_s = GridPair(index=s_idx, buy_price=b_price + self.spread, sell_price=s_price)
             pair_s.next_action = "sell"
             pair_s.trade_count = 0  # INIT uses lot index 0
+            pair_s.group_id = group_id  # Explicitly track group membership
             self.pairs[s_idx] = pair_s
             
             # Execute S(offset+1)
@@ -772,6 +794,7 @@ class SymbolEngine:
             else:
                 pair = GridPair(index=pair_idx, buy_price=price + self.spread, sell_price=price)
             pair.next_action = direction
+            pair.group_id = self.current_group  # Track group membership
             self.pairs[pair_idx] = pair
         
         ticket = await self._execute_market_order(direction, price, pair_idx, reason="TP_EXPAND")
@@ -789,6 +812,7 @@ class SymbolEngine:
         # B(n)
         pair_b = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
         pair_b.next_action = "buy"
+        pair_b.group_id = self.current_group  # Track group membership
         self.pairs[b_idx] = pair_b
         
         ticket_b = await self._execute_market_order("buy", price, b_idx, reason="TP_EXPAND")
@@ -800,6 +824,7 @@ class SymbolEngine:
         # S(n+1)
         pair_s = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
         pair_s.next_action = "sell"
+        pair_s.group_id = self.current_group  # Track group membership
         self.pairs[s_idx] = pair_s
         
         ticket_s = await self._execute_market_order("sell", price, s_idx, reason="TP_EXPAND")
@@ -813,6 +838,7 @@ class SymbolEngine:
         # S(n)
         pair_s = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
         pair_s.next_action = "sell"
+        pair_s.group_id = self.current_group  # Track group membership
         self.pairs[s_idx] = pair_s
         
         ticket_s = await self._execute_market_order("sell", price, s_idx, reason="TP_EXPAND")
@@ -824,6 +850,7 @@ class SymbolEngine:
         # B(n-1)
         pair_b = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
         pair_b.next_action = "buy"
+        pair_b.group_id = self.current_group  # Track group membership
         self.pairs[b_idx] = pair_b
         
         ticket_b = await self._execute_market_order("buy", price, b_idx, reason="TP_EXPAND")
@@ -897,6 +924,20 @@ class SymbolEngine:
                     bearish_edge = pair
                     break
             
+            # ============================================================
+            # EXPANSION DEBUG: Log edge pair discovery results
+            # ============================================================
+            print(f"[COMP-EXPAND] Group={group_id} | C={C} | CMP={cmp:.2f}")
+            print(f"[COMP-EXPAND] Group pairs: {list(group_pairs.keys())}")
+            if bullish_edge:
+                print(f"[COMP-EXPAND] Bullish edge: pair={bullish_edge.index}, sell_price={bullish_edge.sell_price:.2f} (need CMP > this)")
+            else:
+                print(f"[COMP-EXPAND] No bullish edge found (no pair with sell_filled=True, buy_filled=False)")
+            if bearish_edge:
+                print(f"[COMP-EXPAND] Bearish edge: pair={bearish_edge.index}, buy_price={bearish_edge.buy_price:.2f} (need CMP < this)")
+            else:
+                print(f"[COMP-EXPAND] No bearish edge found (no pair with buy_filled=True, sell_filled=False)")
+            
             expansion_done = False
             
             # BULLISH CHECK: CMP > bullish_edge.sell_price
@@ -933,6 +974,7 @@ class SymbolEngine:
                     seed_pair = GridPair(index=seed_idx, buy_price=tick.ask + self.spread, sell_price=tick.ask)
                     seed_pair.next_action = "sell"
                     seed_pair.trade_count = 0  # Lot index 0
+                    seed_pair.group_id = group_id  # Inherit group from expansion context
                     self.pairs[seed_idx] = seed_pair
                     
                     ticket_s = await self._execute_market_order("sell", tick.bid, seed_idx, reason="COMP_EXPAND")
@@ -978,6 +1020,7 @@ class SymbolEngine:
                     seed_pair = GridPair(index=seed_idx, buy_price=tick.bid, sell_price=tick.bid - self.spread)
                     seed_pair.next_action = "buy"
                     seed_pair.trade_count = 0  # Lot index 0
+                    seed_pair.group_id = group_id  # Inherit group from expansion context
                     self.pairs[seed_idx] = seed_pair
                     
                     ticket_b = await self._execute_market_order("buy", tick.ask, seed_idx, reason="COMP_EXPAND")
@@ -1004,85 +1047,101 @@ class SymbolEngine:
 
     async def _check_step_triggers(self, ask: float, bid: float):
         """
-        DYNAMIC GRID EXPANSION: Expand grid at each new level until C >= 3.
+        DYNAMIC GRID EXPANSION for CURRENT GROUP ONLY.
         
-        The grid expands in WHICHEVER direction price moves:
-        - Bullish: When price reaches anchor + (max_pair+1)*D, fire B(max+1) + S(max+2)
-        - Bearish: When price reaches anchor + (min_pair-1)*D, fire S(min-1) + B(min-2)
+        Expands grid at each new level until C >= 3 for the current group.
+        Grid expands in WHICHEVER direction price moves:
+        - Bullish: Complete incomplete pair with B, seed next pair with S
+        - Bearish: Complete incomplete pair with S, seed next pair with B
         
-        This continues until 3 completed pairs exist (C >= 3).
+        IMPORTANT: Only processes pairs belonging to current_group.
+        Uses group-specific anchor from group_anchors[current_group].
         """
         D = self.spread
         T = self.tolerance
-        C = self._count_completed_pairs_open()
         
-        # Don't expand if we already have 3 completed pairs
+        # Only count C for current group
+        C = self._count_completed_pairs_for_group(self.current_group)
+        
+        # Don't expand if current group already has 3 completed pairs
         if C >= 3:
             return
         
-        # Find current grid bounds from existing pairs
-        if not self.pairs:
+        # Get anchor for current group (not global anchor_price!)
+        current_anchor = self.group_anchors.get(self.current_group, self.anchor_price)
+        
+        # Filter pairs to only current group using stored group_id
+        group_pairs = {idx: pair for idx, pair in self.pairs.items()
+                       if pair.group_id == self.current_group}
+        
+        if not group_pairs:
             return
         
-        positive_pairs = [idx for idx in self.pairs.keys() if idx > 0]
-        negative_pairs = [idx for idx in self.pairs.keys() if idx < 0]
+        # Separate positive and negative pairs within current group
+        positive_pairs = [idx for idx in group_pairs.keys() if idx > 0 or (self.current_group > 0 and idx >= self.current_group * 100)]
+        negative_pairs = [idx for idx in group_pairs.keys() if idx < 0 or (self.current_group > 0 and idx < self.current_group * 100)]
         
-        max_positive = max(positive_pairs) if positive_pairs else 0
-        min_negative = min(negative_pairs) if negative_pairs else 0
+        # For Group 1+, adjust positive/negative classification based on group offset
+        if self.current_group > 0:
+            offset = self._get_pair_offset(self.current_group)
+            # Within Group 1+, "positive" means >= offset, "negative" means < offset
+            positive_pairs = [idx for idx in group_pairs.keys() if idx >= offset]
+            negative_pairs = [idx for idx in group_pairs.keys() if idx < offset]
         
         # ================================================================
         # BULLISH EXPANSION: Price moving up
         # ================================================================
-        # Find the highest INCOMPLETE positive pair (has S, no B)
-        # That's the pair we need to complete when price rises
-        
+        # Find the highest INCOMPLETE pair in current group (has S, no B)
         incomplete_bull_pair = None
         for idx in sorted(positive_pairs, reverse=True):  # Check from highest
-            pair = self.pairs.get(idx)
+            pair = group_pairs.get(idx)
             if pair and pair.sell_filled and not pair.buy_filled:
                 incomplete_bull_pair = idx
                 break
         
         if incomplete_bull_pair is not None:
-            # Level for B(incomplete) is anchor + incomplete * D
-            bull_level = self.anchor_price + incomplete_bull_pair * D
+            # For Group 1+, calculate level relative to THAT pair's sell_price
+            # (which was set when the pair was seeded)
+            pair = group_pairs[incomplete_bull_pair]
+            bull_level = pair.buy_price  # Use the stored buy_price for this pair
             
             if ask >= bull_level - T:
-                print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
+                print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}, Group={self.current_group}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
                 await self._expand_bullish(incomplete_bull_pair)
         
         # ================================================================
         # BEARISH EXPANSION: Price moving down
         # ================================================================
-        # Find the lowest INCOMPLETE pair (has B, no S) - including Pair 0
-        # That's the pair we need to complete when price falls
-        
+        # Find the lowest INCOMPLETE pair in current group (has B, no S)
         incomplete_bear_pair = None
-        # Check Pair 0 first
-        pair0 = self.pairs.get(0)
-        if pair0 and pair0.buy_filled and not pair0.sell_filled:
-            incomplete_bear_pair = 0
-        else:
-            # Check negative pairs from highest (closest to 0) to lowest
+        
+        # For Group 0, check Pair 0 explicitly
+        if self.current_group == 0:
+            pair0 = group_pairs.get(0)
+            if pair0 and pair0.buy_filled and not pair0.sell_filled:
+                incomplete_bear_pair = 0
+        
+        if incomplete_bear_pair is None:
+            # Check negative/lower pairs from highest (closest to anchor) to lowest
             for idx in sorted(negative_pairs, reverse=True):
-                pair = self.pairs.get(idx)
+                pair = group_pairs.get(idx)
                 if pair and pair.buy_filled and not pair.sell_filled:
                     incomplete_bear_pair = idx
                     break
         
         if incomplete_bear_pair is not None:
-            # Level for S(incomplete) is anchor + (incomplete - 1) * D = anchor - D for pair 0
-            # For Pair 0: sell at anchor - D
-            # For Pair -1: sell at anchor - 2D, etc.
-            bear_level = self.anchor_price + (incomplete_bear_pair - 1) * D
+            # Use the stored sell_price for this pair
+            pair = group_pairs[incomplete_bear_pair]
+            bear_level = pair.sell_price
             
             if bid <= bear_level + T:
-                print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
+                print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}, Group={self.current_group}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
                 await self._expand_bearish(incomplete_bear_pair)
     
     async def _expand_bullish(self, pair_to_complete: int):
         """Expand grid in bullish direction: complete pair N with B, start pair N+1 with S."""
-        C = self._count_completed_pairs_open()
+        # Use group-specific C counting
+        C = self._count_completed_pairs_for_group(self.current_group)
         if C >= 3:
             print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
             return
@@ -1114,13 +1173,18 @@ class SymbolEngine:
             return
         
         # S(pair_to_complete + 1) - starts new incomplete pair
+        # Derive prices from completing pair (for Group 1+ consistency)
         new_pair_idx = pair_to_complete + 1
+        new_sell_price = pair.buy_price  # New sell at completing pair's buy level
+        new_buy_price = new_sell_price + self.spread
+        
         new_pair = GridPair(
             index=new_pair_idx,
-            buy_price=self.anchor_price + (new_pair_idx + 1) * self.spread,
-            sell_price=self.anchor_price + new_pair_idx * self.spread
+            buy_price=new_buy_price,
+            sell_price=new_sell_price
         )
         new_pair.next_action = "sell"
+        new_pair.group_id = self.current_group  # Track group membership
         self.pairs[new_pair_idx] = new_pair
         
         ticket = await self._execute_market_order("sell", new_pair.sell_price, new_pair_idx, reason="EXPAND")
@@ -1131,7 +1195,8 @@ class SymbolEngine:
     
     async def _expand_bearish(self, pair_to_complete: int):
         """Expand grid in bearish direction: complete pair N with S, start pair N-1 with B."""
-        C = self._count_completed_pairs_open()
+        # Use group-specific C counting
+        C = self._count_completed_pairs_for_group(self.current_group)
         if C >= 3:
             print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
             return
@@ -1163,13 +1228,18 @@ class SymbolEngine:
             return
         
         # B(pair_to_complete - 1) - starts new incomplete pair
+        # Derive prices from completing pair (for Group 1+ consistency)
         new_pair_idx = pair_to_complete - 1
+        new_buy_price = pair.sell_price  # New buy at completing pair's sell level
+        new_sell_price = new_buy_price - self.spread
+        
         new_pair = GridPair(
             index=new_pair_idx,
-            buy_price=self.anchor_price + new_pair_idx * self.spread,
-            sell_price=self.anchor_price + (new_pair_idx - 1) * self.spread
+            buy_price=new_buy_price,
+            sell_price=new_sell_price
         )
         new_pair.next_action = "buy"
+        new_pair.group_id = self.current_group  # Track group membership
         self.pairs[new_pair_idx] = new_pair
         
         ticket = await self._execute_market_order("buy", new_pair.buy_price, new_pair_idx, reason="EXPAND")
@@ -1197,6 +1267,7 @@ class SymbolEngine:
         pair2 = GridPair(index=2, buy_price=self.anchor_price + 2*self.spread, 
                          sell_price=self.anchor_price + self.spread)
         pair2.next_action = "sell"
+        pair2.group_id = self.current_group  # Track group membership
         self.pairs[2] = pair2
         
         ticket = await self._execute_market_order("sell", pair2.sell_price, 2, reason="STEP1")
@@ -1241,6 +1312,7 @@ class SymbolEngine:
         pair_neg1 = GridPair(index=-1, buy_price=self.anchor_price - self.spread, 
                              sell_price=self.anchor_price - 2*self.spread)
         pair_neg1.next_action = "buy"
+        pair_neg1.group_id = self.current_group  # Track group membership
         self.pairs[-1] = pair_neg1
         
         ticket = await self._execute_market_order("buy", pair_neg1.buy_price, -1, reason="STEP1")
@@ -1275,6 +1347,7 @@ class SymbolEngine:
         pair3 = GridPair(index=3, buy_price=self.anchor_price + 3*self.spread,
                          sell_price=self.anchor_price + 2*self.spread)
         pair3.next_action = "sell"
+        pair3.group_id = self.current_group  # Track group membership
         self.pairs[3] = pair3
         
         ticket = await self._execute_market_order("sell", pair3.sell_price, 3, reason="STEP2")
@@ -1313,6 +1386,7 @@ class SymbolEngine:
         pair_neg2 = GridPair(index=-2, buy_price=self.anchor_price - 2*self.spread,
                              sell_price=self.anchor_price - 3*self.spread)
         pair_neg2.next_action = "buy"
+        pair_neg2.group_id = self.current_group  # Track group membership
         self.pairs[-2] = pair_neg2
         
         ticket = await self._execute_market_order("buy", pair_neg2.buy_price, -2, reason="STEP2")
@@ -1590,6 +1664,7 @@ class SymbolEngine:
                         # Execute B0
                         self.center_price = b0_price
                         pair0 = GridPair(index=0, buy_price=b0_price, sell_price=b0_price - self.spread)
+                        pair0.group_id = self.current_group  # Track group membership
                         self.pairs[0] = pair0
                         
                         ticket = await self._execute_market_order("buy", b0_price, 0)
@@ -1669,6 +1744,7 @@ class SymbolEngine:
                         # FIX: Positive pairs start with SELL, so set next_action="sell"
                         # After advance_toggle(), it will correctly become "buy"
                         pair1.next_action = "sell"
+                        pair1.group_id = self.current_group  # Track group membership
                         self.pairs[1] = pair1
                         
                         # For INIT, we typically want the grid ACTIVE.
@@ -2062,8 +2138,9 @@ class SymbolEngine:
                 history = mt5.history_deals_get(from_time, to_time, position=ticket_id)
                 
                 if history:
-                    print(f"[DROP CONFIRMED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} ({direction}) closed. Resetting.")
-                    await self._execute_pair_reset(pair_idx, pair, direction)
+                    print(f"[DROP CONFIRMED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} ({direction}) closed.")
+                    # NUCLEAR RESET DISABLED: Don't close survivor positions
+                    # await self._execute_pair_reset(pair_idx, pair, direction)
                     break 
                 
                 # CHECK 3: Ghost/Latency (Missing from both)
@@ -2071,31 +2148,34 @@ class SymbolEngine:
                 if age < 3.0:
                     continue # Assume Latency
                 else:
-                    print(f"[GHOST DETECTED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} (age={age:.1f}s) missing. Resetting.")
-                    await self._execute_pair_reset(pair_idx, pair, direction)
+                    print(f"[GHOST DETECTED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} (age={age:.1f}s) missing.")
+                    # NUCLEAR RESET DISABLED: Don't close survivor positions
+                    # await self._execute_pair_reset(pair_idx, pair, direction)
                     break
 
-    async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
-        """Helper to execute nuclear reset."""
-        await self._close_pair_positions(pair_idx, "both")
-        if pair.hedge_active and pair.hedge_ticket:
-            self._close_position(pair.hedge_ticket)
-        
-        # NOTE: Phoenix reset removed - pairs are no longer recycled
-        await self.save_state()
+    # NUCLEAR RESET DISABLED: These functions are no longer used
+    # Survivor legs now stay open when opposite leg closes
+    # async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
+    #     """Helper to execute nuclear reset."""
+    #     await self._close_pair_positions(pair_idx, "both")
+    #     if pair.hedge_active and pair.hedge_ticket:
+    #         self._close_position(pair.hedge_ticket)
+    #     
+    #     # NOTE: Phoenix reset removed - pairs are no longer recycled
+    #     await self.save_state()
 
-    async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
-        """Execute nuclear reset for a pair after confirmed position closure."""
-        # Close any remaining positions
-        await self._close_pair_positions(pair_idx, "both")
-        
-        # Close hedge if active
-        if pair.hedge_active and pair.hedge_ticket:
-            print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
-            self._close_position(pair.hedge_ticket)
-        
-        # Save immediately
-        await self.save_state()
+    # async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
+    #     """Execute nuclear reset for a pair after confirmed position closure."""
+    #     # Close any remaining positions
+    #     await self._close_pair_positions(pair_idx, "both")
+    #     
+    #     # Close hedge if active
+    #     if pair.hedge_active and pair.hedge_ticket:
+    #         print(f"   [HEDGE] Closing hedge position {pair.hedge_ticket}")
+    #         self._close_position(pair.hedge_ticket)
+    #     
+    #     # Save immediately
+    #     await self.save_state()
 
     async def _check_tp_sl_from_history(self):
         """
@@ -2166,22 +2246,23 @@ class SymbolEngine:
                     print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
                     self._close_position(pair.hedge_ticket)
                 
-                # Close the survivor (opposing position)
-                if tp_leg == 'B':
-                    survivor_ticket = pair.sell_ticket
-                    survivor_leg = 'S'
-                else:
-                    survivor_ticket = pair.buy_ticket
-                    survivor_leg = 'B'
-                
-                if survivor_ticket and survivor_ticket > 0:
-                    print(f"   [CLEANUP] Closing survivor {survivor_leg} ticket={survivor_ticket}")
-                    self._close_position(survivor_ticket)
-                    
-                    # Clean survivor from ticket_map
-                    if survivor_ticket in self.ticket_map:
-                        del self.ticket_map[survivor_ticket]
-                        await self.repository.delete_ticket(survivor_ticket)
+                # SURVIVOR LEG PRESERVATION: Do NOT close the survivor leg
+                # The survivor stays open and will eventually hit its own TP/SL
+                # if tp_leg == 'B':
+                #     survivor_ticket = pair.sell_ticket
+                #     survivor_leg = 'S'
+                # else:
+                #     survivor_ticket = pair.buy_ticket
+                #     survivor_leg = 'B'
+                # 
+                # if survivor_ticket and survivor_ticket > 0:
+                #     print(f"   [CLEANUP] Closing survivor {survivor_leg} ticket={survivor_ticket}")
+                #     self._close_position(survivor_ticket)
+                #     
+                #     # Clean survivor from ticket_map
+                #     if survivor_ticket in self.ticket_map:
+                #         del self.ticket_map[survivor_ticket]
+                #         await self.repository.delete_ticket(survivor_ticket)
                 
                 # ================================================================
                 # TP-DRIVEN MULTI-GROUP SYSTEM
@@ -2217,12 +2298,17 @@ class SymbolEngine:
                 
                 # Log to session
                 if self.session_logger:
+                    # Get C from current group for logging
+                    C_for_log = self._count_completed_pairs_for_group(self.current_group)
+                    status_for_log = "Incomplete" if self._is_pair_incomplete(pair_idx) else "Complete"
                     self.session_logger.log_tp_sl(
                         symbol=self.symbol,
                         pair_idx=pair_idx,
                         direction="BUY" if tp_leg == 'B' else "SELL",
                         result="tp" if reason == "TP" else "sl",
-                        profit=deal.profit
+                        profit=deal.profit,
+                        C=C_for_log,
+                        status=status_for_log
                     )
             
             self.last_deal_check_time = time.time()
@@ -2283,6 +2369,17 @@ class SymbolEngine:
                 else:
                     entry_price = pair.sell_price
                 
+                # ============================================================
+                # TP HIT LOGGING: Display pair status for all TP/SL events
+                # ============================================================
+                pair_status = "INCOMPLETE" if was_incomplete else "COMPLETE"
+                group_id = self._get_group_from_pair(pair_idx)
+                print(f"[TP-LOG] ======================================")
+                print(f"[TP-LOG] Pair={pair_idx} (Group {group_id}) | Leg={leg} | Status={pair_status}")
+                print(f"[TP-LOG] buy_filled={pair.buy_filled}, sell_filled={pair.sell_filled}")
+                print(f"[TP-LOG] Entry={entry_price:.2f} | CMP={cmp:.2f}")
+                print(f"[TP-LOG] ======================================")
+                
                 # Infer TP or SL based on CMP vs entry_price
                 if was_incomplete:
                     # INCOMPLETE PAIR: Must determine TP vs SL
@@ -2314,31 +2411,41 @@ class SymbolEngine:
                             self.pending_init = True
                             print(f"[INIT-QUEUED] pair={pair_idx} C={C} < 3 → INIT queued, waiting for C==3")
                 else:
-                    # COMPLETED PAIR: Trigger expansion in active group if applicable
-                    print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} → Checking expansion")
+                    # COMPLETED PAIR: Determine TP vs SL and handle appropriately
+                    if leg == 'B':  # Buy position closed
+                        is_tp = cmp > entry_price
+                    else:  # Sell position closed
+                        is_tp = cmp < entry_price
                     
-                    # If we have an active group > 0, trigger expansion check
+                    reason = "TP" if is_tp else "SL"
+                    print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} entry={entry_price:.2f} CMP={cmp:.2f} → {reason}")
+                    
+                    # NUCLEAR RESET: Only on TP hits, close survivor leg
+                    if is_tp:
+                        print(f"[NUCLEAR-RESET] Completed pair {pair_idx} {leg} hit TP → Closing survivor")
+                        if leg == 'B' and pair.sell_ticket and pair.sell_ticket > 0:
+                            print(f"   [NUCLEAR] Closing survivor S ticket={pair.sell_ticket}")
+                            self._close_position(pair.sell_ticket)
+                            if pair.sell_ticket in self.ticket_map:
+                                del self.ticket_map[pair.sell_ticket]
+                                await self.repository.delete_ticket(pair.sell_ticket)
+                        elif leg == 'S' and pair.buy_ticket and pair.buy_ticket > 0:
+                            print(f"   [NUCLEAR] Closing survivor B ticket={pair.buy_ticket}")
+                            self._close_position(pair.buy_ticket)
+                            if pair.buy_ticket in self.ticket_map:
+                                del self.ticket_map[pair.buy_ticket]
+                                await self.repository.delete_ticket(pair.buy_ticket)
+                    else:
+                        # SL hit: Keep survivor open - it will eventually hit its own TP/SL
+                        print(f"[NO-NUCLEAR] Completed pair {pair_idx} {leg} hit SL → Survivor stays open")
+                    
+                    # Trigger expansion in active group if applicable
                     if self.current_group > 0:
                         await self._handle_completed_pair_expansion(cmp)
                 
                 # Clean up ticket from map
                 del self.ticket_map[ticket]
                 await self.repository.delete_ticket(ticket)
-                
-                # Close survivor if this was from a completed pair
-                if not was_incomplete:
-                    if leg == 'B' and pair.sell_ticket and pair.sell_ticket > 0:
-                        print(f"   [CLEANUP] Closing survivor S ticket={pair.sell_ticket}")
-                        self._close_position(pair.sell_ticket)
-                        if pair.sell_ticket in self.ticket_map:
-                            del self.ticket_map[pair.sell_ticket]
-                            await self.repository.delete_ticket(pair.sell_ticket)
-                    elif leg == 'S' and pair.buy_ticket and pair.buy_ticket > 0:
-                        print(f"   [CLEANUP] Closing survivor B ticket={pair.buy_ticket}")
-                        self._close_position(pair.buy_ticket)
-                        if pair.buy_ticket in self.ticket_map:
-                            del self.ticket_map[pair.buy_ticket]
-                            await self.repository.delete_ticket(pair.buy_ticket)
                 
                 # Close hedge if active
                 if pair.hedge_active and pair.hedge_ticket:
@@ -2349,6 +2456,30 @@ class SymbolEngine:
                 
                 # Save state
                 await self.save_state()
+                
+                # Log to session file
+                if self.session_logger:
+                    C_for_log = self._count_completed_pairs_for_group(self.current_group)
+                    status_for_log = "Incomplete" if was_incomplete else "Complete"
+                    # Determine if it was TP or SL for logging
+                    if was_incomplete:
+                        if leg == 'B':
+                            was_tp = cmp > entry_price
+                        else:
+                            was_tp = cmp < entry_price
+                    else:
+                        # For completed pairs, we don't track TP/SL distinction as clearly
+                        was_tp = True  # Assume TP for logging purposes
+                    
+                    self.session_logger.log_tp_sl(
+                        symbol=self.symbol,
+                        pair_idx=pair_idx,
+                        direction="BUY" if leg == 'B' else "SELL",
+                        result="tp" if was_tp else "sl",
+                        profit=0,  # We don't have profit info from position drops
+                        C=C_for_log,
+                        status=status_for_log
+                    )
                 
         except Exception as e:
             print(f"[ERROR] _check_position_drops failed: {e}")

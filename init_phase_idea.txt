@@ -45,4 +45,12 @@ because we havent hit 3 complete pairs in group 1. So init can only be triggered
 The correct behaviour should've actually been at this stage that since C!=3 yet for the group 1 (so if a group doesn't have C ==3 yet then block init from happening and just focus on completed pairs from the other group hitting TP to continue the chain in the next group, only when C is 3 can init happen).
 No init, instead we wait till TP hits for the completed pairs. 
 If not, in scenarios like this we will be having 3 different groups and this breaks the logic we're trying to attain. 
-Before trying to implement, please explain to me to make sure you understand
+
+
+ INIT FOR Group N+1 can ONLY happen when Group N+1 has 3 completed pairs itself. 
+ Because when it has 3 completed pairs we can clarify and be assured which pair was incomplete do you get? 
+ so instead from the log example, what should've happened is B100 would've hit TP before B-2 and B-2 would've hit TP before B-1 so at B100 TP, we will create B101 and S102 at the price it hit TP and  at B-2  TP we create B102 and S103, then at B-1 TP we will create only B103 because C ==2  and we will now create INIT (B200, S201) there for the B99 incomplete pair that hit TP before. Since there's no other incomplete pair. do you get? it's almost like telling init, wait for C==3 then i will fire you at the price where C does become 3. 
+ 
+ this is the fallback we will use because price isn't one dimensional
+
+

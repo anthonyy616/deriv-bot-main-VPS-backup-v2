@@ -121,13 +121,19 @@ USER ID: {self.user_id}
 """)
     
     def log_tp_sl(self, symbol: str, pair_idx: int, direction: str, 
-                  result: str, profit: float = 0):
-        """Log TP or SL hit."""
+                  result: str, profit: float = 0, C: int = 0, status: str = ""):
+        """Log TP or SL hit with pair status for debugging."""
         self.start_session()
         result_type = "TP HIT" if result == "tp" else "SL HIT"
         profit_str = f"+${profit:.2f}" if profit > 0 else f"${profit:.2f}"
-        self._write(f"""[{self._timestamp()}] {result_type}
-  Symbol: {symbol}
+        
+        # Concise summary line for quick debugging
+        leg = "B" if direction.upper() == "BUY" else "S"
+        status_str = f", Status: {status}" if status else ""
+        self._write(f"[{self._timestamp()}] {result_type} for {leg}{pair_idx}, C={C}{status_str}\n")
+        
+        # Detailed breakdown
+        self._write(f"""  Symbol: {symbol}
   Pair: {pair_idx}
   Direction: {direction.upper()}
   Profit: {profit_str}
