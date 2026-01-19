@@ -58,11 +58,9 @@ db/schema.sql
 
 DEPLOYMENT.md
 
-<<<<<<< HEAD
 logs/
-=======
-logs/
->>>>>>> test
 
 new_features_and_fixes.md
 implement_new_strat.md.resolved
+
+later.txt

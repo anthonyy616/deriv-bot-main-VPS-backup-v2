@@ -850,6 +850,11 @@ class SymbolEngine:
         if not tick:
             return
         
+        # Variables for deferred INIT (to avoid deadlock by calling outside lock)
+        should_fire_init = False
+        deferred_group_id = 0
+        deferred_price = 0.0
+        
         async with self.execution_lock:
             group_id = self.current_group
             offset = self._get_pair_offset(group_id)
@@ -984,14 +989,18 @@ class SymbolEngine:
             
             await self.save_state()
             
-            # CHECK: If pending INIT and C just became 3, fire the queued INIT
+            # CHECK: If pending INIT and C just became 3, prepare to fire (outside lock)
             C_after = self._count_completed_pairs_for_group(group_id)
-            if self.pending_init and C_after >= 3:
+            should_fire_init = self.pending_init and C_after >= 3
+            if should_fire_init:
                 self.pending_init = False
-                new_group_id = group_id + 1
-                current_price = (tick.ask + tick.bid) / 2
-                print(f"[INIT-FIRED] Group {group_id} C={C_after} → Firing queued INIT for Group {new_group_id} at {current_price:.2f}")
-                await self._execute_group_init(new_group_id, current_price)
+                deferred_group_id = group_id + 1
+                deferred_price = (tick.ask + tick.bid) / 2
+                print(f"[INIT-FIRED] Group {group_id} C={C_after} → Firing queued INIT for Group {deferred_group_id} at {deferred_price:.2f}")
+        
+        # Fire INIT outside the lock to avoid deadlock
+        if should_fire_init:
+            await self._execute_group_init(deferred_group_id, deferred_price)
 
     async def _check_step_triggers(self, ask: float, bid: float):
         """
@@ -2349,12 +2358,18 @@ class SymbolEngine:
                         new_group_id = self.current_group + 1
                         C = self._count_completed_pairs_for_group(self.current_group)
                         
-                        if C >= 3:
-                            # Current group has C==3, can fire INIT
+                        # GROUP 0: Always fire INIT immediately (no C==3 requirement)
+                        # GROUPS 1+: Only fire if C >= 3, otherwise queue
+                        if self.current_group == 0:
+                            # Group 0 → Group 1: Fire immediately
+                            print(f"[TP-INCOMPLETE] pair={pair_idx} (Group 0) → Creating Group {new_group_id} at CMP={cmp:.2f}")
+                            await self._execute_group_init(new_group_id, cmp)
+                        elif C >= 3:
+                            # Groups 1+ with C==3: Fire INIT
                             print(f"[TP-INCOMPLETE] pair={pair_idx} C={C} → Creating Group {new_group_id} at CMP={cmp:.2f}")
                             await self._execute_group_init(new_group_id, cmp)
                         else:
-                            # C < 3, queue INIT for later
+                            # Groups 1+ with C < 3: Queue INIT for later
                             self.pending_init = True
                             print(f"[INIT-QUEUED] pair={pair_idx} C={C} < 3 → INIT queued, waiting for C==3")
                 else:
