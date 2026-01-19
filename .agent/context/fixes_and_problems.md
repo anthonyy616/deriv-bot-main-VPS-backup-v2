@@ -202,3 +202,29 @@ Now when expansion creates B99 for Group 1, it's explicitly tagged with `group_i
 - Group 1+ pairs can now expand correctly even when Group 0 has 3 completed pairs
 - Completed pairs hitting TP will close the survivor leg
 - Completed pairs hitting SL will keep the survivor open
+
+---
+
+### Non-Atomic Expansion Race Fix (2026-01-19 Session 4)
+
+**Root Cause Identified:**
+Atomic expansion (B102 + S103) and TP-driven expansion (S2 TP → B103) were racing.
+
+1. Atomic expansion places B102 + S103 (bumping real C to 3).
+2. TP-driven `COMP_EXPAND` (triggered by previous S2 TP) runs concurrently with stale C=2.
+3. Finds pair 103 as edge, sees C=2, executes non-atomic expansion (B103 only).
+4. Result: Double expansion (S103 then immediately B103).
+
+**Fix Applied:**
+Added a **C re-check** inside the non-atomic block of `_handle_completed_pair_expansion`:
+
+```python
+if C == 2:
+    current_C = self._count_completed_pairs_for_group(group_id)
+    if current_C >= 3:
+        return  # ABORT: Race detected!
+    # proceed with non-atomic expansion...
+```
+
+**Result:**
+If atomic expansion bumps C to 3 during the race, the non-atomic expansion will detect it and abort, preventing B103 from firing immediately.

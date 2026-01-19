@@ -948,6 +948,13 @@ class SymbolEngine:
                 print(f"[COMP-EXPAND] Bullish: CMP {cmp:.2f} > S{complete_idx} price {bullish_edge.sell_price:.2f}")
                 
                 if C == 2:
+                    # RE-CHECK C to prevent race condition:
+                    # If this expansion raced with another that just bumped C to 3, abort!
+                    current_C = self._count_completed_pairs_for_group(group_id)
+                    if current_C >= 3:
+                        print(f"[COMP-EXPAND] ABORT: Race detected! C was 2, now {current_C} >= 3")
+                        return
+
                     # NON-ATOMIC: Only complete the pair (B on the bullish edge)
                     print(f"[COMP-EXPAND] C==2 Non-atomic: B{complete_idx} only")
                     bullish_edge.trade_count = 1  # Lot index 1 (completing leg)
@@ -994,6 +1001,13 @@ class SymbolEngine:
                 print(f"[COMP-EXPAND] Bearish: CMP {cmp:.2f} < B{complete_idx} price {bearish_edge.buy_price:.2f}")
                 
                 if C == 2:
+                    # RE-CHECK C to prevent race condition:
+                    # If this expansion raced with another that just bumped C to 3, abort!
+                    current_C = self._count_completed_pairs_for_group(group_id)
+                    if current_C >= 3:
+                        print(f"[COMP-EXPAND] ABORT: Race detected! C was 2, now {current_C} >= 3")
+                        return
+
                     # NON-ATOMIC: Only complete the pair (S on the bearish edge)
                     print(f"[COMP-EXPAND] C==2 Non-atomic: S{complete_idx} only")
                     bearish_edge.trade_count = 1  # Lot index 1 (completing leg)
