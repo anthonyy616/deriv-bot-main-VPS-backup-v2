@@ -228,3 +228,219 @@ if C == 2:
 
 **Result:**
 If atomic expansion bumps C to 3 during the race, the non-atomic expansion will detect it and abort, preventing B103 from firing immediately.
+
+
+# Fixes and Problems Log
+
+## Session Date: 2026-01-21
+
+---
+
+## Fixes Implemented This Session
+
+### 1. Deterministic TP/SL Touch Flags
+
+**Problem:** TP/SL classification was unreliable - sometimes positions would close but the system couldn't determine if it was TP or SL.
+
+**Fix:** Implemented latching touch flags that are updated on every tick:
+```python
+def _update_tp_sl_touch_flags(self, ask: float, bid: float):
+    for ticket, info in self.ticket_map.items():
+        pair_idx, leg, _, tp_price, sl_price = info  # 5-tuple unpack
+        if leg == 'B':
+            if bid >= tp_price: flags['tp_touched'] = True
+            if bid <= sl_price: flags['sl_touched'] = True
+        else:  # SELL
+            if ask <= tp_price: flags['tp_touched'] = True
+            if ask >= sl_price: flags['sl_touched'] = True
+```
+
+**Location:** `_update_tp_sl_touch_flags()` called first in `_handle_running()`
+
+---
+
+### 2. MT5-Authoritative C Counting
+
+**Problem:** `_count_completed_pairs_for_group()` used in-memory `pair.buy_filled/sell_filled` which could be stale.
+
+**Fix:** Rewrote to use live MT5 positions + ticket_map:
+```python
+def _count_completed_pairs_for_group(self, group_id: int) -> int:
+    positions = mt5.positions_get(symbol=self.symbol)
+    pair_legs = defaultdict(set)
+    for pos in positions:
+        info = self.ticket_map.get(pos.ticket)
+        if info and len(info) >= 5:
+            pair_idx, leg, _, _, _ = info
+            pair_legs[pair_idx].add(leg)
+    # Count pairs with both legs in specified group
+    count = sum(1 for p_idx, legs in pair_legs.items()
+                if legs == {'B', 'S'} and self._get_group_from_pair(p_idx) == group_id)
+    return count
+```
+
+**Location:** `_count_completed_pairs_for_group()` and `_count_completed_pairs_open()`
+
+---
+
+### 3. Artificial TP Concept (Immediate Close + INIT)
+
+**Problem:** Bot was not transitioning to Group 1+. The system waited for incomplete pairs to naturally hit TP, which:
+- Could hit on the wrong edge (bearish incomplete when bullish expansion happened)
+- Could take forever if price moved away
+- Was unnecessarily complex
+
+**Fix:** When C==2 non-atomic fires (making C=3), **immediately**:
+1. Close the incomplete pair position
+2. Fire INIT for next group
+
+**Implementation:**
+```python
+# In _expand_bullish() and _expand_bearish():
+if C == 2:
+    event_price = pair.buy_price  # or sell_price for bearish
+    print(f"[NON-ATOMIC] C was 2, now 3 -> forcing artificial TP + INIT")
+    await self._force_artificial_tp_and_init(tick, event_price=event_price)
+    return
+```
+
+**Location:**
+- `_expand_bullish()` C==2 branch
+- `_expand_bearish()` C==2 branch
+- `_execute_tp_expansion()` C==2 branches
+
+---
+
+### 4. Completed/Incomplete Uses In-Memory State (Not MT5)
+
+**Problem:** When determining if a dropped position was from a completed or incomplete pair, the system checked MT5 positions for the other leg. But if one leg already closed via SL, the pair appeared "incomplete" even though it was completed.
+
+**Example:**
+1. Pair 101 had both B101 and S101 (completed)
+2. B101 hit SL first → closed
+3. S101 hit TP later → system saw only 1 leg in MT5 → marked "Incomplete"
+4. Routed as incomplete TP → no expansion fired
+
+**Fix:** Use in-memory pair state which remembers "ever filled":
+```python
+# In _check_position_drops():
+pair = self.pairs.get(pair_idx)
+was_completed = pair and pair.buy_filled and pair.sell_filled
+was_incomplete = not was_completed
+```
+
+**Key Insight:** `pair.buy_filled` and `pair.sell_filled` don't get reset when positions close. They remember the pair was once completed.
+
+**Location:** `_check_position_drops()` lines 2510-2514
+
+---
+
+### 5. Removed Pending Rollover Gate
+
+**Problem:** Earlier fix tried to use a `pending_group_rollover` gate to control when incomplete TPs could fire INIT. This was overly complex and failed when:
+- The incomplete TP hit on the wrong edge
+- Multiple incomplete pairs existed
+
+**Fix:** Removed the gate entirely. INIT is now ONLY triggered by the artificial TP mechanism (immediate close when C==2 non-atomic fires), never by natural incomplete TPs.
+
+**Location:** Removed `pending_group_rollover` flag and all related checks
+
+---
+
+### 6. Ticket Map 5-Tuple Validation
+
+**Problem:** Various methods had inconsistent tuple unpacking for ticket_map entries.
+
+**Fix:** Enforced canonical 5-tuple everywhere:
+```python
+# Canonical format:
+ticket_map[ticket] = (pair_idx, leg, entry_price, tp_price, sl_price)
+
+# Correct unpack:
+pair_idx, leg, entry_price, tp_price, sl_price = info
+
+# Or when only needing first elements:
+pair_idx, leg, _, _, _ = info
+```
+
+**Locations:** All methods that access ticket_map
+
+---
+
+## Previous Session Fixes (2026-01-19)
+
+### Group Tracking Per Pair
+- Added `group_id` field to GridPair dataclass
+- Updated `_get_group_from_pair()` to use stored group_id
+
+### Expansion Group Filtering
+- `_check_step_triggers()` filters by current_group
+- Uses stored `pair.buy_price/sell_price` for trigger levels
+
+### Group-Scoped C Gating
+- `_can_place_completing_leg()` uses group-specific C count
+
+### Non-Atomic Race Fix
+- C re-check inside non-atomic block prevents double expansion
+
+---
+
+## Architecture Summary
+
+### Tick Loop Order (Critical)
+```
+_handle_running():
+    1. _update_tp_sl_touch_flags(ask, bid)  # FIRST: latch crossings
+    2. _check_position_drops(ask, bid)       # SECOND: detect drops
+    3. _check_step_triggers(ask, bid)        # Expansion triggers
+    4. _enforce_hedge_invariants_gated()     # Hedge logic
+    5. _check_virtual_triggers(ask, bid)     # Toggle trading
+```
+
+### Position Drop Flow
+```
+Position closes in MT5
+    ↓
+_check_position_drops() detects missing ticket
+    ↓
+Read touch flags: tp_touched / sl_touched
+    ↓
+Determine was_completed from pair.buy_filled && pair.sell_filled
+    ↓
+Route:
+  - Completed pair TP → _execute_tp_expansion()
+  - Completed pair SL → cleanup only
+  - Incomplete pair TP/SL → cleanup only (no INIT here)
+```
+
+### Expansion Flow
+```
+Step trigger or TP drives expansion
+    ↓
+Check C for current group (MT5-authoritative)
+    ↓
+C < 2: Atomic expansion (B + S)
+C == 2: Non-atomic (completing leg only)
+    ↓
+If C == 2: _force_artificial_tp_and_init()
+    ↓
+1. Find incomplete pair in current group
+2. Close it
+3. Fire INIT for next group
+```
+
+---
+
+## Invariants (Must Always Hold)
+
+1. **Ticket map is 5-tuple:** `(pair_idx, leg, entry_price, tp_price, sl_price)`
+
+2. **C counting is MT5-authoritative:** Never use `pair.buy_filled/sell_filled` for C
+
+3. **Completed determination is in-memory:** Use `pair.buy_filled and pair.sell_filled` (remembers "ever filled")
+
+4. **INIT only via artificial TP:** Never trigger INIT from natural incomplete TP drops
+
+5. **Touch flags before drops:** `_update_tp_sl_touch_flags()` must run before `_check_position_drops()`
+
+6. **Group-scoped C:** All C checks use `_count_completed_pairs_for_group(group_id)`
