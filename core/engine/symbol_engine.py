@@ -416,8 +416,13 @@ class SymbolEngine:
         self.step1_triggered: bool = False
         self.step2_triggered: bool = False
         
-        # Ticket → (cycle_id, pair_index, leg) map for TP detection
+        # TICKET TRACKING FOR DETERMINISTIC TP/SL DETECTION
+        # Ticket → (pair_index, leg, entry_price, tp_price, sl_price) map
         self.ticket_map: Dict[int, tuple] = {}    # Runtime cache, persisted to DB
+
+        # TP/SL touch tracking: ticket -> {'tp_touched': bool, 'sl_touched': bool}
+        # Latched on every tick when price crosses TP/SL levels
+        self.ticket_touch_flags: Dict[int, Dict[str, bool]] = {}
         
     @property
     def config(self) -> Dict[str, Any]:
@@ -637,6 +642,46 @@ class SymbolEngine:
         if not pair:
             return False
         return pair.buy_filled != pair.sell_filled
+
+    def _update_tp_sl_touch_flags(self, ask: float, bid: float):
+        """
+        DETERMINISTIC TP/SL DETECTION: Latch touch flags based on real quote prices.
+        
+        Called on every tick to detect when TP/SL levels are crossed.
+        This removes timing sensitivity - we record the crossing when it happens,
+        not when we later notice the position disappeared.
+        """
+        for ticket, info in self.ticket_map.items():
+            if ticket not in self.ticket_touch_flags:
+                self.ticket_touch_flags[ticket] = {'tp_touched': False, 'sl_touched': False}
+            
+            flags = self.ticket_touch_flags[ticket]
+            
+            # Unpack ticket info: (pair_idx, leg, entry_price, tp_price, sl_price)
+            # Use safe unpacking to handle potential legacy tuples during migration
+            if len(info) >= 5:
+                _, leg, _, tp_price, sl_price = info
+            else:
+                # Legacy tuple fallback (shouldn't happen with clean db but safe to ignore)
+                continue
+                
+            if leg == 'B':  # BUY position
+                # BUY TP hit when bid >= tp_price
+                if not flags['tp_touched'] and bid >= tp_price:
+                    flags['tp_touched'] = True
+                
+                # BUY SL hit when bid <= sl_price
+                if not flags['sl_touched'] and bid <= sl_price:
+                    flags['sl_touched'] = True
+            
+            else:  # SELL position
+                # SELL TP hit when ask <= tp_price
+                if not flags['tp_touched'] and ask <= tp_price:
+                    flags['tp_touched'] = True
+                
+                # SELL SL hit when ask >= sl_price
+                if not flags['sl_touched'] and ask >= sl_price:
+                    flags['sl_touched'] = True
     
     def _count_completed_pairs_for_group(self, group_id: int) -> int:
         """Count completed pairs (C) for a specific group only."""
@@ -1976,6 +2021,14 @@ class SymbolEngine:
         - Monitor TP/SL for cycle rollover
         - Enforce hedge rules for COMPLETED pairs only
         """
+        # ================================================================
+        # [FIRST] Update TP/SL touch flags BEFORE position drop detection
+        # This latches the crossing event when it happens, not when we
+        # later notice the position disappeared. Critical for deterministic
+        # TP/SL classification.
+        # ================================================================
+        self._update_tp_sl_touch_flags(ask, bid)
+
         # Check for active positions
         positions = mt5.positions_get(symbol=self.symbol)
         active_count = len(positions) if positions else 0
@@ -2191,312 +2244,277 @@ class SymbolEngine:
     #     # Save immediately
     #     await self.save_state()
 
-    async def _check_tp_sl_from_history(self):
+    async def _force_artificial_tp_and_init(self, tick, event_price: float = None):
         """
-        GROUPS + 3-CAP SYSTEM: Detect TP/SL hits using ticket_map.
-        
-        On TP:
-        - Identify exact (cycle_id, pair_index, leg) from ticket_map
-        - Close opposing position (survivor)
-        - Decrement C (completed pairs count)
-        - Start NEW cycle: increment cycle_id, set anchor=TP price, fire INIT
-        
-        On SL:
-        - Same closure logic, but no new cycle (just cleanup)
+        ARTIFICIAL TP: Close incomplete pair and fire INIT when rollover condition met (C=3).
         """
-        try:
-            from_time = datetime.fromtimestamp(self.last_deal_check_time)
-            deals = mt5.history_deals_get(from_time, datetime.now(), symbol=self.symbol)
+        positions = mt5.positions_get(symbol=self.symbol)
+        
+        # Build map of pair_idx -> dict of leg->ticket for CURRENT GROUP
+        pair_legs_map = defaultdict(dict)
+        
+        if positions:
+            for pos in positions:
+                info = self.ticket_map.get(pos.ticket)
+                if info and len(info) >= 2:
+                    pair_idx = info[0]
+                    leg = info[1]
+                    if self._get_group_from_pair(pair_idx) == self.current_group:
+                        pair_legs_map[pair_idx][leg] = pos.ticket
+
+        # Find incomplete pair (exactly 1 leg open)
+        incomplete_ticket = None
+        incomplete_pair_idx = None
+        
+        for p_idx, legs_dict in pair_legs_map.items():
+            if len(legs_dict) == 1:
+                incomplete_pair_idx = p_idx
+                # Get the only ticket
+                incomplete_ticket = list(legs_dict.values())[0]
+                break
+        
+        if incomplete_ticket:
+            print(f"[ARTIFICIAL-TP] Closing incomplete pair {incomplete_pair_idx} ticket={incomplete_ticket}")
+            self._close_position(incomplete_ticket)
             
-            if not deals:
-                return
+            # Cleanup
+            if incomplete_ticket in self.ticket_map:
+                del self.ticket_map[incomplete_ticket]
+            if incomplete_ticket in self.ticket_touch_flags:
+                del self.ticket_touch_flags[incomplete_ticket]
+            await self.repository.delete_ticket(incomplete_ticket)
+        else:
+            print(f"[ARTIFICIAL-TP] No incomplete pair found in Group {self.current_group}")
+
+        # Fire INIT
+        init_price = event_price if event_price is not None else (tick.ask + tick.bid)/2
+        print(f"[ARTIFICIAL-TP] Firing INIT for Group {self.current_group + 1} at {init_price:.2f}")
+        await self._execute_group_init(self.current_group + 1, init_price)
+
+    async def _execute_tp_expansion(self, group_id: int, event_price: float, is_bullish: bool, C: int):
+        """
+        TP-DRIVEN ATOMIC EXPANSION for active group completed pair TP.
+        """
+        tick = mt5.symbol_info_tick(self.symbol)
+        if not tick: return
+
+        # Find edge incomplete pairs for this group
+        group_pairs = {idx: pair for idx, pair in self.pairs.items()
+                       if self._get_group_from_pair(idx) == group_id}
+        if not group_pairs: return
+        sorted_indices = sorted(group_pairs.keys())
+
+        if is_bullish:
+            # Bullish: Buy leg hit TP -> Expand UP
+            bullish_edge = None
+            for idx in reversed(sorted_indices):
+                pair = group_pairs[idx]
+                if pair.sell_filled and not pair.buy_filled:
+                     bullish_edge = pair
+                     break
             
-            # Debug: log all deals found and their reasons
-            tp_sl_deals = [d for d in deals if d.reason in (mt5.DEAL_REASON_TP, mt5.DEAL_REASON_SL)]
-            if tp_sl_deals:
-                print(f"[DEBUG TP] Found {len(tp_sl_deals)} TP/SL deals: {[(d.ticket, d.reason, d.position_id) for d in tp_sl_deals]}")
+            if not bullish_edge: return
             
-            for deal in deals:
-                if deal.symbol != self.symbol:
-                    continue
-                
-                if deal.ticket in self.processed_deals:
-                    continue
-                
-                # Only process TP/SL closes
-                if deal.reason == mt5.DEAL_REASON_TP:
-                    reason = "TP"
-                elif deal.reason == mt5.DEAL_REASON_SL:
-                    reason = "SL"
+            complete_idx = bullish_edge.index
+            seed_idx = complete_idx + 1
+            
+            if C == 2:
+                 print(f"[TP-EXPAND] C==2: B{complete_idx} only (Artificial TP next)")
+                 await self._place_single_leg_tp("buy", tick.ask, complete_idx)
+                 # Artificial TP triggers INIT
+                 await self._force_artificial_tp_and_init(tick, event_price=event_price)
+            else:
+                 print(f"[TP-EXPAND] Atomic: B{complete_idx} + S{seed_idx}")
+                 await self._place_atomic_bullish_tp(event_price, complete_idx, seed_idx)
+        else:
+            # Bearish: Sell leg hit TP -> Expand DOWN
+            bearish_edge = None
+            for idx in sorted_indices:
+                pair = group_pairs[idx]
+                if pair.buy_filled and not pair.sell_filled:
+                    bearish_edge = pair
+                    break
+            
+            if not bearish_edge: return
+            
+            complete_idx = bearish_edge.index
+            seed_idx = complete_idx - 1
+            
+            if C == 2:
+                 print(f"[TP-EXPAND] C==2: S{complete_idx} only (Artificial TP next)")
+                 await self._place_single_leg_tp("sell", tick.bid, complete_idx)
+                 await self._force_artificial_tp_and_init(tick, event_price=event_price)
+            else:
+                 print(f"[TP-EXPAND] Atomic: S{complete_idx} + B{seed_idx}")
+                 await self._place_atomic_bearish_tp(event_price, complete_idx, seed_idx)
+
+    async def _place_single_leg_tp(self, direction: str, price: float, pair_idx: int):
+        async with self.execution_lock:
+            pair = self.pairs.get(pair_idx)
+            if not pair: return 
+            pair.trade_count = 1
+            ticket = await self._execute_market_order(direction, price, pair_idx, reason="TP_EXPAND")
+            if ticket:
+                if direction == "buy":
+                    pair.buy_filled = True
+                    pair.buy_ticket = ticket
                 else:
-                    continue
-                
-                # USE TICKET_MAP for accurate identification
-                info = self.ticket_map.get(deal.position_id)
-                if not info:
-                    # Fallback: try parsing comment
-                    # Format: G=<cycle>;P=<pair>;L=<leg>;TC=<count>
-                    print(f"[{reason}] Position {deal.position_id} not in ticket_map, skipping cycle logic")
-                    continue
-                
-                tp_cycle, pair_idx, tp_leg = info
-                pair = self.pairs.get(pair_idx)
-                
-                # Mark as processed
-                self.processed_deals.append(deal.ticket)
-                
-                print(f"[{reason}] cycle={tp_cycle} pair={pair_idx} leg={tp_leg} price={deal.price:.2f}")
-                
-                # Clean up ticket from map
-                del self.ticket_map[deal.position_id]
-                await self.repository.delete_ticket(deal.position_id)
-                
-                if not pair:
-                    print(f"[WARNING] Pair {pair_idx} not in memory for {reason} event")
-                    continue
-                
-                # Close hedge if active
-                if pair.hedge_active and pair.hedge_ticket:
-                    print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
-                    self._close_position(pair.hedge_ticket)
-                
-                # SURVIVOR LEG PRESERVATION: Do NOT close the survivor leg
-                # The survivor stays open and will eventually hit its own TP/SL
-                # if tp_leg == 'B':
-                #     survivor_ticket = pair.sell_ticket
-                #     survivor_leg = 'S'
-                # else:
-                #     survivor_ticket = pair.buy_ticket
-                #     survivor_leg = 'B'
-                # 
-                # if survivor_ticket and survivor_ticket > 0:
-                #     print(f"   [CLEANUP] Closing survivor {survivor_leg} ticket={survivor_ticket}")
-                #     self._close_position(survivor_ticket)
-                #     
-                #     # Clean survivor from ticket_map
-                #     if survivor_ticket in self.ticket_map:
-                #         del self.ticket_map[survivor_ticket]
-                #         await self.repository.delete_ticket(survivor_ticket)
-                
-                # ================================================================
-                # TP-DRIVEN MULTI-GROUP SYSTEM
-                # ================================================================
-                if reason == "TP":
-                    # Check if THIS SPECIFIC pair is incomplete (only one leg filled)
-                    is_incomplete_tp = self._is_pair_incomplete(pair_idx)
-                    
-                    print(f"[TP] pair={pair_idx} is_incomplete={is_incomplete_tp}")
-                    
-                    if is_incomplete_tp:
-                        # INCOMPLETE PAIR TP → CREATE NEW GROUP
-                        new_group_id = self.current_group + 1
-                        print(f"[TP-INCOMPLETE] pair={pair_idx} → Creating Group {new_group_id}")
-                        await self._execute_group_init(new_group_id, deal.price)
-                    else:
-                        # COMPLETED PAIR TP → EXPAND CURRENT/NEW GROUP
-                        # Determine direction from which leg hit TP
-                        is_bullish = (tp_leg == 'B')  # Buy TP = price went up
-                        
-                        # Use current group for expansion
-                        group_id = self.current_group
-                        C = self._count_completed_pairs_for_group(group_id)
-                        
-                        print(f"[TP-COMPLETE] pair={pair_idx} leg={tp_leg} → Expand Group {group_id} (C={C})")
-                        
-                        await self._execute_tp_expansion(group_id, deal.price, is_bullish, C)
-                
-                # NOTE: Phoenix reset removed - pairs are no longer recycled
-                
-                # Save state immediately
-                await self.save_state()
-                
-                # Log to session
-                if self.session_logger:
-                    # Get C from current group for logging
-                    C_for_log = self._count_completed_pairs_for_group(self.current_group)
-                    status_for_log = "Incomplete" if self._is_pair_incomplete(pair_idx) else "Complete"
-                    self.session_logger.log_tp_sl(
-                        symbol=self.symbol,
-                        pair_idx=pair_idx,
-                        direction="BUY" if tp_leg == 'B' else "SELL",
-                        result="tp" if reason == "TP" else "sl",
-                        profit=deal.profit,
-                        C=C_for_log,
-                        status=status_for_log
-                    )
+                    pair.sell_filled = True
+                    pair.sell_ticket = ticket
+                pair.advance_toggle()
             
-            self.last_deal_check_time = time.time()
+    async def _place_atomic_bullish_tp(self, price: float, b_idx: int, s_idx: int):
+        async with self.execution_lock:
+            # B(n) at market
+            tick = mt5.symbol_info_tick(self.symbol)
+            pair_b = self.pairs.get(b_idx)
+            if pair_b:
+                 pair_b.trade_count = 1
+                 ticket = await self._execute_market_order("buy", tick.ask, b_idx, reason="TP_EXPAND")
+                 if ticket:
+                     pair_b.buy_filled = True
+                     pair_b.buy_ticket = ticket
+                     pair_b.advance_toggle()
             
-        except Exception as e:
-            print(f"[ERROR] _check_tp_sl_from_history failed: {e}")
-            import traceback
-            traceback.print_exc()
+            # S(n+1) seeded at TP levels
+            seed_pair = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
+            seed_pair.next_action = "sell"
+            seed_pair.trade_count = 0
+            seed_pair.group_id = self.current_group
+            self.pairs[s_idx] = seed_pair
+            
+            ticket_s = await self._execute_market_order("sell", tick.bid, s_idx, reason="TP_EXPAND")
+            if ticket_s:
+                seed_pair.sell_filled = True
+                seed_pair.sell_ticket = ticket_s
+                seed_pair.advance_toggle()
+
+    async def _place_atomic_bearish_tp(self, price: float, s_idx: int, b_idx: int):
+        async with self.execution_lock:
+            # S(n) at market
+            tick = mt5.symbol_info_tick(self.symbol)
+            pair_s = self.pairs.get(s_idx)
+            if pair_s:
+                 pair_s.trade_count = 1
+                 ticket = await self._execute_market_order("sell", tick.bid, s_idx, reason="TP_EXPAND")
+                 if ticket:
+                     pair_s.sell_filled = True
+                     pair_s.sell_ticket = ticket
+                     pair_s.advance_toggle()
+            
+            # B(n-1) seeded at TP levels
+            seed_pair = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
+            seed_pair.next_action = "buy"
+            seed_pair.trade_count = 0
+            seed_pair.group_id = self.current_group
+            self.pairs[b_idx] = seed_pair
+            
+            ticket_b = await self._execute_market_order("buy", tick.ask, b_idx, reason="TP_EXPAND")
+            if ticket_b:
+                seed_pair.buy_filled = True
+                seed_pair.buy_ticket = ticket_b
+                seed_pair.advance_toggle()
+
+    async def _handle_completed_pair_expansion(self, event_price: float, is_bullish: bool):
+        """
+        Handle expansion in active group driven by prior group TP.
+        This simply routes the event to check expansion conditions for the ACTIVE group.
+        """
+        group_id = self.current_group
+        C = self._count_completed_pairs_for_group(group_id)
+        if C >= 3: 
+             # Already full, no expansion needed
+             return
+
+        print(f"[PRIOR-TP-DRIVER] Driving Active Group {group_id} Check (C={C})")
+        # Reuse the main expansion logic
+        await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
+
 
     async def _check_position_drops(self, ask: float, bid: float):
         """
-        POSITION DROP DETECTION: Detect closed positions by comparing ticket_map against MT5 positions.
-        
-        For incomplete pairs (one leg only):
-        - Infer TP/SL using Current Market Price (CMP) vs entry price
-        - Buy: CMP > entry → TP, else SL
-        - Sell: CMP < entry → TP, else SL
-        - TP → Create new group INIT
-        
-        For completed pairs:
-        - Just continue strategy (no TP/SL distinction needed since configs are equal)
+        POSITION DROP DETECTION: Detect closed positions and classify TP/SL.
+        Uses Self.ticket_touch_flags (latched from ticks) for deterministic classification.
+        NO LONGER USES CMP.
         """
         try:
-            # Get current MT5 positions
             positions = mt5.positions_get(symbol=self.symbol)
             current_tickets = set(pos.ticket for pos in positions) if positions else set()
             
-            # Find dropped tickets (in ticket_map but no longer in MT5)
             tracked_tickets = set(self.ticket_map.keys())
             dropped_tickets = tracked_tickets - current_tickets
             
             if not dropped_tickets:
                 return
             
-            # Current market price for TP/SL inference
-            cmp = (ask + bid) / 2  # Midpoint as reference
-            
             for ticket in dropped_tickets:
                 info = self.ticket_map.get(ticket)
-                if not info:
-                    continue
+                if not info: continue
+                # (pair_idx, leg, entry_price, tp_price, sl_price)
+                if len(info) < 5: 
+                    # Legacy fallback or error
+                     print(f"[DROP] Legacy info format for {ticket}, skipping")
+                     continue
                 
-                cycle_id, pair_idx, leg = info
+                pair_idx, leg, entry_price, tp_price, sl_price = info
                 pair = self.pairs.get(pair_idx)
                 
-                if not pair:
-                    # Clean up orphan ticket
-                    del self.ticket_map[ticket]
-                    await self.repository.delete_ticket(ticket)
-                    continue
+                # Retrieve latched flags
+                flags = self.ticket_touch_flags.get(ticket, {'tp_touched': False, 'sl_touched': False})
+                is_tp = flags['tp_touched']
+                is_sl = flags['sl_touched']
                 
-                # Determine if this was an incomplete or completed pair
-                was_incomplete = not (pair.buy_filled and pair.sell_filled)
+                # Default to TP if unknown (legacy heuristic removed, fail safe to TP usually better for flow)
+                if not is_tp and not is_sl:
+                    print(f"[WARNING] Drop {ticket} without touch flags! Defaulting to TP.")
+                    is_tp = True
                 
-                # Get entry price for this leg
-                if leg == 'B':
-                    entry_price = pair.buy_price
-                else:
-                    entry_price = pair.sell_price
+                reason = "TP" if is_tp else "SL"
+                event_price = tp_price if is_tp else sl_price
                 
-                # ============================================================
-                # TP HIT LOGGING: Display pair status for all TP/SL events
-                # ============================================================
-                pair_status = "INCOMPLETE" if was_incomplete else "COMPLETE"
-                group_id = self._get_group_from_pair(pair_idx)
-                print(f"[TP-LOG] ======================================")
-                print(f"[TP-LOG] Pair={pair_idx} (Group {group_id}) | Leg={leg} | Status={pair_status}")
-                print(f"[TP-LOG] buy_filled={pair.buy_filled}, sell_filled={pair.sell_filled}")
-                print(f"[TP-LOG] Entry={entry_price:.2f} | CMP={cmp:.2f}")
-                print(f"[TP-LOG] ======================================")
+                print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f}")
                 
-                # Infer TP or SL based on CMP vs entry_price
-                if was_incomplete:
-                    # INCOMPLETE PAIR: Must determine TP vs SL
-                    if leg == 'B':  # Buy position closed
-                        is_tp = cmp > entry_price
-                    else:  # Sell position closed
-                        is_tp = cmp < entry_price
-                    
-                    reason = "TP" if is_tp else "SL"
-                    print(f"[DROP-INCOMPLETE] pair={pair_idx} leg={leg} entry={entry_price:.2f} CMP={cmp:.2f} → {reason}")
-                    
+                if pair:
+                    # Check was_incomplete using current pair state (before update)
+                    was_incomplete = not (pair.buy_filled and pair.sell_filled)
+                    group_id = self._get_group_from_pair(pair_idx)
+
                     if is_tp:
-                        # INCOMPLETE PAIR TP → Check if we can create new group
-                        new_group_id = self.current_group + 1
-                        C = self._count_completed_pairs_for_group(self.current_group)
-                        
-                        # GROUP 0: Always fire INIT immediately (no C==3 requirement)
-                        # GROUPS 1+: Only fire if C >= 3, otherwise queue
-                        if self.current_group == 0:
-                            # Group 0 → Group 1: Fire immediately
-                            print(f"[TP-INCOMPLETE] pair={pair_idx} (Group 0) → Creating Group {new_group_id} at CMP={cmp:.2f}")
-                            await self._execute_group_init(new_group_id, cmp)
-                        elif C >= 3:
-                            # Groups 1+ with C==3: Fire INIT
-                            print(f"[TP-INCOMPLETE] pair={pair_idx} C={C} → Creating Group {new_group_id} at CMP={cmp:.2f}")
-                            await self._execute_group_init(new_group_id, cmp)
+                        if was_incomplete:
+                             # Incomplete Pair TP -> New Group
+                             new_group = self.current_group + 1
+                             print(f"[TP-INCOMPLETE] Pair {pair_idx} TP -> Firing INIT Group {new_group}")
+                             await self._execute_group_init(new_group, event_price)
                         else:
-                            # Groups 1+ with C < 3: Queue INIT for later
-                            self.pending_init = True
-                            print(f"[INIT-QUEUED] pair={pair_idx} C={C} < 3 → INIT queued, waiting for C==3")
-                else:
-                    # COMPLETED PAIR: Determine TP vs SL and handle appropriately
-                    if leg == 'B':  # Buy position closed
-                        is_tp = cmp > entry_price
-                    else:  # Sell position closed
-                        is_tp = cmp < entry_price
+                             # Completed Pair TP
+                             if group_id == self.current_group:
+                                 C = self._count_completed_pairs_for_group(group_id)
+                                 is_bullish = (leg == 'B') 
+                                 print(f"[TP-COMPLETE] Active Group {group_id} TP -> Expansion (C={C})")
+                                 await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
+                             elif group_id < self.current_group:
+                                 print(f"[TP-COMPLETE] Prior Group {group_id} TP -> Handle Completed Check")
+                                 await self._handle_completed_pair_expansion(event_price, is_bullish)
                     
-                    reason = "TP" if is_tp else "SL"
-                    print(f"[DROP-COMPLETE] pair={pair_idx} leg={leg} entry={entry_price:.2f} CMP={cmp:.2f} → {reason}")
-                    
-                    # NUCLEAR RESET: Only on TP hits, close survivor leg
-                    if is_tp:
-                        print(f"[NUCLEAR-RESET] Completed pair {pair_idx} {leg} hit TP → Closing survivor")
-                        if leg == 'B' and pair.sell_ticket and pair.sell_ticket > 0:
-                            print(f"   [NUCLEAR] Closing survivor S ticket={pair.sell_ticket}")
-                            self._close_position(pair.sell_ticket)
-                            if pair.sell_ticket in self.ticket_map:
-                                del self.ticket_map[pair.sell_ticket]
-                                await self.repository.delete_ticket(pair.sell_ticket)
-                        elif leg == 'S' and pair.buy_ticket and pair.buy_ticket > 0:
-                            print(f"   [NUCLEAR] Closing survivor B ticket={pair.buy_ticket}")
-                            self._close_position(pair.buy_ticket)
-                            if pair.buy_ticket in self.ticket_map:
-                                del self.ticket_map[pair.buy_ticket]
-                                await self.repository.delete_ticket(pair.buy_ticket)
-                    else:
-                        # SL hit: Keep survivor open - it will eventually hit its own TP/SL
-                        print(f"[NO-NUCLEAR] Completed pair {pair_idx} {leg} hit SL → Survivor stays open")
-                    
-                    # Trigger expansion in active group if applicable
-                    if self.current_group > 0:
-                        await self._handle_completed_pair_expansion(cmp)
-                
-                # Clean up ticket from map
-                del self.ticket_map[ticket]
+                    # Close hedge if active
+                    if pair.hedge_active and pair.hedge_ticket:
+                         print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
+                         self._close_position(pair.hedge_ticket)
+
+                    # Update pair flags? 
+                    # Usually we don't update pair.filled until _update_fill_status logic runs?
+                    # Or we should update it here to prevent stale state?
+                    # Reset triggers usually handle state clearing. For now, trust standard flow.
+
+                # Cleanup
+                if ticket in self.ticket_map: del self.ticket_map[ticket]
+                if ticket in self.ticket_touch_flags: del self.ticket_touch_flags[ticket]
                 await self.repository.delete_ticket(ticket)
-                
-                # Close hedge if active
-                if pair.hedge_active and pair.hedge_ticket:
-                    print(f"   [HEDGE] Closing hedge {pair.hedge_ticket}")
-                    self._close_position(pair.hedge_ticket)
-                
-                # NOTE: Phoenix reset removed - pairs are no longer recycled
-                
-                # Save state
+                     
                 await self.save_state()
-                
-                # Log to session file
-                if self.session_logger:
-                    C_for_log = self._count_completed_pairs_for_group(self.current_group)
-                    status_for_log = "Incomplete" if was_incomplete else "Complete"
-                    # Determine if it was TP or SL for logging
-                    if was_incomplete:
-                        if leg == 'B':
-                            was_tp = cmp > entry_price
-                        else:
-                            was_tp = cmp < entry_price
-                    else:
-                        # For completed pairs, we don't track TP/SL distinction as clearly
-                        was_tp = True  # Assume TP for logging purposes
-                    
-                    self.session_logger.log_tp_sl(
-                        symbol=self.symbol,
-                        pair_idx=pair_idx,
-                        direction="BUY" if leg == 'B' else "SELL",
-                        result="tp" if was_tp else "sl",
-                        profit=0,  # We don't have profit info from position drops
-                        C=C_for_log,
-                        status=status_for_log
-                    )
-                
+
         except Exception as e:
-            print(f"[ERROR] _check_position_drops failed: {e}")
+            print(f"[ERROR] _check_position_drops: {e}")
             import traceback
             traceback.print_exc()
 
@@ -4007,9 +4025,10 @@ class SymbolEngine:
                 position_ticket = result.order
                 print(f"[WARNING] Could not find new position, using order ticket: {position_ticket}")
             
-            # TICKET MAPPING: Store POSITION ticket for TP detection
-            self.ticket_map[position_ticket] = (self.cycle_id, index, leg)
-            await self.repository.save_ticket(position_ticket, self.cycle_id, index, leg, trade_count)
+            # TICKET MAPPING: Store POSITION ticket with TP/SL levels for deterministic detection
+            self.ticket_map[position_ticket] = (index, leg, exec_price, tp, sl)
+            await self.repository.save_ticket(position_ticket, self.cycle_id, index, leg, trade_count,
+                                              entry_price=exec_price, tp_price=tp, sl_price=sl)
             
             print(f"[TICKET_MAP] pos={position_ticket} -> (cycle={self.cycle_id}, pair={index}, leg={leg})")
             
