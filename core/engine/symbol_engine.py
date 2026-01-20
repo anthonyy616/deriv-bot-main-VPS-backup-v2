@@ -2507,10 +2507,10 @@ class SymbolEngine:
                     await self.repository.delete_ticket(ticket)
                     continue
 
-                # Authoritative completed/incomplete:
-                # If the opposite leg is still open AFTER the drop, then before the drop it was a completed pair.
-                other_leg = "S" if leg == "B" else "B"
-                was_completed = other_leg in pair_legs_open.get(pair_idx, set())
+                # Determine completed/incomplete using IN-MEMORY pair state (not MT5 positions).
+                # This remembers "ever filled" even if one leg already closed via SL.
+                pair = self.pairs.get(pair_idx)
+                was_completed = pair and pair.buy_filled and pair.sell_filled
                 was_incomplete = not was_completed
 
                 print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f} "
