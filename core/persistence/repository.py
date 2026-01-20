@@ -134,35 +134,39 @@ class Repository:
     # TICKET MAP (Groups + 3-Cap Strategy)
     # ========================================================================
 
-    async def save_ticket(self, ticket: int, cycle_id: int, pair_index: int, 
-                          leg: str, trade_count: int = 0):
-        """Save ticket → (cycle, pair, leg) mapping for TP detection."""
+    async def save_ticket(self, ticket: int, cycle_id: int, pair_index: int,
+                          leg: str, trade_count: int = 0,
+                          entry_price: float = 0.0, tp_price: float = 0.0, sl_price: float = 0.0):
+        """Save ticket → (pair, leg, prices) mapping for deterministic TP/SL detection."""
         await self.db.execute(
             """
-            INSERT INTO ticket_map (ticket, symbol, cycle_id, pair_index, leg, trade_count)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO ticket_map (ticket, symbol, cycle_id, pair_index, leg, trade_count, entry_price, tp_price, sl_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ticket) DO UPDATE SET
                 cycle_id=excluded.cycle_id,
                 pair_index=excluded.pair_index,
                 leg=excluded.leg,
-                trade_count=excluded.trade_count
+                trade_count=excluded.trade_count,
+                entry_price=excluded.entry_price,
+                tp_price=excluded.tp_price,
+                sl_price=excluded.sl_price
             """,
-            (ticket, self.symbol, cycle_id, pair_index, leg, trade_count)
+            (ticket, self.symbol, cycle_id, pair_index, leg, trade_count, entry_price, tp_price, sl_price)
         )
         await self.db.commit()
 
-    async def get_ticket_map(self) -> Dict[int, Tuple[int, int, str]]:
+    async def get_ticket_map(self) -> Dict[int, Tuple[int, str, float, float, float]]:
         """Load all ticket mappings for this symbol.
-        
+
         Returns:
-            Dict[ticket, (cycle_id, pair_index, leg)]
+            Dict[ticket, (pair_index, leg, entry_price, tp_price, sl_price)]
         """
         async with self.db.execute(
-            "SELECT ticket, cycle_id, pair_index, leg FROM ticket_map WHERE symbol = ?",
+            "SELECT ticket, pair_index, leg, entry_price, tp_price, sl_price FROM ticket_map WHERE symbol = ?",
             (self.symbol,)
         ) as cursor:
             rows = await cursor.fetchall()
-            return {row['ticket']: (row['cycle_id'], row['pair_index'], row['leg']) for row in rows}
+            return {row['ticket']: (row['pair_index'], row['leg'], row['entry_price'], row['tp_price'], row['sl_price']) for row in rows}
 
     async def delete_ticket(self, ticket: int):
         """Remove a ticket from the map (on position close)."""
