@@ -3291,9 +3291,12 @@ class SymbolEngine:
         tolerance = self.spread * 0.1  # 10% of spread, or use fixed 5.0 points
         
         for idx, pair in sorted_items:
-            # GROUPS+CAP GATE: Only process COMPLETED pairs (both B+S exist)
+            # GROUPS+CAP GATE: Only process pairs that have EVER been completed
+            # (both buy_filled and sell_filled are True at some point)
             # Expansion is handled by step triggers, this is only for toggle trading
-            if not self._is_pair_completed(idx):
+            # NOTE: Using pair state (buy_filled/sell_filled) instead of live MT5 positions
+            # because toggle re-entry should work even after one leg hits TP/SL
+            if not (pair.buy_filled and pair.sell_filled):
                 continue
             
             # Validation: Ensure spread consistency

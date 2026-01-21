@@ -10,6 +10,47 @@ from pathlib import Path
 LOG_DIR = Path(__file__).parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
+# --- Terminal Redirection (Capture Everything) ---
+class Tee:
+    def __init__(self, original_stream, log_file):
+        self.original_stream = original_stream
+        self.log_file = log_file
+
+    def write(self, data):
+        try:
+            self.original_stream.write(data)
+            self.log_file.write(data)
+            self.log_file.flush()
+            self.original_stream.flush()
+        except Exception:
+            pass # Prevent recursion or errors during write
+
+    def flush(self):
+        try:
+            self.original_stream.flush()
+            self.log_file.flush()
+        except Exception:
+            pass
+            
+    def isatty(self):
+        try:
+            return self.original_stream.isatty()
+        except AttributeError:
+            return False
+            
+    def __getattr__(self, name):
+        return getattr(self.original_stream, name)
+
+# Redirect stdout and stderr to file
+terminal_log_path = LOG_DIR / "terminal_output.log"
+try:
+    terminal_file = open(terminal_log_path, "a", encoding="utf-8")
+    sys.stdout = Tee(sys.stdout, terminal_file)
+    sys.stderr = Tee(sys.stderr, terminal_file)
+    print(f"[SYSTEM] Standard Output & Error redirected to {terminal_log_path}")
+except Exception as e:
+    print(f"[SYSTEM] Failed to redirect terminal output: {e}")
+
 # Configure root logger
 logging.basicConfig(
     level=logging.INFO,

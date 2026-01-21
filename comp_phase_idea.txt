@@ -63,3 +63,42 @@ Cosmetic fix for accuracy and to minimize degradation and risk minimization of i
 It was correctly implemented. 
 But i think this current version might slightly degrade overtime because the design of this system is meant to be when the non-atomic leg fires, we are meant to be placing init too by design of how it will be configured. 
 The TP of this system is always configured to 3x the grid distance value. As you can see i have been testing with spread 30 and TP 90. this has always been consistent. But now, I want to introduce something new - artificial Take Profits to execute init. You know when C=2 we fire non-atomically, well after doing that we then check IF the incomplete pair has hit TP (or if it's still open) - anyone that's easier to judge, then if it's true (i.e. incomplete pair still open ) we will then close the incomplete pair ourselves and ASSUME the incomplete pair has hit TP so that init fires almost at the same price as the non-atomic pair because once a position drop is detected for that incomplete pair and we run the check it will always return true so we will create init. So it's like an artificial TP hit for to make sure that the grid is consistent and we always init because 
+
+
+
+
+
+To fix race condition
+
+
+
+
+expand logic (both bullish and bearish)
+
+    lock here 
+
+        if group_id==0:
+            C= self._count_completed_pairs_for_group(self.current_group)
+
+            if C !=2;
+                EXPAND Normally using grid distance and execute atomically
+
+            if C==2:
+                EXPAND Normally, execute non-atomic leg, then force the artificial TP to close the incomplete pair for group 1 -> then update C =3 and fire init for the next grop i.e. 1
+
+
+        else
+        
+            group_id=self.current_group
+            C=self._count_completed_pairs_for_group(group_id)
+
+            if C !=2;
+                EXPAND ONLY due to TP hit and execute atomically
+
+            if C==2:
+                execute non-atomic leg, then force the artificial TP to close the incomplete pair for group _id -> then update C =3 and fire init for the next grpup
+
+                
+
+
+
