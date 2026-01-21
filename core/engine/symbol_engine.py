@@ -708,82 +708,82 @@ class SymbolEngine:
             print(f"[GROUP_INIT] {self.symbol}: No tick data, cannot init")
             return
 
-        async with self.execution_lock:
-            offset = self._get_pair_offset(group_id)
-            b_idx = offset
-            s_idx = offset + 1
+        #async with self.execution_lock:
+        offset = self._get_pair_offset(group_id)
+        b_idx = offset
+        s_idx = offset + 1
 
-            print(f"[GROUP_INIT] group={group_id} anchor={anchor_price:.2f} B{b_idx}+S{s_idx}")
+        print(f"[GROUP_INIT] group={group_id} anchor={anchor_price:.2f} B{b_idx}+S{s_idx}")
 
-            # --- Build pairs using the ANCHOR as reference (deterministic) ---
-            b_price = float(anchor_price)  # was tick.ask
-            pair_b = GridPair(index=b_idx, buy_price=b_price, sell_price=b_price - self.spread)
-            pair_b.next_action = "buy"
-            pair_b.trade_count = 0
-            pair_b.group_id = group_id
-            self.pairs[b_idx] = pair_b
+        # --- Build pairs using the ANCHOR as reference (deterministic) ---
+        b_price = float(anchor_price)  # was tick.ask
+        pair_b = GridPair(index=b_idx, buy_price=b_price, sell_price=b_price - self.spread)
+        pair_b.next_action = "buy"
+        pair_b.trade_count = 0
+        pair_b.group_id = group_id
+        self.pairs[b_idx] = pair_b
 
-            ticket_b = await self._execute_market_order("buy", b_price, b_idx, reason="INIT")
-            if not ticket_b:
-                print(f"[GROUP_INIT] B{b_idx} FAILED")
-                # rollback pair object
-                self.pairs.pop(b_idx, None)
-                return
+        ticket_b = await self._execute_market_order("buy", b_price, b_idx, reason="INIT")
+        if not ticket_b:
+            print(f"[GROUP_INIT] B{b_idx} FAILED")
+            # rollback pair object
+            self.pairs.pop(b_idx, None)
+            return
 
-            pair_b.buy_filled = True
-            pair_b.buy_ticket = ticket_b
-            # sticky ever-opened (if field exists)
-            if hasattr(pair_b, "buy_ever_opened"):
-                pair_b.buy_ever_opened = True
-            pair_b.advance_toggle()
-            print(f"[GROUP_INIT] B{b_idx} placed, ticket={ticket_b}")
+        pair_b.buy_filled = True
+        pair_b.buy_ticket = ticket_b
+        # sticky ever-opened (if field exists)
+        if hasattr(pair_b, "buy_ever_opened"):
+            pair_b.buy_ever_opened = True
+        pair_b.advance_toggle()
+        print(f"[GROUP_INIT] B{b_idx} placed, ticket={ticket_b}")
 
-            # S(offset+1) is seeded at B price (your convention)
-            s_price = b_price
-            pair_s = GridPair(index=s_idx, buy_price=b_price + self.spread, sell_price=s_price)
-            pair_s.next_action = "sell"
-            pair_s.trade_count = 0
-            pair_s.group_id = group_id
-            self.pairs[s_idx] = pair_s
+        # S(offset+1) is seeded at B price (your convention)
+        s_price = b_price
+        pair_s = GridPair(index=s_idx, buy_price=b_price + self.spread, sell_price=s_price)
+        pair_s.next_action = "sell"
+        pair_s.trade_count = 0
+        pair_s.group_id = group_id
+        self.pairs[s_idx] = pair_s
 
-            ticket_s = await self._execute_market_order("sell", s_price, s_idx, reason="INIT")
-            if not ticket_s:
-                print(f"[GROUP_INIT] S{s_idx} FAILED -> rolling back group init")
-                # rollback second pair object
-                self.pairs.pop(s_idx, None)
-                # close the already-open buy to avoid half-init group
-                try:
-                    self._close_position(ticket_b)
-                except Exception:
-                    pass
-                # rollback first pair object too
-                self.pairs.pop(b_idx, None)
-                return
+        ticket_s = await self._execute_market_order("sell", s_price, s_idx, reason="INIT")
+        if not ticket_s:
+            print(f"[GROUP_INIT] S{s_idx} FAILED -> rolling back group init")
+            # rollback second pair object
+            self.pairs.pop(s_idx, None)
+            # close the already-open buy to avoid half-init group
+            try:
+                self._close_position(ticket_b)
+            except Exception:
+                pass
+            # rollback first pair object too
+            self.pairs.pop(b_idx, None)
+            return
 
-            pair_s.sell_filled = True
-            pair_s.sell_ticket = ticket_s
-            if hasattr(pair_s, "sell_ever_opened"):
-                pair_s.sell_ever_opened = True
-            pair_s.advance_toggle()
-            print(f"[GROUP_INIT] S{s_idx} placed, ticket={ticket_s}")
+        pair_s.sell_filled = True
+        pair_s.sell_ticket = ticket_s
+        if hasattr(pair_s, "sell_ever_opened"):
+            pair_s.sell_ever_opened = True
+        pair_s.advance_toggle()
+        print(f"[GROUP_INIT] S{s_idx} placed, ticket={ticket_s}")
 
-            # --- Only now commit group tracking (atomic commit) ---
-            self.current_group = group_id
-            self.group_anchors[group_id] = b_price
-            self.anchor_price = b_price
-            self.cycle_id = group_id  # keep legacy field in sync
+        # --- Only now commit group tracking (atomic commit) ---
+        self.current_group = group_id
+        self.group_anchors[group_id] = b_price
+        self.anchor_price = b_price
+        self.cycle_id = group_id  # keep legacy field in sync
 
-            # Reset step triggers for new group (all directions)
-            self.step1_bullish_triggered = False
-            self.step1_bearish_triggered = False
-            self.step2_bullish_triggered = False
-            self.step2_bearish_triggered = False
-            self.step1_triggered = False
-            self.step2_triggered = False
+        # Reset step triggers for new group (all directions)
+        self.step1_bullish_triggered = False
+        self.step1_bearish_triggered = False
+        self.step2_bullish_triggered = False
+        self.step2_bearish_triggered = False
+        self.step1_triggered = False
+        self.step2_triggered = False
 
-            self.center_price = b_price
+        self.center_price = b_price
 
-            await self.save_state()
+        await self.save_state()
 
 
     async def _execute_tp_expansion(self, group_id: int, tp_price: float, is_bullish: bool, C: int):
@@ -793,11 +793,11 @@ class SymbolEngine:
         - Bullish TP (Buy hit): Place B(next) + S(next+1) or B(next) only if C==2
         - Bearish TP (Sell hit): Place S(anchor) + B(anchor-1) or S only if C==2
         """
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            return
-        
         async with self.execution_lock:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                return
+
             offset = self._get_pair_offset(group_id)
             group_pairs = [idx for idx in self.pairs.keys() 
                           if self._get_group_from_pair(idx) == group_id]
@@ -1198,110 +1198,112 @@ class SymbolEngine:
         """Expand grid bullish: complete pair N with B, start pair N+1 with S.
         If C==2, do NON-ATOMIC completion then immediately artificial-close + INIT next group.
         """
-        C = self._count_completed_pairs_for_group(self.current_group)
-        if C >= 3:
-            print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
-            return
+        async with self.execution_lock:
+            C = self._count_completed_pairs_for_group(self.current_group)
+            if C >= 3:
+                print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
+                return
 
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            return
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                return
 
-        pair = self.pairs.get(pair_to_complete)
-        if not pair:
-            return
+            pair = self.pairs.get(pair_to_complete)
+            if not pair:
+                return
 
-        # Complete with B(pair_to_complete)
-        if not pair.buy_filled:
-            ticket = await self._execute_market_order("buy", pair.buy_price, pair_to_complete, reason="EXPAND")
+            # Complete with B(pair_to_complete)
+            if not pair.buy_filled:
+                ticket = await self._execute_market_order("buy", pair.buy_price, pair_to_complete, reason="EXPAND")
+                if ticket:
+                    pair.buy_filled = True
+                    pair.buy_ticket = ticket
+                    # sticky ever-opened (if present)
+                    if hasattr(pair, "buy_ever_opened"):
+                        pair.buy_ever_opened = True
+                    pair.advance_toggle()
+                else:
+                    return  # completion failed
+
+            # NON-ATOMIC at C==2: completing this makes C==3 -> immediately force artificial TP + INIT
+            if C == 2:
+                event_price = pair.buy_price  # deterministic boundary (not midpoint)
+                print(f"[NON-ATOMIC] C was 2, now 3 after B{pair_to_complete} -> forcing artificial TP + INIT at {event_price:.2f}")
+                await self._force_artificial_tp_and_init(tick, event_price=event_price)
+                return
+
+            # Otherwise seed next incomplete: S(pair_to_complete + 1)
+            new_pair_idx = pair_to_complete + 1
+            new_sell_price = pair.buy_price
+            new_buy_price = new_sell_price + self.spread
+
+            new_pair = GridPair(index=new_pair_idx, buy_price=new_buy_price, sell_price=new_sell_price)
+            new_pair.next_action = "sell"
+            new_pair.group_id = self.current_group
+            self.pairs[new_pair_idx] = new_pair
+
+            ticket = await self._execute_market_order("sell", new_pair.sell_price, new_pair_idx, reason="EXPAND")
             if ticket:
-                pair.buy_filled = True
-                pair.buy_ticket = ticket
-                # sticky ever-opened (if present)
-                if hasattr(pair, "buy_ever_opened"):
-                    pair.buy_ever_opened = True
-                pair.advance_toggle()
-            else:
-                return  # completion failed
-
-        # NON-ATOMIC at C==2: completing this makes C==3 -> immediately force artificial TP + INIT
-        if C == 2:
-            event_price = pair.buy_price  # deterministic boundary (not midpoint)
-            print(f"[NON-ATOMIC] C was 2, now 3 after B{pair_to_complete} -> forcing artificial TP + INIT at {event_price:.2f}")
-            await self._force_artificial_tp_and_init(tick, event_price=event_price)
-            return
-
-        # Otherwise seed next incomplete: S(pair_to_complete + 1)
-        new_pair_idx = pair_to_complete + 1
-        new_sell_price = pair.buy_price
-        new_buy_price = new_sell_price + self.spread
-
-        new_pair = GridPair(index=new_pair_idx, buy_price=new_buy_price, sell_price=new_sell_price)
-        new_pair.next_action = "sell"
-        new_pair.group_id = self.current_group
-        self.pairs[new_pair_idx] = new_pair
-
-        ticket = await self._execute_market_order("sell", new_pair.sell_price, new_pair_idx, reason="EXPAND")
-        if ticket:
-            new_pair.sell_filled = True
-            new_pair.sell_ticket = ticket
-            if hasattr(new_pair, "sell_ever_opened"):
-                new_pair.sell_ever_opened = True
-            new_pair.advance_toggle()
+                new_pair.sell_filled = True
+                new_pair.sell_ticket = ticket
+                if hasattr(new_pair, "sell_ever_opened"):
+                    new_pair.sell_ever_opened = True
+                new_pair.advance_toggle()
 
     async def _expand_bearish(self, pair_to_complete: int):
         """Expand grid bearish: complete pair N with S, start pair N-1 with B.
         If C==2, do NON-ATOMIC completion then immediately artificial-close + INIT next group.
         """
-        C = self._count_completed_pairs_for_group(self.current_group)
-        if C >= 3:
-            print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
-            return
+        async with self.execution_lock:
+            C = self._count_completed_pairs_for_group(self.current_group)
+            if C >= 3:
+                print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
+                return
 
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            return
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                return
 
-        pair = self.pairs.get(pair_to_complete)
-        if not pair:
-            return
+            pair = self.pairs.get(pair_to_complete)
+            if not pair:
+                return
 
-        # Complete with S(pair_to_complete)
-        if not pair.sell_filled:
-            ticket = await self._execute_market_order("sell", pair.sell_price, pair_to_complete, reason="EXPAND")
+            # Complete with S(pair_to_complete)
+            if not pair.sell_filled:
+                ticket = await self._execute_market_order("sell", pair.sell_price, pair_to_complete, reason="EXPAND")
+                if ticket:
+                    pair.sell_filled = True
+                    pair.sell_ticket = ticket
+                    if hasattr(pair, "sell_ever_opened"):
+                        pair.sell_ever_opened = True
+                    pair.advance_toggle()
+                else:
+                    return  # completion failed
+
+            # NON-ATOMIC at C==2: completing this makes C==3 -> immediately force artificial TP + INIT
+            if C == 2:
+                event_price = pair.sell_price  # deterministic boundary (not midpoint)
+                print(f"[NON-ATOMIC] C was 2, now 3 after S{pair_to_complete} -> forcing artificial TP + INIT at {event_price:.2f}")
+                await self._force_artificial_tp_and_init(tick, event_price=event_price)
+                return
+
+            # Otherwise seed next incomplete: B(pair_to_complete - 1)
+            new_pair_idx = pair_to_complete - 1
+            new_buy_price = pair.sell_price
+            new_sell_price = new_buy_price - self.spread
+
+            new_pair = GridPair(index=new_pair_idx, buy_price=new_buy_price, sell_price=new_sell_price)
+            new_pair.next_action = "buy"
+            new_pair.group_id = self.current_group
+            self.pairs[new_pair_idx] = new_pair
+
+            ticket = await self._execute_market_order("buy", new_pair.buy_price, new_pair_idx, reason="EXPAND")
             if ticket:
-                pair.sell_filled = True
-                pair.sell_ticket = ticket
-                if hasattr(pair, "sell_ever_opened"):
-                    pair.sell_ever_opened = True
-                pair.advance_toggle()
-            else:
-                return  # completion failed
-
-        # NON-ATOMIC at C==2: completing this makes C==3 -> immediately force artificial TP + INIT
-        if C == 2:
-            event_price = pair.sell_price  # deterministic boundary (not midpoint)
-            print(f"[NON-ATOMIC] C was 2, now 3 after S{pair_to_complete} -> forcing artificial TP + INIT at {event_price:.2f}")
-            await self._force_artificial_tp_and_init(tick, event_price=event_price)
-            return
-
-        # Otherwise seed next incomplete: B(pair_to_complete - 1)
-        new_pair_idx = pair_to_complete - 1
-        new_buy_price = pair.sell_price
-        new_sell_price = new_buy_price - self.spread
-
-        new_pair = GridPair(index=new_pair_idx, buy_price=new_buy_price, sell_price=new_sell_price)
-        new_pair.next_action = "buy"
-        new_pair.group_id = self.current_group
-        self.pairs[new_pair_idx] = new_pair
-
-        ticket = await self._execute_market_order("buy", new_pair.buy_price, new_pair_idx, reason="EXPAND")
-        if ticket:
-            new_pair.buy_filled = True
-            new_pair.buy_ticket = ticket
-            if hasattr(new_pair, "buy_ever_opened"):
-                new_pair.buy_ever_opened = True
-            new_pair.advance_toggle()
+                new_pair.buy_filled = True
+                new_pair.buy_ticket = ticket
+                if hasattr(new_pair, "buy_ever_opened"):
+                    new_pair.buy_ever_opened = True
+                new_pair.advance_toggle()
 
     
     async def _execute_step1_bullish(self):
@@ -2296,58 +2298,59 @@ class SymbolEngine:
         """
         TP-DRIVEN ATOMIC EXPANSION for active group completed pair TP.
         """
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick: return
+        async with self.execution_lock:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick: return
 
-        # Find edge incomplete pairs for this group
-        group_pairs = {idx: pair for idx, pair in self.pairs.items()
-                       if self._get_group_from_pair(idx) == group_id}
-        if not group_pairs: return
-        sorted_indices = sorted(group_pairs.keys())
+            # Find edge incomplete pairs for this group
+            group_pairs = {idx: pair for idx, pair in self.pairs.items()
+                        if self._get_group_from_pair(idx) == group_id}
+            if not group_pairs: return
+            sorted_indices = sorted(group_pairs.keys())
 
-        if is_bullish:
-            # Bullish: Buy leg hit TP -> Expand UP
-            bullish_edge = None
-            for idx in reversed(sorted_indices):
-                pair = group_pairs[idx]
-                if pair.sell_filled and not pair.buy_filled:
-                     bullish_edge = pair
-                     break
-            
-            if not bullish_edge: return
-            
-            complete_idx = bullish_edge.index
-            seed_idx = complete_idx + 1
-            
-            if C == 2:
-                 print(f"[TP-EXPAND] C==2: B{complete_idx} only (Artificial TP next)")
-                 await self._place_single_leg_tp("buy", tick.ask, complete_idx)
-                 # Artificial TP triggers INIT
-                 await self._force_artificial_tp_and_init(tick, event_price=event_price)
+            if is_bullish:
+                # Bullish: Buy leg hit TP -> Expand UP
+                bullish_edge = None
+                for idx in reversed(sorted_indices):
+                    pair = group_pairs[idx]
+                    if pair.sell_filled and not pair.buy_filled:
+                        bullish_edge = pair
+                        break
+                
+                if not bullish_edge: return
+                
+                complete_idx = bullish_edge.index
+                seed_idx = complete_idx + 1
+                
+                if C == 2:
+                    print(f"[TP-EXPAND] C==2: B{complete_idx} only (Artificial TP next)")
+                    await self._place_single_leg_tp("buy", tick.ask, complete_idx)
+                    # Artificial TP triggers INIT
+                    await self._force_artificial_tp_and_init(tick, event_price=event_price)
+                else:
+                    print(f"[TP-EXPAND] Atomic: B{complete_idx} + S{seed_idx}")
+                    await self._place_atomic_bullish_tp(event_price, complete_idx, seed_idx)
             else:
-                 print(f"[TP-EXPAND] Atomic: B{complete_idx} + S{seed_idx}")
-                 await self._place_atomic_bullish_tp(event_price, complete_idx, seed_idx)
-        else:
-            # Bearish: Sell leg hit TP -> Expand DOWN
-            bearish_edge = None
-            for idx in sorted_indices:
-                pair = group_pairs[idx]
-                if pair.buy_filled and not pair.sell_filled:
-                    bearish_edge = pair
-                    break
-            
-            if not bearish_edge: return
-            
-            complete_idx = bearish_edge.index
-            seed_idx = complete_idx - 1
-            
-            if C == 2:
-                 print(f"[TP-EXPAND] C==2: S{complete_idx} only (Artificial TP next)")
-                 await self._place_single_leg_tp("sell", tick.bid, complete_idx)
-                 await self._force_artificial_tp_and_init(tick, event_price=event_price)
-            else:
-                 print(f"[TP-EXPAND] Atomic: S{complete_idx} + B{seed_idx}")
-                 await self._place_atomic_bearish_tp(event_price, complete_idx, seed_idx)
+                # Bearish: Sell leg hit TP -> Expand DOWN
+                bearish_edge = None
+                for idx in sorted_indices:
+                    pair = group_pairs[idx]
+                    if pair.buy_filled and not pair.sell_filled:
+                        bearish_edge = pair
+                        break
+                
+                if not bearish_edge: return
+                
+                complete_idx = bearish_edge.index
+                seed_idx = complete_idx - 1
+                
+                if C == 2:
+                    print(f"[TP-EXPAND] C==2: S{complete_idx} only (Artificial TP next)")
+                    await self._place_single_leg_tp("sell", tick.bid, complete_idx)
+                    await self._force_artificial_tp_and_init(tick, event_price=event_price)
+                else:
+                    print(f"[TP-EXPAND] Atomic: S{complete_idx} + B{seed_idx}")
+                    await self._place_atomic_bearish_tp(event_price, complete_idx, seed_idx)
 
     async def _place_single_leg_tp(self, direction: str, price: float, pair_idx: int):
         async with self.execution_lock:
