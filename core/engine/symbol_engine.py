@@ -606,9 +606,7 @@ class SymbolEngine:
         # Fallback: Calculate from index (legacy behavior)
         if pair_idx >= 0:
             return pair_idx // self.GROUP_OFFSET
-        else:
-            # Negative pairs: -1 to -99 = Group 0, -100 to -199 = Group 1, etc.
-            return (-pair_idx - 1) // self.GROUP_OFFSET
+        
     
     def _get_pair_offset(self, group_id: int) -> int:
         """Get the base pair offset for a group. Group 0 → 0, Group 1 → 100."""
@@ -785,337 +783,26 @@ class SymbolEngine:
 
         await self.save_state()
 
-
-    async def _execute_tp_expansion(self, group_id: int, tp_price: float, is_bullish: bool, C: int):
-        """
-        Execute grid expansion when a COMPLETED pair hits TP.
-        
-        - Bullish TP (Buy hit): Place B(next) + S(next+1) or B(next) only if C==2
-        - Bearish TP (Sell hit): Place S(anchor) + B(anchor-1) or S only if C==2
-        """
-        async with self.execution_lock:
-            tick = mt5.symbol_info_tick(self.symbol)
-            if not tick:
-                return
-
-            offset = self._get_pair_offset(group_id)
-            group_pairs = [idx for idx in self.pairs.keys() 
-                          if self._get_group_from_pair(idx) == group_id]
-            
-            if is_bullish:
-                # BULLISH: B(next) + S(next+1)
-                next_b_idx = max(group_pairs) + 1 if group_pairs else offset + 2
-                next_s_idx = next_b_idx + 1
-                
-                if C == 2:
-                    print(f"[TP_EXPAND] Bullish C==2: B{next_b_idx} only")
-                    await self._place_single_leg_tp("buy", tp_price, next_b_idx)
-                else:
-                    print(f"[TP_EXPAND] Bullish: B{next_b_idx} + S{next_s_idx}")
-                    await self._place_atomic_bullish_tp(tp_price, next_b_idx, next_s_idx)
-            else:
-                # BEARISH: S(next) + B(next-1)
-                next_s_idx = min(group_pairs) - 1 if group_pairs else offset - 1
-                next_b_idx = next_s_idx - 1
-                
-                if C == 2:
-                    print(f"[TP_EXPAND] Bearish C==2: S{next_s_idx} only")
-                    await self._place_single_leg_tp("sell", tp_price, next_s_idx)
-                else:
-                    print(f"[TP_EXPAND] Bearish: S{next_s_idx} + B{next_b_idx}")
-                    await self._place_atomic_bearish_tp(tp_price, next_s_idx, next_b_idx)
-            
-            await self.save_state()
-    
-    async def _place_single_leg_tp(self, direction: str, price: float, pair_idx: int):
-        """Place single leg for TP expansion when C==2."""
-        pair = self.pairs.get(pair_idx)
-        if not pair:
-            if direction == "buy":
-                pair = GridPair(index=pair_idx, buy_price=price, sell_price=price - self.spread)
-            else:
-                pair = GridPair(index=pair_idx, buy_price=price + self.spread, sell_price=price)
-            pair.next_action = direction
-            pair.group_id = self.current_group  # Track group membership
-            self.pairs[pair_idx] = pair
-        
-        ticket = await self._execute_market_order(direction, price, pair_idx, reason="TP_EXPAND")
-        if ticket:
-            if direction == "buy":
-                pair.buy_filled = True
-                pair.buy_ticket = ticket
-            else:
-                pair.sell_filled = True
-                pair.sell_ticket = ticket
-            pair.advance_toggle()
-    
-    async def _place_atomic_bullish_tp(self, price: float, b_idx: int, s_idx: int):
-        """Place B(n) + S(n+1) atomically for bullish TP expansion."""
-        # B(n)
-        pair_b = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
-        pair_b.next_action = "buy"
-        pair_b.group_id = self.current_group  # Track group membership
-        self.pairs[b_idx] = pair_b
-        
-        ticket_b = await self._execute_market_order("buy", price, b_idx, reason="TP_EXPAND")
-        if ticket_b:
-            pair_b.buy_filled = True
-            pair_b.buy_ticket = ticket_b
-            pair_b.advance_toggle()
-        
-        # S(n+1)
-        pair_s = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
-        pair_s.next_action = "sell"
-        pair_s.group_id = self.current_group  # Track group membership
-        self.pairs[s_idx] = pair_s
-        
-        ticket_s = await self._execute_market_order("sell", price, s_idx, reason="TP_EXPAND")
-        if ticket_s:
-            pair_s.sell_filled = True
-            pair_s.sell_ticket = ticket_s
-            pair_s.advance_toggle()
-    
-    async def _place_atomic_bearish_tp(self, price: float, s_idx: int, b_idx: int):
-        """Place S(n) + B(n-1) atomically for bearish TP expansion."""
-        # S(n)
-        pair_s = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
-        pair_s.next_action = "sell"
-        pair_s.group_id = self.current_group  # Track group membership
-        self.pairs[s_idx] = pair_s
-        
-        ticket_s = await self._execute_market_order("sell", price, s_idx, reason="TP_EXPAND")
-        if ticket_s:
-            pair_s.sell_filled = True
-            pair_s.sell_ticket = ticket_s
-            pair_s.advance_toggle()
-        
-        # B(n-1)
-        pair_b = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
-        pair_b.next_action = "buy"
-        pair_b.group_id = self.current_group  # Track group membership
-        self.pairs[b_idx] = pair_b
-        
-        ticket_b = await self._execute_market_order("buy", price, b_idx, reason="TP_EXPAND")
-        if ticket_b:
-            pair_b.buy_filled = True
-            pair_b.buy_ticket = ticket_b
-            pair_b.advance_toggle()
-    
-    async def _handle_completed_pair_expansion(self, cmp: float):
-        """
-        Handle expansion in the current active group when a COMPLETED pair from a prior group drops.
-        
-        After INIT (B100, S101):
-        - Pair 100: Only B100 exists (incomplete - buy side)
-        - Pair 101: Only S101 exists (incomplete - sell side)
-        
-        When completed pair drops:
-        - If CMP > S101.sell_price → Complete pair 101 with B101 (lot 1), seed pair 102 with S102 (lot 0)
-        - If CMP < B100.buy_price → Complete pair 100 with S100 (lot 1), seed pair 99 with B99 (lot 0)
-        
-        Respects C==2 non-atomic rule: only fire the completing leg when C==2.
-        """
-        tick = mt5.symbol_info_tick(self.symbol)
-        if not tick:
-            return
-        
-        # Variables for deferred INIT (to avoid deadlock by calling outside lock)
-        should_fire_init = False
-        deferred_group_id = 0
-        deferred_price = 0.0
-        
-        async with self.execution_lock:
-            group_id = self.current_group
-            offset = self._get_pair_offset(group_id)
-            
-            # Find edge pairs for this group (the incomplete pairs at the edges)
-            group_pairs = {idx: pair for idx, pair in self.pairs.items()
-                          if self._get_group_from_pair(idx) == group_id}
-            
-            if not group_pairs:
-                print(f"[COMP-EXPAND] No pairs found in group {group_id}")
-                return
-            
-            # Get C for this group
-            C = self._count_completed_pairs_for_group(group_id)
-            
-            # C >= 3 means group is locked, no more expansion
-            if C >= 3:
-                print(f"[COMP-EXPAND] Group {group_id} locked (C={C}), no expansion")
-                return
-            
-            # Find the bullish edge (highest pair with only sell filled = incomplete buy side)
-            # and bearish edge (lowest pair with only buy filled = incomplete sell side)
-            bullish_edge = None  # Pair where we check CMP > pair.sell_price
-            bearish_edge = None  # Pair where we check CMP < pair.buy_price
-            
-            # Get sorted pair indices for this group
-            sorted_indices = sorted(group_pairs.keys())
-            
-            # Check highest pair for bullish expansion (should have sell_filled but not buy_filled)
-            for idx in reversed(sorted_indices):
-                pair = group_pairs[idx]
-                if pair.sell_filled and not pair.buy_filled:
-                    bullish_edge = pair
-                    break
-            
-            # Check lowest pair for bearish expansion (should have buy_filled but not sell_filled)
-            for idx in sorted_indices:
-                pair = group_pairs[idx]
-                if pair.buy_filled and not pair.sell_filled:
-                    bearish_edge = pair
-                    break
-            
-            # ============================================================
-            # EXPANSION DEBUG: Log edge pair discovery results
-            # ============================================================
-            print(f"[COMP-EXPAND] Group={group_id} | C={C} | CMP={cmp:.2f}")
-            print(f"[COMP-EXPAND] Group pairs: {list(group_pairs.keys())}")
-            if bullish_edge:
-                print(f"[COMP-EXPAND] Bullish edge: pair={bullish_edge.index}, sell_price={bullish_edge.sell_price:.2f} (need CMP > this)")
-            else:
-                print(f"[COMP-EXPAND] No bullish edge found (no pair with sell_filled=True, buy_filled=False)")
-            if bearish_edge:
-                print(f"[COMP-EXPAND] Bearish edge: pair={bearish_edge.index}, buy_price={bearish_edge.buy_price:.2f} (need CMP < this)")
-            else:
-                print(f"[COMP-EXPAND] No bearish edge found (no pair with buy_filled=True, sell_filled=False)")
-            
-            expansion_done = False
-            
-            # BULLISH CHECK: CMP > bullish_edge.sell_price
-            if bullish_edge and cmp > bullish_edge.sell_price:
-                complete_idx = bullish_edge.index
-                seed_idx = complete_idx + 1
-                
-                print(f"[COMP-EXPAND] Bullish: CMP {cmp:.2f} > S{complete_idx} price {bullish_edge.sell_price:.2f}")
-                
-                if C == 2:
-                    # RE-CHECK C to prevent race condition:
-                    # If this expansion raced with another that just bumped C to 3, abort!
-                    current_C = self._count_completed_pairs_for_group(group_id)
-                    if current_C >= 3:
-                        print(f"[COMP-EXPAND] ABORT: Race detected! C was 2, now {current_C} >= 3")
-                        return
-
-                    # NON-ATOMIC: Only complete the pair (B on the bullish edge)
-                    print(f"[COMP-EXPAND] C==2 Non-atomic: B{complete_idx} only")
-                    bullish_edge.trade_count = 1  # Lot index 1 (completing leg)
-                    ticket = await self._execute_market_order("buy", tick.ask, complete_idx, reason="COMP_EXPAND")
-                    if ticket:
-                        bullish_edge.buy_filled = True
-                        bullish_edge.buy_ticket = ticket
-                        bullish_edge.advance_toggle()
-                        print(f"[COMP-EXPAND] B{complete_idx} placed (lot 1), ticket={ticket}")
-                else:
-                    # ATOMIC: Complete pair + seed next
-                    print(f"[COMP-EXPAND] C={C} Atomic: B{complete_idx} (lot 1) + S{seed_idx} (lot 0)")
-                    
-                    # B on complete_idx (lot 1)
-                    bullish_edge.trade_count = 1
-                    ticket_b = await self._execute_market_order("buy", tick.ask, complete_idx, reason="COMP_EXPAND")
-                    if ticket_b:
-                        bullish_edge.buy_filled = True
-                        bullish_edge.buy_ticket = ticket_b
-                        bullish_edge.advance_toggle()
-                        print(f"[COMP-EXPAND] B{complete_idx} placed (lot 1), ticket={ticket_b}")
-                    
-                    # S on seed_idx (lot 0) - new pair
-                    seed_pair = GridPair(index=seed_idx, buy_price=tick.ask + self.spread, sell_price=tick.ask)
-                    seed_pair.next_action = "sell"
-                    seed_pair.trade_count = 0  # Lot index 0
-                    seed_pair.group_id = group_id  # Inherit group from expansion context
-                    self.pairs[seed_idx] = seed_pair
-                    
-                    ticket_s = await self._execute_market_order("sell", tick.bid, seed_idx, reason="COMP_EXPAND")
-                    if ticket_s:
-                        seed_pair.sell_filled = True
-                        seed_pair.sell_ticket = ticket_s
-                        seed_pair.advance_toggle()
-                        print(f"[COMP-EXPAND] S{seed_idx} placed (lot 0), ticket={ticket_s}")
-                
-                expansion_done = True
-            
-            # BEARISH CHECK: CMP < bearish_edge.buy_price (only if no bullish expansion)
-            if not expansion_done and bearish_edge and cmp < bearish_edge.buy_price:
-                complete_idx = bearish_edge.index
-                seed_idx = complete_idx - 1
-                
-                print(f"[COMP-EXPAND] Bearish: CMP {cmp:.2f} < B{complete_idx} price {bearish_edge.buy_price:.2f}")
-                
-                if C == 2:
-                    # RE-CHECK C to prevent race condition:
-                    # If this expansion raced with another that just bumped C to 3, abort!
-                    current_C = self._count_completed_pairs_for_group(group_id)
-                    if current_C >= 3:
-                        print(f"[COMP-EXPAND] ABORT: Race detected! C was 2, now {current_C} >= 3")
-                        return
-
-                    # NON-ATOMIC: Only complete the pair (S on the bearish edge)
-                    print(f"[COMP-EXPAND] C==2 Non-atomic: S{complete_idx} only")
-                    bearish_edge.trade_count = 1  # Lot index 1 (completing leg)
-                    ticket = await self._execute_market_order("sell", tick.bid, complete_idx, reason="COMP_EXPAND")
-                    if ticket:
-                        bearish_edge.sell_filled = True
-                        bearish_edge.sell_ticket = ticket
-                        bearish_edge.advance_toggle()
-                        print(f"[COMP-EXPAND] S{complete_idx} placed (lot 1), ticket={ticket}")
-                else:
-                    # ATOMIC: Complete pair + seed next
-                    print(f"[COMP-EXPAND] C={C} Atomic: S{complete_idx} (lot 1) + B{seed_idx} (lot 0)")
-                    
-                    # S on complete_idx (lot 1)
-                    bearish_edge.trade_count = 1
-                    ticket_s = await self._execute_market_order("sell", tick.bid, complete_idx, reason="COMP_EXPAND")
-                    if ticket_s:
-                        bearish_edge.sell_filled = True
-                        bearish_edge.sell_ticket = ticket_s
-                        bearish_edge.advance_toggle()
-                        print(f"[COMP-EXPAND] S{complete_idx} placed (lot 1), ticket={ticket_s}")
-                    
-                    # B on seed_idx (lot 0) - new pair
-                    seed_pair = GridPair(index=seed_idx, buy_price=tick.bid, sell_price=tick.bid - self.spread)
-                    seed_pair.next_action = "buy"
-                    seed_pair.trade_count = 0  # Lot index 0
-                    seed_pair.group_id = group_id  # Inherit group from expansion context
-                    self.pairs[seed_idx] = seed_pair
-                    
-                    ticket_b = await self._execute_market_order("buy", tick.ask, seed_idx, reason="COMP_EXPAND")
-                    if ticket_b:
-                        seed_pair.buy_filled = True
-                        seed_pair.buy_ticket = ticket_b
-                        seed_pair.advance_toggle()
-                        print(f"[COMP-EXPAND] B{seed_idx} placed (lot 0), ticket={ticket_b}")
-            
-            await self.save_state()
-            
-            # CHECK: If pending INIT and C just became 3, prepare to fire (outside lock)
-            C_after = self._count_completed_pairs_for_group(group_id)
-            should_fire_init = self.pending_init and C_after >= 3
-            if should_fire_init:
-                self.pending_init = False
-                deferred_group_id = group_id + 1
-                deferred_price = (tick.ask + tick.bid) / 2
-                print(f"[INIT-FIRED] Group {group_id} C={C_after} → Firing queued INIT for Group {deferred_group_id} at {deferred_price:.2f}")
-        
-        # Fire INIT outside the lock to avoid deadlock
-        if should_fire_init:
-            await self._execute_group_init(deferred_group_id, deferred_price)
-
     async def _check_step_triggers(self, ask: float, bid: float):
         """
-        DYNAMIC GRID EXPANSION for CURRENT GROUP ONLY.
-        
-        Expands grid at each new level until C >= 3 for the current group.
+        DYNAMIC GRID EXPANSION for GROUP 0 ONLY.
+
+        Groups > 0 expand via TP-driven expansion (_execute_tp_expansion),
+        NOT via step triggers. This prevents race conditions between the two paths.
+
+        Expands grid at each new level until C >= 3 for Group 0.
         Grid expands in WHICHEVER direction price moves:
         - Bullish: Complete incomplete pair with B, seed next pair with S
         - Bearish: Complete incomplete pair with S, seed next pair with B
-        
-        IMPORTANT: Only processes pairs belonging to current_group.
-        Uses group-specific anchor from group_anchors[current_group].
         """
+        # GUARD: Step triggers ONLY apply to Group 0
+        # Groups > 0 expand via TP-driven expansion from prior group TPs
+        if self.current_group > 0:
+            return
+
         D = self.spread
         T = self.tolerance
-        
+
         # Only count C for current group
         C = self._count_completed_pairs_for_group(self.current_group)
         
@@ -1234,6 +921,11 @@ class SymbolEngine:
 
             # Otherwise seed next incomplete: S(pair_to_complete + 1)
             new_pair_idx = pair_to_complete + 1
+
+            if new_pair_idx in self.pairs:
+                print(f"[EXPAND-BULL] Seed Pair {new_pair_idx} already exists - Skipping")
+                return
+            
             new_sell_price = pair.buy_price
             new_buy_price = new_sell_price + self.spread
 
@@ -1289,6 +981,11 @@ class SymbolEngine:
 
             # Otherwise seed next incomplete: B(pair_to_complete - 1)
             new_pair_idx = pair_to_complete - 1
+
+            if new_pair_idx in self.pairs:
+                print(f"[EXPAND-BEAR] Seed Pair {new_pair_idx} already exists - Skipping")
+                return
+                
             new_buy_price = pair.sell_price
             new_sell_price = new_buy_price - self.spread
 
@@ -2353,71 +2050,75 @@ class SymbolEngine:
                     await self._place_atomic_bearish_tp(event_price, complete_idx, seed_idx)
 
     async def _place_single_leg_tp(self, direction: str, price: float, pair_idx: int):
-        async with self.execution_lock:
-            pair = self.pairs.get(pair_idx)
-            if not pair: return 
-            pair.trade_count = 1
-            ticket = await self._execute_market_order(direction, price, pair_idx, reason="TP_EXPAND")
-            if ticket:
-                if direction == "buy":
-                    pair.buy_filled = True
-                    pair.buy_ticket = ticket
-                else:
-                    pair.sell_filled = True
-                    pair.sell_ticket = ticket
-                pair.advance_toggle()
+        pair = self.pairs.get(pair_idx)
+        if not pair: return 
+        pair.trade_count = 1
+        ticket = await self._execute_market_order(direction, price, pair_idx, reason="TP_EXPAND")
+        if ticket:
+            if direction == "buy":
+                pair.buy_filled = True
+                pair.buy_ticket = ticket
+            else:
+                pair.sell_filled = True
+                pair.sell_ticket = ticket
+            pair.advance_toggle()
             
     async def _place_atomic_bullish_tp(self, price: float, b_idx: int, s_idx: int):
-        async with self.execution_lock:
-            # B(n) at market
-            tick = mt5.symbol_info_tick(self.symbol)
-            pair_b = self.pairs.get(b_idx)
-            if pair_b:
-                 pair_b.trade_count = 1
-                 ticket = await self._execute_market_order("buy", tick.ask, b_idx, reason="TP_EXPAND")
-                 if ticket:
-                     pair_b.buy_filled = True
-                     pair_b.buy_ticket = ticket
-                     pair_b.advance_toggle()
-            
-            # S(n+1) seeded at TP levels
-            seed_pair = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
-            seed_pair.next_action = "sell"
-            seed_pair.trade_count = 0
-            seed_pair.group_id = self.current_group
-            self.pairs[s_idx] = seed_pair
-            
-            ticket_s = await self._execute_market_order("sell", tick.bid, s_idx, reason="TP_EXPAND")
-            if ticket_s:
-                seed_pair.sell_filled = True
-                seed_pair.sell_ticket = ticket_s
-                seed_pair.advance_toggle()
+        # B(n) at market
+        tick = mt5.symbol_info_tick(self.symbol)
+        pair_b = self.pairs.get(b_idx)
+        if pair_b:
+                pair_b.trade_count = 1
+                ticket = await self._execute_market_order("buy", tick.ask, b_idx, reason="TP_EXPAND")
+                if ticket:
+                    pair_b.buy_filled = True
+                    pair_b.buy_ticket = ticket
+                    pair_b.advance_toggle()
+
+        if s_idx in self.pairs:
+            print(f"[TP-EXPAND] Skipping Seed S{s_idx} - Pair already exists")
+            return
+        
+        # S(n+1) seeded at TP levels
+        seed_pair = GridPair(index=s_idx, buy_price=price + self.spread, sell_price=price)
+        seed_pair.next_action = "sell"
+        seed_pair.trade_count = 0
+        seed_pair.group_id = self.current_group
+        self.pairs[s_idx] = seed_pair
+        
+        ticket_s = await self._execute_market_order("sell", tick.bid, s_idx, reason="TP_EXPAND")
+        if ticket_s:
+            seed_pair.sell_filled = True
+            seed_pair.sell_ticket = ticket_s
+            seed_pair.advance_toggle()
 
     async def _place_atomic_bearish_tp(self, price: float, s_idx: int, b_idx: int):
-        async with self.execution_lock:
-            # S(n) at market
-            tick = mt5.symbol_info_tick(self.symbol)
-            pair_s = self.pairs.get(s_idx)
-            if pair_s:
-                 pair_s.trade_count = 1
-                 ticket = await self._execute_market_order("sell", tick.bid, s_idx, reason="TP_EXPAND")
-                 if ticket:
-                     pair_s.sell_filled = True
-                     pair_s.sell_ticket = ticket
-                     pair_s.advance_toggle()
-            
-            # B(n-1) seeded at TP levels
-            seed_pair = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
-            seed_pair.next_action = "buy"
-            seed_pair.trade_count = 0
-            seed_pair.group_id = self.current_group
-            self.pairs[b_idx] = seed_pair
-            
-            ticket_b = await self._execute_market_order("buy", tick.ask, b_idx, reason="TP_EXPAND")
-            if ticket_b:
-                seed_pair.buy_filled = True
-                seed_pair.buy_ticket = ticket_b
-                seed_pair.advance_toggle()
+        # S(n) at market
+        tick = mt5.symbol_info_tick(self.symbol)
+        pair_s = self.pairs.get(s_idx)
+        if pair_s:
+                pair_s.trade_count = 1
+                ticket = await self._execute_market_order("sell", tick.bid, s_idx, reason="TP_EXPAND")
+                if ticket:
+                    pair_s.sell_filled = True
+                    pair_s.sell_ticket = ticket
+                    pair_s.advance_toggle()
+        if b_idx in self.pairs:
+            print(f"[TP-EXPAND] Skipping Seed B{b_idx} - Pair already exists")
+            return
+        
+        # B(n-1) seeded at TP levels
+        seed_pair = GridPair(index=b_idx, buy_price=price, sell_price=price - self.spread)
+        seed_pair.next_action = "buy"
+        seed_pair.trade_count = 0
+        seed_pair.group_id = self.current_group
+        self.pairs[b_idx] = seed_pair
+        
+        ticket_b = await self._execute_market_order("buy", tick.ask, b_idx, reason="TP_EXPAND")
+        if ticket_b:
+            seed_pair.buy_filled = True
+            seed_pair.buy_ticket = ticket_b
+            seed_pair.advance_toggle()
 
     async def _handle_completed_pair_expansion(self, event_price: float, is_bullish: bool):
         """
