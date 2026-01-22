@@ -1,6 +1,26 @@
 # Fixes and Problems Log
 
-## Session Date: 2026-01-19
+## Session Date: 2026-01-23
+
+---
+
+## Fixes Implemented This Session
+
+### 1. Permanent Per-Pair TP Expansion Lock
+
+**Problem:** The TP expansion logic used a time-based debounce (5 seconds), which allowed the same pair to trigger expansion multiple times if TP events occurred spaced out (e.g., B102 + S103 firing twice). This caused grid inconsistency and unintended trade sequences.
+
+**Fix:** Replaced the global time-based debounce with a permanent per-pair lock.
+
+1. Removed `_expansion_debounce_seconds` and `_pair_last_expansion_time`.
+2. Implemented `_pairs_tp_expanded: Set[int]` to track pairs that have fired expansion.
+3. Once a completed pair hits TP and fires expansion, it is permanently added to the set and cannot fire expansion again for the rest of the session.
+
+**Location:** `symbol_engine.py` (lines ~430, ~2300)
+
+---
+
+## Session Date: 2026-01-22
 
 ---
 

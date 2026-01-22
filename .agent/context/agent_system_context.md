@@ -103,6 +103,7 @@ When a Take Profit (TP) is hit on a **completed pair** (detected via `_check_pos
 **Completed Pair TP → Group Expansion:**
 
 - When a completed pair's leg hits TP (in current or prior group)
+- **Permanent Lock Logic**: Once a pair fires expansion, it is permanently added to `_pairs_tp_expanded` and cannot fire expansion again. This prevents duplicate expansion triggers from the same pair.
 - Triggers expansion in the active group (if C < 3)
 - If C == 2 after expansion → non-atomic → artificial TP + INIT
 
