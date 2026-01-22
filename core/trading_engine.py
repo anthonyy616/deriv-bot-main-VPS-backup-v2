@@ -52,6 +52,10 @@ class TradingEngine:
             "errors": 0,
             "last_tick_time": None
         }
+        
+        # Graceful stop timeout tracking
+        self.start_time: datetime = None  # Set when tick loop starts
+        self.timeout_graceful_stop_triggered: bool = False
 
     def _init_mt5(self) -> bool:
         """
@@ -142,6 +146,9 @@ class TradingEngine:
         """
         Main tick processing loop with health monitoring.
         """
+        # Track start time for timeout calculation
+        self.start_time = datetime.now()
+        logger.info(f"[TIMEOUT] Session started at {self.start_time}")
         
         while self.running:
             try:
@@ -153,6 +160,10 @@ class TradingEngine:
                             # Failed to reconnect - exit to trigger watchdog restart
                             logger.critical("MT5 reconnection failed. Exiting for watchdog restart.")
                             raise RuntimeError("MT5 connection lost and could not reconnect")
+                
+                # CHECK TIMEOUT: Trigger graceful stop if max_runtime_minutes elapsed
+                if not self.timeout_graceful_stop_triggered:
+                    await self._check_timeout_graceful_stop()
                 
                 # 1. Collect all active symbols from all active users (orchestrators)
                 all_orchestrators = list(self.bot_manager.bots.values())
@@ -233,3 +244,46 @@ class TradingEngine:
             "consecutive_errors": self.consecutive_errors,
             "running": self.running
         }
+    
+    async def _check_timeout_graceful_stop(self):
+        """
+        Check if max_runtime_minutes has elapsed and trigger graceful stop on all engines.
+        
+        This allows existing completed pairs to continue trading to max_positions
+        while blocking all new group creation and grid expansion.
+        """
+        if self.start_time is None:
+            return
+        
+        # Get max_runtime_minutes from any orchestrator's config
+        all_orchestrators = list(self.bot_manager.bots.values())
+        if not all_orchestrators:
+            return
+        
+        # Get global config from first orchestrator
+        try:
+            global_config = all_orchestrators[0].config_manager.get_global_config()
+            max_runtime = global_config.get("max_runtime_minutes", 0)
+        except Exception:
+            return
+        
+        # 0 means no timeout
+        if not max_runtime or max_runtime <= 0:
+            return
+        
+        # Check if timeout has elapsed
+        elapsed = datetime.now() - self.start_time
+        elapsed_minutes = elapsed.total_seconds() / 60
+        
+        if elapsed_minutes >= max_runtime:
+            logger.warning(f"[TIMEOUT] max_runtime_minutes ({max_runtime}) reached. Triggering graceful stop on all engines.")
+            print(f"[TIMEOUT] max_runtime_minutes ({max_runtime}) reached after {elapsed_minutes:.1f} minutes. Triggering graceful stop...")
+            
+            # Set graceful_stop on all symbol engines
+            for orch in all_orchestrators:
+                for symbol, strategy in orch.strategies.items():
+                    if hasattr(strategy, 'graceful_stop') and not strategy.graceful_stop:
+                        strategy.graceful_stop = True
+                        print(f"[TIMEOUT] {symbol}: Graceful stop activated")
+            
+            self.timeout_graceful_stop_triggered = True

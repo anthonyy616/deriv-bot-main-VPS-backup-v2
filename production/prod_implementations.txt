@@ -1,0 +1,77 @@
+# Production Implementation Notes
+# ================================
+# Last Updated: 2026-01-21
+
+## GRACEFUL STOP / TIMEOUT BEHAVIOR
+-----------------------------------
+
+### Trigger Conditions:
+- User clicks "Graceful Stop" button
+- OR max_runtime_minutes timeout elapses (from global config)
+
+### When Graceful Stop is Active:
+
+1. **Toggle Triggers on Existing Pairs**: 
+   ✅ YES - Continue trading up to max_positions on pairs that are already complete.
+   This is why it's "graceful" - existing pairs continue their buy→sell→buy cycle.
+
+2. **Incomplete Pairs**: 
+   ❌ NO - Leave incomplete pairs as-is. Do NOT wait for second leg to complete.
+   Just stop creating new trades on incomplete pairs.
+
+3. **Hedges**: 
+   ✅ YES - Hedges should still be placed on pairs that reach max_positions.
+
+4. **Timeout Source**: 
+   ✅ Uses max_runtime_minutes from global config.
+
+### What Gets BLOCKED During Graceful Stop:
+- ❌ No new groups created (no _execute_group_init calls)
+- ❌ TP hitting completed pairs should NOT cause expansion (no _execute_tp_expansion)
+- ❌ No new pairs via _check_step_triggers
+- ❌ No artificial TP + INIT sequences
+
+
+## SQLITE DATABASE ACCESS
+-------------------------
+
+### Location:
+The SQLite database is stored at: `db/grid_v3.db`
+Full path: c:\Users\antho\Documents\codes-websites\trade-bot-deriv-production\db\grid_v3.db
+
+### Viewing the Database:
+
+1. **Using SQLite CLI** (if installed):
+   ```
+   sqlite3 db/grid_v3.db
+   .tables                    # List all tables
+   .schema                    # Show table schemas
+   SELECT * FROM grid_state;  # Query state
+   SELECT * FROM trade_log;   # Query trade history
+   .quit                      # Exit
+   ```
+
+2. **Using DB Browser for SQLite** (GUI tool):
+   - Download from: https://sqlitebrowser.org/
+   - Open > Navigate to db/grid_v3.db
+   - Browse tables visually
+
+3. **Using Python**:
+   ```python
+   import sqlite3
+   conn = sqlite3.connect("db/grid_v3.db")
+   cursor = conn.cursor()
+   cursor.execute("SELECT * FROM grid_state")
+   for row in cursor.fetchall():
+       print(row)
+   conn.close()
+   ```
+
+4. **Using VS Code Extension**:
+   - Install "SQLite" extension by alexcvzz
+   - Right-click db/grid_v3.db > "Open Database"
+   - Explore tables in the SQLite Explorer sidebar
+
+### Note: 
+The database is DELETED on each fresh start (/control/start) to ensure clean sessions.
+If you need to inspect state, do so while the bot is running or before the next start.

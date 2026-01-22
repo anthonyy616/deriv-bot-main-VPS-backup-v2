@@ -701,6 +701,11 @@ class SymbolEngine:
         await self._execute_group_init(self.current_group, self.anchor_price)
     
     async def _execute_group_init(self, group_id: int, anchor_price: float):
+        # GRACEFUL STOP GUARD: Block new group creation during graceful stop
+        if self.graceful_stop:
+            print(f"[GROUP_INIT] {self.symbol}: Graceful stop active, blocking new group {group_id}")
+            return
+
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
             print(f"[GROUP_INIT] {self.symbol}: No tick data, cannot init")
@@ -795,6 +800,10 @@ class SymbolEngine:
         - Bullish: Complete incomplete pair with B, seed next pair with S
         - Bearish: Complete incomplete pair with S, seed next pair with B
         """
+        # GRACEFUL STOP GUARD: Block step triggers (new pair creation) during graceful stop
+        if self.graceful_stop:
+            return
+
         # GUARD: Step triggers ONLY apply to Group 0
         # Groups > 0 expand via TP-driven expansion from prior group TPs
         if self.current_group > 0:
@@ -1948,6 +1957,11 @@ class SymbolEngine:
         """
         ARTIFICIAL TP: Close incomplete pair and fire INIT when rollover condition met (C=3).
         """
+        # GRACEFUL STOP GUARD: Block artificial TP + INIT sequence during graceful stop
+        if self.graceful_stop:
+            print(f"[ARTIFICIAL-TP] {self.symbol}: Graceful stop active, blocking artificial TP + INIT")
+            return
+
         positions = mt5.positions_get(symbol=self.symbol)
         
         # Build map of pair_idx -> dict of leg->ticket for CURRENT GROUP
@@ -1995,6 +2009,11 @@ class SymbolEngine:
         """
         TP-DRIVEN ATOMIC EXPANSION for active group completed pair TP.
         """
+        # GRACEFUL STOP GUARD: Block TP-driven expansion during graceful stop
+        if self.graceful_stop:
+            print(f"[TP-EXPAND] {self.symbol}: Graceful stop active, blocking expansion")
+            return
+
         async with self.execution_lock:
             tick = mt5.symbol_info_tick(self.symbol)
             if not tick: return
