@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS grid_pairs (
     hedge_direction TEXT,
     -- 'buy' or 'sell'
     hedge_active BOOLEAN DEFAULT 0,
+    -- LOCKED ENTRY PRICES: Set once on first execution, never changed
+    -- Ensures re-entries happen at exact same price level
+    locked_buy_entry REAL DEFAULT 0.0,
+    locked_sell_entry REAL DEFAULT 0.0,
     PRIMARY KEY (symbol, pair_index)
 );
 -- 3. Trade History (Replaces in-memory self.trade_history list)

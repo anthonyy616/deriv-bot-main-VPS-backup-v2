@@ -229,7 +229,6 @@ if C == 2:
 **Result:**
 If atomic expansion bumps C to 3 during the race, the non-atomic expansion will detect it and abort, preventing B103 from firing immediately.
 
-
 # Fixes and Problems Log
 
 ## Session Date: 2026-01-21
@@ -243,6 +242,7 @@ If atomic expansion bumps C to 3 during the race, the non-atomic expansion will 
 **Problem:** TP/SL classification was unreliable - sometimes positions would close but the system couldn't determine if it was TP or SL.
 
 **Fix:** Implemented latching touch flags that are updated on every tick:
+
 ```python
 def _update_tp_sl_touch_flags(self, ask: float, bid: float):
     for ticket, info in self.ticket_map.items():
@@ -264,6 +264,7 @@ def _update_tp_sl_touch_flags(self, ask: float, bid: float):
 **Problem:** `_count_completed_pairs_for_group()` used in-memory `pair.buy_filled/sell_filled` which could be stale.
 
 **Fix:** Rewrote to use live MT5 positions + ticket_map:
+
 ```python
 def _count_completed_pairs_for_group(self, group_id: int) -> int:
     positions = mt5.positions_get(symbol=self.symbol)
@@ -286,15 +287,18 @@ def _count_completed_pairs_for_group(self, group_id: int) -> int:
 ### 3. Artificial TP Concept (Immediate Close + INIT)
 
 **Problem:** Bot was not transitioning to Group 1+. The system waited for incomplete pairs to naturally hit TP, which:
+
 - Could hit on the wrong edge (bearish incomplete when bullish expansion happened)
 - Could take forever if price moved away
 - Was unnecessarily complex
 
 **Fix:** When C==2 non-atomic fires (making C=3), **immediately**:
+
 1. Close the incomplete pair position
 2. Fire INIT for next group
 
 **Implementation:**
+
 ```python
 # In _expand_bullish() and _expand_bearish():
 if C == 2:
@@ -305,6 +309,7 @@ if C == 2:
 ```
 
 **Location:**
+
 - `_expand_bullish()` C==2 branch
 - `_expand_bearish()` C==2 branch
 - `_execute_tp_expansion()` C==2 branches
@@ -316,12 +321,14 @@ if C == 2:
 **Problem:** When determining if a dropped position was from a completed or incomplete pair, the system checked MT5 positions for the other leg. But if one leg already closed via SL, the pair appeared "incomplete" even though it was completed.
 
 **Example:**
+
 1. Pair 101 had both B101 and S101 (completed)
 2. B101 hit SL first → closed
 3. S101 hit TP later → system saw only 1 leg in MT5 → marked "Incomplete"
 4. Routed as incomplete TP → no expansion fired
 
 **Fix:** Use in-memory pair state which remembers "ever filled":
+
 ```python
 # In _check_position_drops():
 pair = self.pairs.get(pair_idx)
@@ -338,6 +345,7 @@ was_incomplete = not was_completed
 ### 5. Removed Pending Rollover Gate
 
 **Problem:** Earlier fix tried to use a `pending_group_rollover` gate to control when incomplete TPs could fire INIT. This was overly complex and failed when:
+
 - The incomplete TP hit on the wrong edge
 - Multiple incomplete pairs existed
 
@@ -352,6 +360,7 @@ was_incomplete = not was_completed
 **Problem:** Various methods had inconsistent tuple unpacking for ticket_map entries.
 
 **Fix:** Enforced canonical 5-tuple everywhere:
+
 ```python
 # Canonical format:
 ticket_map[ticket] = (pair_idx, leg, entry_price, tp_price, sl_price)
@@ -370,17 +379,21 @@ pair_idx, leg, _, _, _ = info
 ## Previous Session Fixes (2026-01-19)
 
 ### Group Tracking Per Pair
+
 - Added `group_id` field to GridPair dataclass
 - Updated `_get_group_from_pair()` to use stored group_id
 
 ### Expansion Group Filtering
+
 - `_check_step_triggers()` filters by current_group
 - Uses stored `pair.buy_price/sell_price` for trigger levels
 
 ### Group-Scoped C Gating
+
 - `_can_place_completing_leg()` uses group-specific C count
 
 ### Non-Atomic Race Fix
+
 - C re-check inside non-atomic block prevents double expansion
 
 ---
@@ -388,6 +401,7 @@ pair_idx, leg, _, _, _ = info
 ## Architecture Summary
 
 ### Tick Loop Order (Critical)
+
 ```
 _handle_running():
     1. _update_tp_sl_touch_flags(ask, bid)  # FIRST: latch crossings
@@ -398,6 +412,7 @@ _handle_running():
 ```
 
 ### Position Drop Flow
+
 ```
 Position closes in MT5
     ↓
@@ -414,6 +429,7 @@ Route:
 ```
 
 ### Expansion Flow
+
 ```
 Step trigger or TP drives expansion
     ↓
@@ -444,3 +460,73 @@ If C == 2: _force_artificial_tp_and_init()
 5. **Touch flags before drops:** `_update_tp_sl_touch_flags()` must run before `_check_position_drops()`
 
 6. **Group-scoped C:** All C checks use `_count_completed_pairs_for_group(group_id)`
+
+7. **LOCKED ENTRY PRICES IMMUTABLE:** Once set, `locked_buy_entry` and `locked_sell_entry` never change
+
+---
+
+## Session Date: 2026-01-22
+
+---
+
+## Fixes Implemented This Session
+
+### 1. Locked Entry Prices (Grid Drift Fix)
+
+**Problem:** Re-entries were happening at WRONG price levels because:
+
+1. When a position left the grid (TP/SL), the original entry price was lost
+2. `_check_virtual_triggers` recalculated trigger levels using dynamic formula:
+
+   ```python
+   # OLD (WRONG): Used relative calculation
+   buy_trigger = pair.sell_price + spread  # Dynamic!
+   ```
+
+3. This caused S100 to re-enter at 119749 when original was 119683 (66 pips drift!)
+
+**Example from logs:**
+
+- Trade #18: S100 opened at **119683.53** (original)
+- Trade #27: S100 re-opened at **119749.56** (WRONG - 66 pips higher!)
+
+**Fix Applied:**
+
+1. Added `locked_buy_entry` and `locked_sell_entry` to `GridPair` dataclass
+2. In `_execute_market_order()`: Set locked entry when trade first executes
+
+   ```python
+   if pair.locked_buy_entry == 0.0:
+       pair.locked_buy_entry = exec_price
+       print(f"[LOCKED] Pair {index} BUY entry locked at {exec_price:.2f}")
+   ```
+
+3. In `_check_virtual_triggers()`: Use locked entries instead of recalculating
+
+   ```python
+   buy_trigger = pair.locked_buy_entry if pair.locked_buy_entry > 0 else pair.buy_price
+   sell_trigger = pair.locked_sell_entry if pair.locked_sell_entry > 0 else pair.sell_price
+   ```
+
+4. Updated `schema.sql` and `repository.py` for persistence
+
+**Locations:**
+
+- `GridPair` class (lines 93-98)
+- `_execute_market_order()` (lines 3833-3845)
+- `_check_virtual_triggers()` (lines 3346-3362, 3412-3423)
+- `db/schema.sql` (grid_pairs table)
+- `core/persistence/repository.py` (upsert_pair method)
+
+**Result:**
+
+- Once B100 enters at 119783, that's B100's level FOREVER
+- Once S100 enters at 119683, that's S100's level FOREVER
+- Re-entries happen at exact same price levels
+- Grid structure remains stable across the session
+
+---
+
+## Invariant Added
+
+1. **LOCKED ENTRY PRICES IMMUTABLE:** Once `locked_buy_entry` or `locked_sell_entry` is set (non-zero), it NEVER changes. Re-entries must use these exact prices.

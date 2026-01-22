@@ -88,7 +88,10 @@ class GridPair:
     
     # Group tracking: Explicitly track which group this pair belongs to
     # This fixes the issue where bearish expansion pairs (e.g., 99) were miscategorized
-    group_id: int = 0  # Group 0 by default, set explicitly when pair is created
+    group_id: int = 0  # Group 0 for first group, 1 for second group, etc.s
+    
+    locked_buy_entry: float = 0.0   # The actual execution price when BUY first fired
+    locked_sell_entry: float = 0.0  # The actual execution price when SELL first fired
     
     def get_next_lot(self, lot_sizes: list) -> float:
         """
@@ -2229,12 +2232,35 @@ class SymbolEngine:
                     event_price = sl_price
                     reason = "SL"
                 else:
-                    # UNKNOWN -> cleanup only (no expansion/init)
-                    print(f"[DROP-UNKNOWN] Ticket={ticket} Pair={pair_idx} Leg={leg} - no touch flags, cleanup only")
-                    self.ticket_map.pop(ticket, None)
-                    self.ticket_touch_flags.pop(ticket, None)
-                    await self.repository.delete_ticket(ticket)
-                    continue
+                    # ================================================================
+                    # FALLBACK INFERENCE: Position closed between ticks before we latched flags.
+                    # Infer TP/SL based on current market price vs stored TP/SL levels.
+                    # This ensures expansion fires even if position closes faster than polling.
+                    # ================================================================
+                    if leg == 'B':  # BUY position
+                        # If current bid is at or above TP, it was TP
+                        if bid >= tp_price:
+                            is_tp = True
+                            event_price = tp_price
+                            reason = "TP"
+                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> TP (bid={bid:.2f} >= tp={tp_price:.2f})")
+                        else:
+                            is_tp = False
+                            event_price = sl_price
+                            reason = "SL"
+                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> SL (bid={bid:.2f} < tp={tp_price:.2f})")
+                    else:  # SELL position
+                        # If current ask is at or below TP, it was TP
+                        if ask <= tp_price:
+                            is_tp = True
+                            event_price = tp_price
+                            reason = "TP"
+                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> TP (ask={ask:.2f} <= tp={tp_price:.2f})")
+                        else:
+                            is_tp = False
+                            event_price = sl_price
+                            reason = "SL"
+                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> SL (ask={ask:.2f} > tp={tp_price:.2f})")
 
                 # Determine completed/incomplete using IN-MEMORY pair state (not MT5 positions).
                 # This remembers "ever filled" even if one leg already closed via SL.
@@ -3343,11 +3369,13 @@ class SymbolEngine:
             if not (pair.buy_filled and pair.sell_filled):
                 continue
             
-            # Validation: Ensure spread consistency
-            expected_buy_price = pair.sell_price + self.spread
-            if abs(pair.buy_price - expected_buy_price) > 0.5:
-                pair.buy_price = pair.sell_price + self.spread
-                await self.save_state()
+            # ================================================================
+            # USE LOCKED ENTRY PRICES FOR RE-ENTRIES
+            # Once a trade executes, its entry price is locked forever.
+            # Re-entries must happen at the exact same level.
+            # ================================================================
+            buy_trigger = pair.locked_buy_entry if pair.locked_buy_entry > 0 else pair.buy_price
+            sell_trigger = pair.locked_sell_entry if pair.locked_sell_entry > 0 else pair.sell_price
             
             # NOTE: Proximity-based re-entry for Phoenix pairs removed - no longer used
             # ================================================================
@@ -3355,16 +3383,16 @@ class SymbolEngine:
             # ================================================================
             
             # --- BUY TRIGGER ---
-            if idx > 0:   buy_in_zone_now = ask >= pair.buy_price
-            elif idx < 0: buy_in_zone_now = bid >= pair.buy_price
-            else:         buy_in_zone_now = ask >= pair.buy_price
+            if idx > 0:   buy_in_zone_now = ask >= buy_trigger
+            elif idx < 0: buy_in_zone_now = bid >= buy_trigger
+            else:         buy_in_zone_now = ask >= buy_trigger
             
             # Zone EXIT
             if pair.buy_in_zone and not buy_in_zone_now:
                 pair.buy_in_zone = False
                 if pair.buy_pending_ticket == 0:
                     pair.buy_pending_ticket = self._place_pending_order(
-                        self._get_order_type("buy", pair.buy_price), pair.buy_price, idx
+                        self._get_order_type("buy", buy_trigger), buy_trigger, idx
                     )
 
             # Zone ENTRY Logic
@@ -3408,16 +3436,16 @@ class SymbolEngine:
 
             
             # --- SELL TRIGGER ---
-            if idx > 0:   sell_in_zone_now = ask <= pair.sell_price
-            elif idx < 0: sell_in_zone_now = bid <= pair.sell_price
-            else:         sell_in_zone_now = bid <= pair.sell_price
+            if idx > 0:   sell_in_zone_now = ask <= sell_trigger
+            elif idx < 0: sell_in_zone_now = bid <= sell_trigger
+            else:         sell_in_zone_now = bid <= sell_trigger
             
             # Zone EXIT
             if pair.sell_in_zone and not sell_in_zone_now:
                 pair.sell_in_zone = False
                 if pair.sell_pending_ticket == 0:
                     pair.sell_pending_ticket = self._place_pending_order(
-                        self._get_order_type("sell", pair.sell_price), pair.sell_price, idx
+                        self._get_order_type("sell", sell_trigger), sell_trigger, idx
                     )
 
             # Zone ENTRY Logic
@@ -3830,6 +3858,19 @@ class SymbolEngine:
                 notes=f"TP={tp:.2f} SL={sl:.2f} C={self.cycle_id}",
                 trade_count=pair.trade_count if pair else 0
             )
+            
+            # ================================================================
+            # LOCKED ENTRY PRICES: Set ONCE on first execution, NEVER change
+            # This ensures re-entries happen at the exact same price level
+            # ================================================================
+            if pair:
+                if direction == "buy" and pair.locked_buy_entry == 0.0:
+                    pair.locked_buy_entry = exec_price
+                    print(f"[LOCKED] Pair {index} BUY entry locked at {exec_price:.2f}")
+                elif direction == "sell" and pair.locked_sell_entry == 0.0:
+                    pair.locked_sell_entry = exec_price
+                    print(f"[LOCKED] Pair {index} SELL entry locked at {exec_price:.2f}")
+            
             return position_ticket
         
         # Retry logic removed because we did pre-validation. 

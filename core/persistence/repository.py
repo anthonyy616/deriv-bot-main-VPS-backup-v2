@@ -87,8 +87,9 @@ class Repository:
                 buy_pending_ticket, sell_pending_ticket,
                 trade_count, next_action, is_reopened,
                 buy_in_zone, sell_in_zone,
-                hedge_ticket, hedge_direction, hedge_active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                hedge_ticket, hedge_direction, hedge_active,
+                locked_buy_entry, locked_sell_entry
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, pair_index) DO UPDATE SET
                 buy_price=excluded.buy_price,
                 sell_price=excluded.sell_price,
@@ -105,7 +106,9 @@ class Repository:
                 sell_in_zone=excluded.sell_in_zone,
                 hedge_ticket=excluded.hedge_ticket,
                 hedge_direction=excluded.hedge_direction,
-                hedge_active=excluded.hedge_active
+                hedge_active=excluded.hedge_active,
+                locked_buy_entry=excluded.locked_buy_entry,
+                locked_sell_entry=excluded.locked_sell_entry
             """,
             (
                 self.symbol, pair_data['index'], pair_data['buy_price'], pair_data['sell_price'],
@@ -117,7 +120,9 @@ class Repository:
                 pair_data.get('sell_in_zone', 0),
                 pair_data.get('hedge_ticket', 0),
                 pair_data.get('hedge_direction', None),
-                pair_data.get('hedge_active', 0)
+                pair_data.get('hedge_active', 0),
+                pair_data.get('locked_buy_entry', 0.0),
+                pair_data.get('locked_sell_entry', 0.0)
             )
         )
         await self.db.commit()

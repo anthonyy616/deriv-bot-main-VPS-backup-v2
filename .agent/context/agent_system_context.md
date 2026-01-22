@@ -9,7 +9,9 @@ This document describes the TP-driven multi-group trading system implemented in 
 ## Core Concepts
 
 ### Pairs
+
 A **pair** consists of a BUY and SELL position at related price levels:
+
 - **Pair N (positive)**: Buy at `anchor + N*D`, Sell at `anchor + (N-1)*D`
 - **Pair 0**: Buy at `anchor`, Sell at `anchor - D`
 - **Pair N (negative)**: Buy at `anchor + N*D`, Sell at `anchor + (N-1)*D`
@@ -17,16 +19,21 @@ A **pair** consists of a BUY and SELL position at related price levels:
 Where `D` = spread (grid distance) and `anchor` = initial price.
 
 ### Pair States
+
 - **Incomplete**: Only one leg filled (BUY xor SELL)
 - **Complete**: Both legs filled (BUY and SELL) - **EVER FILLED, regardless of current MT5 state**
 
 ### Completed Pairs Count (C)
+
 `C` = number of pairs with BOTH positions currently open in MT5 for a **specific group**.
+
 - Counted via MT5 positions + ticket_map (authoritative)
 - Group-scoped: `_count_completed_pairs_for_group(group_id)`
 
 ### Groups
+
 Groups are isolated namespaces for pairs:
+
 - **Group 0**: Pairs 0-99 (and negative pairs -1 to -99)
 - **Group 1**: Pairs 100-199 (and -100 to -199)
 - **Group 2**: Pairs 200-299, etc.
@@ -38,33 +45,41 @@ Each group maintains its own anchor price and pair indices.
 ## Trading Flow
 
 ### Phase 1: INIT
+
 When bot starts or new group begins:
+
 1. Place **B(offset)** (Buy at anchor) - Pair offset is incomplete
 2. Place **S(offset+1)** (Sell at anchor) - Pair offset+1 is incomplete
 3. Both use **lot index 0** (smallest lot size)
 
 **State after INIT:**
+
 - Pair offset: B only (incomplete)
 - Pair offset+1: S only (incomplete)
 - C = 0
 
 ### Phase 2: Dynamic Grid Expansion (Atomic)
+
 Grid expands atomically as price moves, until C reaches 2:
 
 **Price goes UP (bullish):**
+
 1. At trigger level: Place **B(n) + S(n+1)** atomically
    - B(n) completes pair n
    - S(n+1) starts new incomplete pair
    - C increases by 1
 
 **Price goes DOWN (bearish):**
+
 1. At trigger level: Place **S(n) + B(n-1)** atomically
    - S(n) completes pair n
    - B(n-1) starts new incomplete pair
    - C increases by 1
 
 ### Phase 3: Non-Atomic Expansion (C == 2)
+
 When C == 2 and expansion triggers:
+
 - **Only place the completing leg** (no seed leg)
 - This makes C = 3
 - **Immediately call `_force_artificial_tp_and_init()`**:
@@ -72,7 +87,9 @@ When C == 2 and expansion triggers:
   2. Fire INIT for next group at the event price
 
 ### Phase 4: Toggle Trading (C == 3)
+
 When C = 3:
+
 - **No new pair legs created** (grid stops expanding)
 - **Toggle trading continues** on completed pairs:
   - Each completed pair can trade: buy → sell → buy → sell...
@@ -80,14 +97,17 @@ When C = 3:
 - Group is "locked" but still active for toggle trading
 
 ### Phase 5: TP-Driven Events
+
 When a Take Profit (TP) is hit on a **completed pair** (detected via `_check_position_drops`):
 
 **Completed Pair TP → Group Expansion:**
+
 - When a completed pair's leg hits TP (in current or prior group)
 - Triggers expansion in the active group (if C < 3)
 - If C == 2 after expansion → non-atomic → artificial TP + INIT
 
 **Incomplete Pair TP → Cleanup Only:**
+
 - Natural incomplete TPs just cleanup (no INIT triggered here)
 - INIT is ONLY triggered by the artificial TP mechanism when C==2 non-atomic fires
 
@@ -96,7 +116,9 @@ When a Take Profit (TP) is hit on a **completed pair** (detected via `_check_pos
 ## Artificial TP Concept (Critical for Infinite Groups)
 
 ### Why Artificial TP?
+
 When C reaches 3 via non-atomic expansion:
+
 1. The grid stops expanding (locked)
 2. One incomplete pair remains at the edge
 3. Instead of waiting for this pair to naturally hit TP (which could take forever or hit on wrong edge), we **immediately**:
@@ -104,6 +126,7 @@ When C reaches 3 via non-atomic expansion:
    - Fire INIT for the next group
 
 ### Flow
+
 ```
 C==2 → Expansion triggers → Non-atomic completes (C=3)
     ↓
@@ -121,6 +144,7 @@ New group starts with B(new_offset) + S(new_offset+1)
 ## Example: Group 0 to Group 1 (Bullish Scenario)
 
 ### Group 0
+
 ```
 INIT at anchor=100.00, D=30:
   B0 @ 100.00 (Pair 0 incomplete)
@@ -143,6 +167,7 @@ Price rises to 190:
 ```
 
 ### Group 1 INIT
+
 ```
 Group 1 INIT at anchor=190.00:
   B100 @ 190.00 (Pair 100 incomplete)
@@ -161,12 +186,14 @@ Grid continues expanding in Group 1...
 **Answer:** YES. Multiple groups can have open positions simultaneously.
 
 ### Why?
+
 1. When Group 0 locks at C=3, it has 3 completed pairs still toggle-trading
 2. Group 1 starts while Group 0 positions are still open
 3. When Group 1 locks at C=3, Group 2 starts
 4. At this point: Group 0, Group 1, and Group 2 all have positions
 
 ### Example Timeline
+
 ```
 Time T1: Group 0 active, C=3 (locked), 6 positions open (3 pairs × 2 legs)
 Time T2: Group 1 INIT fires, adds 2 more positions (B100, S101)
@@ -178,6 +205,7 @@ Time T4: Group 1 locks at C=3, Group 2 INIT fires
 ```
 
 ### What Drives This?
+
 - TP distance (90) vs spread (30) = 3x ratio
 - Price volatility and direction changes
 - Toggle trading on locked groups keeps positions alive
@@ -188,35 +216,55 @@ Time T4: Group 1 locks at C=3, Group 2 INIT fires
 ## Key Implementation Details
 
 ### Ticket Map (Canonical 5-Tuple)
+
 ```python
 ticket_map[position_ticket] = (pair_idx, leg, entry_price, tp_price, sl_price)
 ```
+
 - `pair_idx`: The pair index (0, 1, 100, 101, etc.)
 - `leg`: 'B' or 'S'
 - `entry_price`: Actual execution price
 - `tp_price`: Take profit level
 - `sl_price`: Stop loss level
 
+### Locked Entry Prices (Grid Drift Prevention)
+
+```python
+pair.locked_buy_entry = exec_price   # Set ONCE on first BUY execution
+pair.locked_sell_entry = exec_price  # Set ONCE on first SELL execution
+```
+
+- Set in `_execute_market_order()` when trade first executes
+- Used in `_check_virtual_triggers()` for re-entry triggers
+- **NEVER CHANGED** after first execution (immutable)
+- Ensures re-entries happen at exact same price level
+
 ### TP/SL Touch Flags (Deterministic Detection)
+
 ```python
 ticket_touch_flags[ticket] = {'tp_touched': False, 'sl_touched': False}
 ```
+
 - Latched on every tick by `_update_tp_sl_touch_flags()`
 - BUY: `tp_touched` when `bid >= tp_price`, `sl_touched` when `bid <= sl_price`
 - SELL: `tp_touched` when `ask <= tp_price`, `sl_touched` when `ask >= sl_price`
 - Used in `_check_position_drops()` to classify closed positions
 
 ### Completed/Incomplete Determination
+
 **Uses in-memory pair state, NOT MT5 positions:**
+
 ```python
 pair = self.pairs.get(pair_idx)
 was_completed = pair and pair.buy_filled and pair.sell_filled
 ```
+
 - `pair.buy_filled` and `pair.sell_filled` remember "ever filled"
 - Even if one leg closed via SL, pair is still considered "completed"
 - This allows proper TP routing for the survivor leg
 
 ### C Counting (MT5-Authoritative)
+
 ```python
 def _count_completed_pairs_for_group(self, group_id: int) -> int:
     positions = mt5.positions_get(symbol=self.symbol)
@@ -224,6 +272,7 @@ def _count_completed_pairs_for_group(self, group_id: int) -> int:
     # Count pairs where legs == {'B', 'S'}
     # Filter by _get_group_from_pair(pair_idx) == group_id
 ```
+
 - Counts what's ACTUALLY OPEN in MT5
 - Group-scoped for proper gating
 
