@@ -182,6 +182,14 @@ async def stop_all(bot = Depends(get_current_bot)):
 @app.post("/control/start/{symbol}")
 async def start_symbol(symbol: str, bot = Depends(get_current_bot)):
     """Start a specific symbol"""
+    # Clean stale DB for fresh session
+    if os.path.exists(DB_PATH):
+        try:
+            os.remove(DB_PATH)
+            print(f"[START] Cleaned DB for fresh session: {DB_PATH}")
+        except Exception as e:
+            print(f"[START] Could not clean DB: {e}")
+    
     # Enable the symbol first
     bot.config_manager.enable_symbol(symbol, True)
     await bot.start_symbol(symbol)
