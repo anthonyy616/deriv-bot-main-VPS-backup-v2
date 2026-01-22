@@ -427,11 +427,17 @@ class SymbolEngine:
         # Latched on every tick when price crosses TP/SL levels
         self.ticket_touch_flags: Dict[int, Dict[str, bool]] = {}
 
-        # TP EXPANSION DEDUPLICATION: Track last expansion time per pair
-        # Prevents multiple positions from same pair triggering expansion multiple times
-        # pair_idx -> timestamp of last expansion
-        self._pair_last_expansion_time: Dict[int, float] = {}
-        self._expansion_debounce_seconds: float = 5.0  # Minimum seconds between expansions for same pair
+        # TP EXPANSION LOCK: Track pairs that have already fired expansion after TP
+        # Once a completed pair hits TP and fires expansion, it is PERMANENTLY blocked
+        # from firing expansion again (prevents grid inconsistency from repeated TP events)
+        # pair_idx set - if pair is in this set, expansion is blocked
+        self._pairs_tp_expanded: Set[int] = set()
+        
+        # Graceful Stop Feature:
+        # When True, NO NEW GROUPS will be created.
+        # Existing pairs will continue trading until max_positions limit is reached.
+        # Once all active pairs hit max_positions, the bot stops.
+        self.graceful_stop: bool = False
         
     @property
     def config(self) -> Dict[str, Any]:
@@ -1300,7 +1306,7 @@ class SymbolEngine:
     
     async def _check_graceful_stop_complete(self) -> bool:
         """
-        Check if graceful stop is complete (all open pairs at max_positions).
+        Check if graceful stop is complete (all open pairs at max_positions or hedged).
         Returns True if we should fully stop now.
         """
         if not self.graceful_stop:
@@ -1310,14 +1316,20 @@ class SymbolEngine:
         for idx, pair in self.pairs.items():
             # If this pair has any active positions (buy or sell filled)
             if pair.buy_filled or pair.sell_filled:
+                
+                # WAIT FOR HEDGE: If hedge is active, wait for it to resolve
+                if pair.hedge_active or pair.hedge_ticket > 0:
+                    return False
+                
+                # WAIT FOR MAX POSITIONS: If not hedged, wait for max trades
                 if pair.trade_count < self.max_positions:
                     # Still has trades to complete
                     return False
         
-        # All active pairs have reached max_positions - fully stop now
+        # All active pairs have reached max_positions or completed - fully stop now
         self.running = False
         self.graceful_stop = False
-        print(f"[STOP] {self.symbol}: Graceful stop complete. All pairs at max_positions.")
+        print(f"[STOP] {self.symbol}: Graceful stop complete. All pairs at max_positions/hedged.")
         await self.save_state()
         return True
     
@@ -1966,10 +1978,7 @@ class SymbolEngine:
         """
         ARTIFICIAL TP: Close incomplete pair and fire INIT when rollover condition met (C=3).
         """
-        # GRACEFUL STOP GUARD: Block artificial TP + INIT sequence during graceful stop
-        if self.graceful_stop:
-            print(f"[ARTIFICIAL-TP] {self.symbol}: Graceful stop active, blocking artificial TP + INIT")
-            return
+        # NOTE: Graceful stop check moved to END of function (block INIT only, allow cleanup)
 
         positions = mt5.positions_get(symbol=self.symbol)
         
@@ -2009,7 +2018,11 @@ class SymbolEngine:
         else:
             print(f"[ARTIFICIAL-TP] No incomplete pair found in Group {self.current_group}")
 
-        # Fire INIT
+        # Fire INIT - BLOCKED during graceful stop
+        if self.graceful_stop:
+            print(f"[GRACEFUL-STOP] {self.symbol}: Artificial TP complete (cleanup done), BLOCKING new group INIT due to timeout.")
+            return
+
         init_price = event_price if event_price is not None else (tick.ask + tick.bid)/2
         print(f"[ARTIFICIAL-TP] Firing INIT for Group {self.current_group + 1} at {init_price:.2f}")
         await self._execute_group_init(self.current_group + 1, init_price)
@@ -2288,23 +2301,19 @@ class SymbolEngine:
                         print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> cleanup only (no INIT here)")
                     else:
                         # Completed-pair TP
-                        # DEDUPLICATION: Only expand once per pair within debounce window
-                        # This handles multiple positions from same pair hitting TP across different ticks
-                        current_time = time.time()
-                        last_expansion = self._pair_last_expansion_time.get(pair_idx, 0)
-                        time_since_last = current_time - last_expansion
-
-                        if time_since_last < self._expansion_debounce_seconds:
-                            print(f"[TP-DEDUP] Pair={pair_idx} expanded {time_since_last:.1f}s ago (debounce={self._expansion_debounce_seconds}s), skipping")
+                        # PERMANENT LOCK: Once a pair fires expansion, it is BLOCKED forever
+                        # This prevents grid inconsistency from repeated TP events on the same pair
+                        if pair_idx in self._pairs_tp_expanded:
+                            print(f"[TP-BLOCKED] Pair={pair_idx} already fired expansion before, permanently skipping")
                         elif group_id == self.current_group:
                             C = self._count_completed_pairs_for_group(group_id)
                             print(f"[TP-COMPLETE] Active Group {group_id} -> Expansion (C={C})")
                             await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
-                            self._pair_last_expansion_time[pair_idx] = current_time
+                            self._pairs_tp_expanded.add(pair_idx)
                         elif group_id < self.current_group:
                             print(f"[TP-COMPLETE] Prior Group {group_id} -> Drive active group check")
                             await self._handle_completed_pair_expansion(event_price, is_bullish)
-                            self._pair_last_expansion_time[pair_idx] = current_time
+                            self._pairs_tp_expanded.add(pair_idx)
 
                 # Hedge close (leave your existing behavior)
                 pair = self.pairs.get(pair_idx)

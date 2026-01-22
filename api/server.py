@@ -169,6 +169,10 @@ async def start_all(bot = Depends(get_current_bot)):
             print(f"[START] Cleaned DB for fresh session: {DB_PATH}")
         except Exception as e:
             print(f"[START] Could not clean DB: {e}")
+            return {
+                "status": "blocked",
+                "error": f"DB file locked ({e}). Please terminate all or restart bot."
+            }
     
     await bot.start()
     return {"status": "started", "symbols": bot.config_manager.get_enabled_symbols()}
@@ -189,6 +193,10 @@ async def start_symbol(symbol: str, bot = Depends(get_current_bot)):
             print(f"[START] Cleaned DB for fresh session: {DB_PATH}")
         except Exception as e:
             print(f"[START] Could not clean DB: {e}")
+            return {
+                "status": "blocked",
+                "error": f"DB file locked ({e}). Please terminate all or restart bot."
+            }
     
     # Enable the symbol first
     bot.config_manager.enable_symbol(symbol, True)
@@ -213,14 +221,23 @@ async def terminate_all(bot = Depends(get_current_bot)):
     await bot.terminate_all()
     
     # Clean DB after termination for complete reset
+    db_cleaned = True
+    db_warning = None
+    
     if os.path.exists(DB_PATH):
         try:
             os.remove(DB_PATH)
             print(f"[TERMINATE] Cleaned DB after nuclear reset: {DB_PATH}")
         except Exception as e:
             print(f"[TERMINATE] Could not clean DB: {e}")
+            db_cleaned = False
+            db_warning = f"Could not delete DB file ({e}). Please retry or restart."
     
-    return {"status": "terminated_all"}
+    return {
+        "status": "terminated_all",
+        "db_cleaned": db_cleaned,
+        "warning": db_warning
+    }
 
 @app.get("/status")
 async def get_status(bot = Depends(get_current_bot)):
