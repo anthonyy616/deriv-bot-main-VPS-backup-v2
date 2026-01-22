@@ -423,6 +423,12 @@ class SymbolEngine:
         # TP/SL touch tracking: ticket -> {'tp_touched': bool, 'sl_touched': bool}
         # Latched on every tick when price crosses TP/SL levels
         self.ticket_touch_flags: Dict[int, Dict[str, bool]] = {}
+
+        # TP EXPANSION DEDUPLICATION: Track last expansion time per pair
+        # Prevents multiple positions from same pair triggering expansion multiple times
+        # pair_idx -> timestamp of last expansion
+        self._pair_last_expansion_time: Dict[int, float] = {}
+        self._expansion_debounce_seconds: float = 5.0  # Minimum seconds between expansions for same pair
         
     @property
     def config(self) -> Dict[str, Any]:
@@ -2236,10 +2242,19 @@ class SymbolEngine:
                 was_completed = pair and pair.buy_filled and pair.sell_filled
                 was_incomplete = not was_completed
 
-                print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f} "
-                    f"Incomplete={was_incomplete} Group={group_id}")
+                # DEBUG: Trace pair flags to identify incorrect "completed" detection for INIT pairs
+                if pair:
+                    print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f} "
+                        f"buy_filled={pair.buy_filled} sell_filled={pair.sell_filled} "
+                        f"Completed={was_completed} Group={group_id}")
+                else:
+                    print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f} "
+                        f"Pair=None! Group={group_id}")
 
                 # ROUTING
+                # Determine direction from which leg hit TP (needed for expansion)
+                is_bullish = (leg == 'B')  # Buy leg TP = price went up = bullish
+                
                 if is_tp:
                     if was_incomplete:
                         # Do NOT init here (prevents runaway group creation).
@@ -2247,13 +2262,23 @@ class SymbolEngine:
                         print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> cleanup only (no INIT here)")
                     else:
                         # Completed-pair TP
-                        if group_id == self.current_group:
+                        # DEDUPLICATION: Only expand once per pair within debounce window
+                        # This handles multiple positions from same pair hitting TP across different ticks
+                        current_time = time.time()
+                        last_expansion = self._pair_last_expansion_time.get(pair_idx, 0)
+                        time_since_last = current_time - last_expansion
+
+                        if time_since_last < self._expansion_debounce_seconds:
+                            print(f"[TP-DEDUP] Pair={pair_idx} expanded {time_since_last:.1f}s ago (debounce={self._expansion_debounce_seconds}s), skipping")
+                        elif group_id == self.current_group:
                             C = self._count_completed_pairs_for_group(group_id)
                             print(f"[TP-COMPLETE] Active Group {group_id} -> Expansion (C={C})")
                             await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
+                            self._pair_last_expansion_time[pair_idx] = current_time
                         elif group_id < self.current_group:
                             print(f"[TP-COMPLETE] Prior Group {group_id} -> Drive active group check")
                             await self._handle_completed_pair_expansion(event_price, is_bullish)
+                            self._pair_last_expansion_time[pair_idx] = current_time
 
                 # Hedge close (leave your existing behavior)
                 pair = self.pairs.get(pair_idx)
