@@ -8,3 +8,6 @@ MetaTrader5
 requests
 pydantic
 aiosqlite
+cryptography
+cachetools
+supabase

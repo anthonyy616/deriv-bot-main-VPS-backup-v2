@@ -270,6 +270,45 @@
         </div>
     </div>
 
+    <!-- MT5 Account Linking Modal -->
+    <div id="mt5-link-modal"
+        class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center hidden">
+        <div
+            class="bg-white dark:bg-slate-800 p-8 rounded-lg shadow-2xl w-full max-w-md border border-slate-200 dark:border-slate-700">
+            <h2 class="text-2xl font-bold text-center mb-2 text-purple-500">🔗 Link MT5 Account</h2>
+            <p class="text-sm text-center text-slate-500 mb-6">Connect your WelTrade MT5 trading account to start
+                trading</p>
+            <form id="form-mt5-link" onsubmit="handleMT5Link(event)" class="space-y-4">
+                <div>
+                    <label class="block text-sm font-medium mb-1">MT5 Login</label>
+                    <input type="text" id="mt5-login"
+                        class="w-full p-2 rounded bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 outline-none"
+                        required placeholder="12345678">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-1">MT5 Password</label>
+                    <input type="password" id="mt5-password"
+                        class="w-full p-2 rounded bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 outline-none"
+                        required placeholder="••••••••">
+                </div>
+                <div>
+                    <label class="block text-sm font-medium mb-1">MT5 Server</label>
+                    <input type="text" id="mt5-server"
+                        class="w-full p-2 rounded bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-600 outline-none"
+                        required placeholder="Weltrade-Demo">
+                </div>
+                <button type="submit" id="mt5-link-btn"
+                    class="w-full py-2 px-4 bg-purple-600 hover:bg-purple-700 text-white rounded font-medium transition flex justify-center items-center gap-2">
+                    <span>Link Account</span>
+                </button>
+            </form>
+            <p id="mt5-link-error" class="text-red-500 text-sm text-center mt-4 hidden"></p>
+            <p class="text-xs text-slate-500 text-center mt-4">
+                Your credentials are encrypted and stored securely. Each MT5 account can only be linked to one user.
+            </p>
+        </div>
+    </div>
+
     <div id="dashboard" class="max-w-6xl mx-auto space-y-6 hidden">
         <div class="flex items-center justify-between">
             <h1 class="text-2xl md:text-3xl font-bold text-blue-500">Weltrade MT5 Bot</h1>
@@ -281,6 +320,9 @@
                 <button id="toggle-btn"
                     class="px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm font-medium rounded"
                     onclick="toggleBot()">Start Bot</button>
+                <button onclick="unlinkMT5()"
+                    class="px-3 py-1.5 bg-purple-500/10 text-purple-500 text-xs font-medium rounded border border-purple-500/20"
+                    title="Disconnect MT5 account">🔗 Unlink</button>
                 <button onclick="logout()"
                     class="px-3 py-1.5 bg-red-500/10 text-red-500 text-xs font-medium rounded border border-red-500/20">Sign
                     Out</button>
@@ -634,23 +676,121 @@
         let updateInterval = null;
         let sessionToken = null;
         let lastRunningState = false;
+        let mt5Linked = false;  // Track MT5 linking status
 
         // --- 1. UI State Helpers ---
-        function setLoggedInState(session) {
+        async function setLoggedInState(session) {
             sessionToken = session.access_token;
             document.getElementById('login-modal').classList.add('hidden');
-            document.getElementById('dashboard').classList.remove('hidden');
+
             const btn = document.getElementById('login-btn');
             if (btn) btn.innerHTML = 'Sign In / Register';
             log("✅ Authenticated.");
-            loadConfig();
-            startPolling();
+
+            // Check MT5 linking status BEFORE showing dashboard
+            await checkMT5Status();
+        }
+
+        async function checkMT5Status() {
+            try {
+                const status = await apiCallDirect('/mt5/status');
+                if (status && status.linked) {
+                    mt5Linked = true;
+                    document.getElementById('mt5-link-modal').classList.add('hidden');
+                    document.getElementById('dashboard').classList.remove('hidden');
+                    log(`🔗 MT5 Connected: ${status.login}@${status.server}`);
+                    loadConfig();
+                    startPolling();
+                } else {
+                    // Show MT5 linking modal
+                    mt5Linked = false;
+                    document.getElementById('mt5-link-modal').classList.remove('hidden');
+                    document.getElementById('dashboard').classList.add('hidden');
+                }
+            } catch (e) {
+                console.error("MT5 status check failed:", e);
+                // Show linking modal on error
+                document.getElementById('mt5-link-modal').classList.remove('hidden');
+            }
+        }
+
+        async function handleMT5Link(e) {
+            e.preventDefault();
+            const login = document.getElementById('mt5-login').value;
+            const password = document.getElementById('mt5-password').value;
+            const server = document.getElementById('mt5-server').value;
+            const btn = document.getElementById('mt5-link-btn');
+            const errBox = document.getElementById('mt5-link-error');
+
+            errBox.classList.add('hidden');
+            btn.innerHTML = '<div class="loader"></div> Validating...';
+
+            try {
+                const result = await apiCallDirect('/mt5/link', 'POST', { login, password, server });
+
+                if (result && result.status === 'linked') {
+                    mt5Linked = true;
+                    document.getElementById('mt5-link-modal').classList.add('hidden');
+                    document.getElementById('dashboard').classList.remove('hidden');
+                    log(`✅ MT5 Linked: ${result.login}@${result.server}`);
+                    loadConfig();
+                    startPolling();
+                } else {
+                    throw new Error(result?.detail || 'Failed to link MT5 account');
+                }
+            } catch (e) {
+                console.error("MT5 Link Error:", e);
+                errBox.textContent = e.message || "Failed to link MT5 account";
+                errBox.classList.remove('hidden');
+                btn.innerHTML = '<span>Link Account</span>';
+            }
+        }
+
+        async function unlinkMT5() {
+            if (!confirm('Are you sure you want to unlink your MT5 account? This will stop all trading.')) {
+                return;
+            }
+
+            try {
+                const result = await apiCall('/mt5/unlink', 'DELETE');
+                if (result) {
+                    mt5Linked = false;
+                    log("🔓 MT5 account unlinked");
+                    document.getElementById('dashboard').classList.add('hidden');
+                    document.getElementById('mt5-link-modal').classList.remove('hidden');
+                }
+            } catch (e) {
+                console.error("Unlink error:", e);
+            }
+        }
+
+        // Direct API call without bot dependency (for MT5 linking)
+        async function apiCallDirect(endpoint, method = 'GET', body = null) {
+            const { data } = await supabaseClient.auth.getSession();
+            const token = data.session?.access_token;
+            if (!token) return null;
+
+            const headers = {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json'
+            };
+            const opts = { method, headers };
+            if (body) opts.body = JSON.stringify(body);
+
+            const res = await fetch(endpoint, opts);
+            if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                throw new Error(err.detail || `HTTP ${res.status}`);
+            }
+            return res.json();
         }
 
         function setLoggedOutState() {
             sessionToken = null;
+            mt5Linked = false;
             document.getElementById('login-modal').classList.remove('hidden');
             document.getElementById('dashboard').classList.add('hidden');
+            document.getElementById('mt5-link-modal').classList.add('hidden');
             if (updateInterval) clearInterval(updateInterval);
         }
 

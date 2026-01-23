@@ -5,7 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from core.bot_manager import BotManager
-from core.trading_engine import TradingEngine 
+from core.trading_engine import TradingEngine
+from core.mt5_credential_manager import MT5CredentialManager
+from core.user_mt5_bridge import UserMT5Bridge
 from supabase import create_client, Client
 import asyncio
 import os
@@ -78,6 +80,12 @@ class ConfigUpdate(BaseModel):
     global_settings: Optional[GlobalConfig] = None
     symbols: Optional[Dict[str, SymbolConfig]] = None
 
+class MT5LinkCredentials(BaseModel):
+    """MT5 account linking payload"""
+    login: str
+    password: str
+    server: str
+
 
 # --- 2. Auth Helper ---
 def verify_token_sync(token):
@@ -99,6 +107,27 @@ def verify_token_sync(token):
         if token in auth_cache:
             del auth_cache[token]
     return None
+
+async def get_current_user(request: Request):
+    """
+    Get the current authenticated user (just user info, not bot).
+    Used for MT5 linking endpoints that don't need bot instance.
+    """
+    auth_header = request.headers.get('Authorization')
+    if not auth_header:
+        raise HTTPException(401, "Missing token")
+    
+    try:
+        token = auth_header.split(" ")[1]
+        user = await asyncio.to_thread(verify_token_sync, token)
+    except Exception as e:
+        print(f"[AUTH] Check Failed: {e}")
+        raise HTTPException(401, "Auth Validation Failed")
+    
+    if not user:
+        raise HTTPException(401, "Invalid Token")
+    
+    return user.user
 
 async def get_current_bot(request: Request):
     """
@@ -171,7 +200,7 @@ async def start_all(bot = Depends(get_current_bot)):
             print(f"[START] Could not clean DB: {e}")
             return {
                 "status": "blocked",
-                "error": f"DB file locked ({e}). Please terminate all or restart bot."
+                "error": f"DB file locked ({e}). Please click on terminate all to start bot."
             }
     
     await bot.start()
@@ -231,7 +260,7 @@ async def terminate_all(bot = Depends(get_current_bot)):
         except Exception as e:
             print(f"[TERMINATE] Could not clean DB: {e}")
             db_cleaned = False
-            db_warning = f"Could not delete DB file ({e}). Please retry or restart."
+            db_warning = f"Could not delete DB file ({e}). Please click on terminate all again."
     
     return {
         "status": "terminated_all",
@@ -260,6 +289,92 @@ async def get_session_log(session_id: str, bot = Depends(get_current_bot)):
         from fastapi.responses import PlainTextResponse
         return PlainTextResponse(content)
     raise HTTPException(404, "Session not found")
+
+# --- MT5 Account Linking Endpoints ---
+
+# Initialize credential manager (lazy - will be created when first used)
+_credential_manager = None
+
+def get_credential_manager():
+    global _credential_manager
+    if _credential_manager is None:
+        _credential_manager = MT5CredentialManager(supabase)
+    return _credential_manager
+
+@app.get("/mt5/status")
+async def get_mt5_status(user = Depends(get_current_user)):
+    """Check if user has linked MT5 account"""
+    cm = get_credential_manager()
+    creds = await cm.get_credentials(user.id)
+    
+    if creds:
+        return {
+            "linked": True,
+            "login": creds.login,
+            "server": creds.server,
+            "is_connected": creds.is_connected
+        }
+    return {"linked": False}
+
+@app.post("/mt5/link")
+async def link_mt5_account(credentials: MT5LinkCredentials, user = Depends(get_current_user)):
+    """
+    Link MT5 account to user. Validates credentials before saving.
+    Each MT5 account can only be linked to ONE user.
+    """
+    cm = get_credential_manager()
+    
+    # Check if MT5 is already linked to another user
+    is_available = await cm.is_mt5_available(credentials.login, credentials.server, user.id)
+    if not is_available:
+        raise HTTPException(400, f"MT5 account {credentials.login}@{credentials.server} is already linked to another user")
+    
+    # Validate credentials by attempting connection
+    mt5_path = os.getenv("MT5_PATH", "")
+    success, message = UserMT5Bridge.validate_credentials(
+        int(credentials.login),
+        credentials.password,
+        credentials.server,
+        mt5_path
+    )
+    
+    if not success:
+        raise HTTPException(400, f"MT5 validation failed: {message}")
+    
+    # Save encrypted credentials
+    try:
+        saved = await cm.save_credentials(
+            user.id,
+            credentials.login,
+            credentials.password,
+            credentials.server
+        )
+        return {
+            "status": "linked",
+            "login": credentials.login,
+            "server": credentials.server,
+            "message": message
+        }
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.delete("/mt5/unlink")
+async def unlink_mt5_account(user = Depends(get_current_user)):
+    """Unlink MT5 account from user"""
+    cm = get_credential_manager()
+    
+    # Stop any running bots first
+    bot = bot_manager.get_bot(user.id)
+    if bot:
+        await bot.terminate_all()
+        await bot_manager.stop_bot(user.id)
+    
+    # Delete credentials
+    deleted = await cm.delete_credentials(user.id)
+    
+    if deleted:
+        return {"status": "unlinked", "message": "MT5 account unlinked successfully"}
+    return {"status": "not_linked", "message": "No MT5 account was linked"}
 
 # Mount static folder for assets (css/js images)
 app.mount("/static", StaticFiles(directory="static"), name="static")
