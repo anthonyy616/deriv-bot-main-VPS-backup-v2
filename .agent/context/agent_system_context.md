@@ -58,7 +58,9 @@ When bot starts or new group begins:
 - Pair offset+1: S only (incomplete)
 - C = 0
 
-### Phase 2: Dynamic Grid Expansion (Atomic)
+### Phase 2: Dynamic Grid Expansion (Atomic) - ALL GROUPS
+
+**IMPORTANT: All groups expand normally via step triggers, not just Group 0.**
 
 Grid expands atomically as price moves, until C reaches 2:
 
@@ -83,7 +85,7 @@ When C == 2 and expansion triggers:
 - **Only place the completing leg** (no seed leg)
 - This makes C = 3
 - **Immediately call `_force_artificial_tp_and_init()`**:
-  1. Find and close the remaining incomplete pair in current group
+  1. Find and close the remaining incomplete pair at the OPPOSITE edge
   2. Fire INIT for next group at the event price
 
 ### Phase 4: Toggle Trading (C == 3)
@@ -98,19 +100,18 @@ When C = 3:
 
 ### Phase 5: TP-Driven Events
 
-When a Take Profit (TP) is hit on a **completed pair** (detected via `_check_position_drops`):
+**Incomplete Pair TP → Fire INIT for Next Group:**
 
-**Completed Pair TP → Group Expansion:**
+- When an incomplete pair's leg hits TP, INIT fires for the next group
+- **Permanent Lock Logic**: `_incomplete_pairs_init_triggered` set prevents duplicate INITs from the same pair
+- This allows infinite group progression without waiting for C=3 non-atomic
+
+**Completed Pair TP → Conditional Expansion:**
 
 - When a completed pair's leg hits TP (in current or prior group)
-- **Permanent Lock Logic**: Once a pair fires expansion, it is permanently added to `_pairs_tp_expanded` and cannot fire expansion again. This prevents duplicate expansion triggers from the same pair.
-- Triggers expansion in the active group (if C < 3)
-- If C == 2 after expansion → non-atomic → artificial TP + INIT
-
-**Incomplete Pair TP → Cleanup Only:**
-
-- Natural incomplete TPs just cleanup (no INIT triggered here)
-- INIT is ONLY triggered by the artificial TP mechanism when C==2 non-atomic fires
+- **SKIP if normal expansion is active (C < 3)**: This prevents double expansion from both step triggers and TP-driven expansion
+- **Permanent Lock Logic**: Once a pair fires expansion, it is permanently added to `_pairs_tp_expanded` and cannot fire expansion again
+- If C == 3, triggers expansion via artificial TP mechanism
 
 ---
 

@@ -6,7 +6,55 @@
 
 ## Fixes Implemented This Session
 
-### 1. Permanent Per-Pair TP Expansion Lock
+### 1. Normal Expansion for All Groups (Infinite Groups Fix)
+
+**Problem:** Step trigger expansion was only working for Group 0. Groups 1+ were waiting for completed pair TPs to drive expansion, which was incorrect. The strategy requires ALL groups to expand normally via step triggers.
+
+**Fix:** Removed the guard that blocked step triggers for Group 1+.
+
+1. Removed `if self.current_group > 0: return` from `_check_step_triggers()`.
+2. All groups now expand normally: INIT → atomic expansion until C=2 → non-atomic at C=3 → artificial TP → INIT next group.
+3. Each group uses its own anchor price stored in `group_anchors`.
+
+**Example Flow:**
+
+- Group 0: Price 0→50→100→150 (bullish) → C=3 → INIT Group 1 at 150
+- Group 1: Price 150→100→50→0 (bearish) → C=3 → INIT Group 2 at 0
+- Group 2: Price 0→50→100→150 (bullish) → C=3 → INIT Group 3 at 150
+- ... pattern repeats infinitely
+
+**Location:** `symbol_engine.py` (lines ~811-823)
+
+---
+
+### 2. Incomplete Pair TP → INIT for Next Group
+
+**Problem:** Natural incomplete pair TPs were only doing cleanup, not firing INIT. This prevented infinite group progression in some scenarios.
+
+**Fix:** Incomplete pair TPs now fire INIT for the next group.
+
+1. Added `_incomplete_pairs_init_triggered: Set[int]` to prevent duplicate INITs from the same pair.
+2. When an incomplete pair hits TP, INIT fires for `current_group + 1` at the TP event price.
+3. Subsequent TP hits on that same pair are blocked (set protection).
+
+**Location:** `symbol_engine.py` (lines ~440, ~2298-2307)
+
+---
+
+### 3. Completed Pair TP Skips Expansion When Normal Expansion Active
+
+**Problem:** Completed pair TPs could fire TP-driven expansion even when step triggers were already handling expansion (C < 3). This could cause double expansion.
+
+**Fix:** Added C < 3 check to skip TP-driven expansion when normal expansion is active.
+
+1. If `C < 3` for current group, completed pair TP logs `[TP-COMPLETE-SKIP]` and does not fire expansion.
+2. TP-driven expansion only fires when `C >= 3` (group is locked).
+
+**Location:** `symbol_engine.py` (lines ~2308-2316)
+
+---
+
+### 4. Permanent Per-Pair TP Expansion Lock
 
 **Problem:** The TP expansion logic used a time-based debounce (5 seconds), which allowed the same pair to trigger expansion multiple times if TP events occurred spaced out (e.g., B102 + S103 firing twice). This caused grid inconsistency and unintended trade sequences.
 

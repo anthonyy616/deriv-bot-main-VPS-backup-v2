@@ -402,6 +402,12 @@ class SymbolEngine:
         self.group_anchors: Dict[int, float] = {} # group_id -> anchor_price
         self.pending_init: bool = False           # True = incomplete TP hit but C < 3, queue INIT
         
+        # High-Water Mark for C (Completed Pairs)
+        # Tracks the maximum C ever reached for each group.
+        # This ensures that even if pairs close (dropping live C), the group progression logic
+        # knows it has already achieved a certain level of completion.
+        self.group_c_highwater: Dict[int, int] = defaultdict(int)
+        
         # Legacy fields (maintained for compatibility)
         self.cycle_id: int = 0                    # Maps to current_group for now
         self.anchor_price: float = 0.0            # Per-cycle anchor (startup or TP price)
@@ -432,6 +438,11 @@ class SymbolEngine:
         # from firing expansion again (prevents grid inconsistency from repeated TP events)
         # pair_idx set - if pair is in this set, expansion is blocked
         self._pairs_tp_expanded: Set[int] = set()
+        
+        # INCOMPLETE PAIR INIT LOCK: Track incomplete pairs that have already fired INIT
+        # Prevents duplicate INITs when toggle-trading creates multiple positions of same pair
+        # Once an incomplete pair fires INIT, subsequent TP hits on that pair are blocked
+        self._incomplete_pairs_init_triggered: Set[int] = set()
         
         # Graceful Stop Feature:
         # When True, NO NEW GROUPS will be created.
@@ -690,19 +701,46 @@ class SymbolEngine:
                 if not flags['sl_touched'] and ask >= sl_price:
                     flags['sl_touched'] = True
     
+    def _update_c_highwater(self, group_id: int, current_c: int):
+        """
+        Update the high-water mark for C in a group.
+        Only updates if current_c is greater than the previous high-water mark.
+        """
+        prev = self.group_c_highwater[group_id]  # Defaultdict returns 0 if missing
+        if current_c > prev:
+            self.group_c_highwater[group_id] = current_c
+            #print(f"[C-HIGHWATER] Group {group_id}: High-water updated {prev} -> {current_c}")
+            
+    def _get_c_highwater(self, group_id: int) -> int:
+        """Get the high-water mark for C for expansion gating."""
+        return self.group_c_highwater[group_id]
+
     def _count_completed_pairs_for_group(self, group_id: int) -> int:
         """Count completed pairs (C) for a specific group only."""
         offset = self._get_pair_offset(group_id)
-        count = 0
         
-        # Check positive pairs in group range
-        for idx, pair in self.pairs.items():
-            pair_group = self._get_group_from_pair(idx)
-            if pair_group == group_id:
-                if pair.buy_filled and pair.sell_filled:
-                    count += 1
+        # Use MT5 authoritative source via ticket_map
+        positions = mt5.positions_get(symbol=self.symbol)
+        pair_legs = defaultdict(set)
         
-        return count
+        # 1. Map all open legs to pairs
+        if positions:
+            for pos in positions:
+                info = self.ticket_map.get(pos.ticket)
+                if info and len(info) >= 5:
+                    pair_idx, leg, _, _, _ = info
+                    pair_legs[pair_idx].add(leg)
+        
+        # 2. Count pairs with both legs that belong to this group
+        live_count = 0
+        for p_idx, legs in pair_legs.items():
+            if legs == {'B', 'S'} and self._get_group_from_pair(p_idx) == group_id:
+                live_count += 1
+                
+        # 3. Update High-Water Mark Logic
+        self._update_c_highwater(group_id, live_count)
+        
+        return live_count
     
     def _is_group_locked(self, group_id: int) -> bool:
         """Check if a specific group is locked (C >= 3)."""
@@ -805,12 +843,12 @@ class SymbolEngine:
 
     async def _check_step_triggers(self, ask: float, bid: float):
         """
-        DYNAMIC GRID EXPANSION for GROUP 0 ONLY.
+        DYNAMIC GRID EXPANSION for ALL GROUPS.
 
-        Groups > 0 expand via TP-driven expansion (_execute_tp_expansion),
-        NOT via step triggers. This prevents race conditions between the two paths.
-
-        Expands grid at each new level until C >= 3 for Group 0.
+        All groups expand normally via step triggers when price moves.
+        Each group uses its own anchor price stored in group_anchors.
+        
+        Expands grid at each new level until C >= 3 for current group.
         Grid expands in WHICHEVER direction price moves:
         - Bullish: Complete incomplete pair with B, seed next pair with S
         - Bearish: Complete incomplete pair with S, seed next pair with B
@@ -819,16 +857,15 @@ class SymbolEngine:
         if self.graceful_stop:
             return
 
-        # GUARD: Step triggers ONLY apply to Group 0
-        # Groups > 0 expand via TP-driven expansion from prior group TPs
-        if self.current_group > 0:
-            return
+        # NOTE: Step triggers now apply to ALL groups (not just Group 0)
+        # Each group expands normally from its anchor price
 
         D = self.spread
         T = self.tolerance
 
-        # Only count C for current group
-        C = self._count_completed_pairs_for_group(self.current_group)
+        # Only count C for current group (Use High-Water Mark for gating)
+        # This prevents regression if positions close
+        C = self._get_c_highwater(self.current_group)
         
         # Don't expand if current group already has 3 completed pairs
         if C >= 3:
@@ -910,7 +947,8 @@ class SymbolEngine:
         If C==2, do NON-ATOMIC completion then immediately artificial-close + INIT next group.
         """
         async with self.execution_lock:
-            C = self._count_completed_pairs_for_group(self.current_group)
+            # Use High-Water C for gating
+            C = self._get_c_highwater(self.current_group)
             if C >= 3:
                 print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
                 return
@@ -971,7 +1009,8 @@ class SymbolEngine:
         If C==2, do NON-ATOMIC completion then immediately artificial-close + INIT next group.
         """
         async with self.execution_lock:
-            C = self._count_completed_pairs_for_group(self.current_group)
+            # Use High-Water C for gating
+            C = self._get_c_highwater(self.current_group)
             if C >= 3:
                 print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
                 return
@@ -2172,7 +2211,7 @@ class SymbolEngine:
              # Already full, no expansion needed
              return
 
-        print(f"[PRIOR-TP-DRIVER] Driving Active Group {group_id} Check (C={C})")
+        #print(f"[PRIOR-TP-DRIVER] Driving Active Group {group_id} Check (C={C})")
         # Reuse the main expansion logic
         await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
 
@@ -2296,23 +2335,40 @@ class SymbolEngine:
                 
                 if is_tp:
                     if was_incomplete:
-                        # Do NOT init here (prevents runaway group creation).
-                        # Rollover INIT must be driven by your C==2 non-atomic + artificial close mechanism.
-                        print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> cleanup only (no INIT here)")
+                        # INCOMPLETE PAIR TP -> Fire INIT for next group
+                        # Check duplicate prevention set first
+                        if pair_idx in self._incomplete_pairs_init_triggered:
+                            print(f"[TP-INCOMPLETE-BLOCKED] Pair={pair_idx} already fired INIT before, skipping")
+                        elif self.graceful_stop:
+                            print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> graceful stop active, no INIT")
+                        else:
+                            print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> Firing INIT for Group {self.current_group + 1}")
+                            self._incomplete_pairs_init_triggered.add(pair_idx)
+                            await self._execute_group_init(self.current_group + 1, event_price)
                     else:
                         # Completed-pair TP
-                        # PERMANENT LOCK: Once a pair fires expansion, it is BLOCKED forever
-                        # This prevents grid inconsistency from repeated TP events on the same pair
+                        # FORCE NORMAL EXPANSION using High-Water C
+                        # We do NOT skip based on live C dropping. We use high-water C to gate atomic/non-atomic logic inside.
+                        
+                        # Get verified high-water C
+                        C_highwater = self._get_c_highwater(self.current_group)
+                        
                         if pair_idx in self._pairs_tp_expanded:
-                            print(f"[TP-BLOCKED] Pair={pair_idx} already fired expansion before, permanently skipping")
+                            print(f"[TP-BLOCKED] Pair={pair_idx} already fired expansion")
+                            
                         elif group_id == self.current_group:
-                            C = self._count_completed_pairs_for_group(group_id)
-                            print(f"[TP-COMPLETE] Active Group {group_id} -> Expansion (C={C})")
-                            await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
+                            print(f"[TP-COMPLETE] Active Group {group_id} -> Executing Expansion (C_Highwater={C_highwater})")
+                            # Call expansion regardless of C value (pass C_highwater so it knows if it should be atomic)
+                            await self._execute_tp_expansion(group_id, event_price, is_bullish, C_highwater)
                             self._pairs_tp_expanded.add(pair_idx)
-                        elif group_id < self.current_group:
-                            print(f"[TP-COMPLETE] Prior Group {group_id} -> Drive active group check")
+                            
+                        elif group_id == self.current_group - 1:
+                            print(f"[TP-COMPLETE] Prior Group {group_id} (Parent) -> Drive active group check")
                             await self._handle_completed_pair_expansion(event_price, is_bullish)
+                            self._pairs_tp_expanded.add(pair_idx)
+                        elif group_id < self.current_group - 1:
+                            print(f"[TP-COMPLETE] Ancestor Group {group_id} < {self.current_group - 1} -> Ignoring for expansion (prevent double execution)")
+                            # Still mark as expanded to prevent repeated logs, but don't drive expansion
                             self._pairs_tp_expanded.add(pair_idx)
 
                 # Hedge close (leave your existing behavior)
@@ -3745,7 +3801,7 @@ class SymbolEngine:
             sl = exec_price + sl_pips
         
         # DEBUG: Log TP/SL calculation
-        print(f"[TP/SL] {direction.upper()} Pair {index}: exec_price={exec_price:.2f} tp_pips={tp_pips} sl_pips={sl_pips} → TP={tp:.2f} SL={sl:.2f}")
+        #print(f"[TP/SL] {direction.upper()} Pair {index}: exec_price={exec_price:.2f} tp_pips={tp_pips} sl_pips={sl_pips} → TP={tp:.2f} SL={sl:.2f}")
 
         # 3. SAFETY CHECK: Validate against Current Market Price (Execution Price)
         # MT5 'Invalid Stops' happens if TP/SL are too close to CURRENT Ask/Bid
@@ -3850,7 +3906,7 @@ class SymbolEngine:
             await self.repository.save_ticket(position_ticket, self.cycle_id, index, leg, trade_count,
                                               entry_price=exec_price, tp_price=tp, sl_price=sl)
             
-            print(f"[TICKET_MAP] pos={position_ticket} -> (cycle={self.cycle_id}, pair={index}, leg={leg})")
+            #print(f"[TICKET_MAP] pos={position_ticket} -> (cycle={self.cycle_id}, pair={index}, leg={leg})")
             
             # Log order placement
             print(f"[ORDER] cycle={self.cycle_id} pair={index} leg={leg} reason={reason}")
