@@ -595,9 +595,16 @@ class SymbolEngine:
         # Get group-specific C count (not global!)
         group_id = pair.group_id
         C = self._count_completed_pairs_for_group(group_id)
-        
         # If already at cap (C >= 3), check if this would complete an INCOMPLETE pair
         if C >= 3:
+            # EXCEPTION: If this trade will bring us to (or above) max_positions, ALLOW it.
+            # This is critical for small max_positions (e.g. 2) where the "completing" leg
+            # is also the "hedging" leg. If we block it, we prevent the hedge.
+            # Since hedging neutralizes the pair (removing it from C calculation), 
+            # this trade is effectively neutral to risk.
+            if (pair.trade_count + 1) >= self.max_positions:
+                return True
+
             # Check if pair is currently incomplete (only one leg filled)
             pair_is_incomplete = pair.buy_filled != pair.sell_filled
             
@@ -3480,10 +3487,31 @@ class SymbolEngine:
             if pair.tp_blocked:
                 continue
             
+            # ================================================================
+            # [SIMPLE HEDGE TRIGGER]
+            # Rule: "Once a pair trades to max positions then execute hedge."
+            # This is independent of completion status or any other blocks.
+            # ================================================================
+            if pair.trade_count >= self.max_positions and self.hedge_enabled and not pair.hedge_active:
+                # Deterministic Hedge Direction Logic
+                hedge_dir = None
+                is_odd = (self.max_positions % 2 != 0)
+                
+                if idx <= 0: # Zero & Negative Pairs
+                    if is_odd: hedge_dir = "sell"
+                    else:      hedge_dir = "buy"
+                else: # Positive Pairs
+                    if is_odd: hedge_dir = "buy"
+                    else:      hedge_dir = "sell"
+                
+                print(f" {self.symbol}: [HEDGE TRIGGER] Pair {idx} hit Max {self.max_positions}. executing {hedge_dir.upper()} hedge.")
+                await self._execute_hedge(idx, hedge_dir)
+                # Continue triggers to allow expansion if needed, but hedge is prioritised
+
+
             # GROUPS+CAP GATE: Only process pairs that have EVER been completed
             # (both buy_filled and sell_filled are True at some point)
             # Expansion is handled by step triggers, this is only for toggle trading
-            # NOTE: Using pair state (buy_filled/sell_filled) instead of live MT5 positions
             # because toggle re-entry should work even after one leg hits TP/SL
             if not (pair.buy_filled and pair.sell_filled):
                 continue
@@ -3694,34 +3722,54 @@ class SymbolEngine:
         # Upper Limit = Buy Entry + Buy TP Pips (approx) OR Sell Entry + Sell SL Pips
         # Lower Limit = Sell Entry - Sell TP Pips (approx) OR Buy Entry - Buy SL Pips
         
-        # Use simple offsets from the grid prices to find the intended levels
-        tp_pips = float(self.config.get('buy_stop_tp', 20.0)) * point # Default assumption
-        sl_pips = float(self.config.get('buy_stop_sl', 20.0)) * point
+        print(f" {self.symbol}: [HEDGE-WARNING] Could not find opposing position to inherit. Using fallback calculation.")
+        # Fallback Logic (Standard Grid Specs)
+        if pair.pair_tp > 0 and pair.pair_sl > 0:
+            h_tp = max(pair.pair_tp, pair.pair_sl) if direction == 'buy' else min(pair.pair_tp, pair.pair_sl)
+            h_sl = min(pair.pair_tp, pair.pair_sl) if direction == 'buy' else max(pair.pair_tp, pair.pair_sl)
+        else:
+            h_tp = pair.sell_price + self.spread if direction == 'buy' else pair.buy_price - self.spread # Just rough estimate
+            h_sl = pair.sell_price - self.spread if direction == 'buy' else pair.buy_price + self.spread
+    
         
         # If we have existing values, use them to define the range, otherwise calculate
         # We assume the "Upper" is the Buy's TP level and "Lower" is Sell's TP level
         # This matches the "Cycle" logic where both sides share exit levels
         
         if pair.pair_tp > 0 and pair.pair_sl > 0:
-            # Determine which is Top and Bottom
+            # Standard Inheritance: The box is already defined by the first trade of the cycle
             upper_limit = max(pair.pair_tp, pair.pair_sl)
             lower_limit = min(pair.pair_tp, pair.pair_sl)
         else:
-            # Fallback calculation
+            # Fallback (Should rarely happen for a maxed pair)
+            tp_pips = float(self.config.get('buy_stop_tp', 20.0)) * point 
             upper_limit = pair.buy_price + tp_pips
             lower_limit = pair.sell_price - tp_pips
 
         # --- 2. ASSIGN BASED ON DIRECTION ---
         if direction == "buy":
             # Buying to Hedge a Sell
-            # TP must be UP, SL must be DOWN
+            # Hedge TP = Upper Limit (matches Sell SL)
+            # Hedge SL = Lower Limit (matches Sell TP)
             h_tp = upper_limit
             h_sl = lower_limit
+            
+            # Sanity Check: Buy TP must be > Price
+            if h_tp <= tick.ask:
+                 print(f"[HEDGE-ADJ] Buy Hedge TP {h_tp:.5f} <= Ask {tick.ask:.5f}. using default offset.")
+                 h_tp = tick.ask + (2000 * point) # Fallback to prevent invalid stops
+                 
         else:
             # Selling to Hedge a Buy
-            # TP must be DOWN, SL must be UP
+            # Hedge TP = Lower Limit (matches Buy SL)
+            # Hedge SL = Upper Limit (matches Buy TP)
             h_tp = lower_limit
             h_sl = upper_limit
+
+            # Sanity Check: Sell TP must be < Price
+            if h_tp >= tick.bid:
+                 print(f"[HEDGE-ADJ] Sell Hedge TP {h_tp:.5f} >= Bid {tick.bid:.5f}. using default offset.")
+                 h_tp = tick.bid - (2000 * point)
 
         # --- 3. FORCE VALIDITY (The "Push" Logic) ---
         # Instead of removing invalid stops, we push them to the nearest valid price
