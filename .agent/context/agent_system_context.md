@@ -97,6 +97,7 @@ When C = 3:
   - Each completed pair can trade: buy → sell → buy → sell...
   - Until max_positions reached → hedge executes
 - Group is "locked" but still active for toggle trading
+- **Expansion Lock**: Once Group N+1 is initialized, Group N is **permanently locked for expansion**. Only toggle triggers (re-entries/hedges) are permitted.
 
 ### Phase 5: TP-Driven Events
 
@@ -112,6 +113,14 @@ When C = 3:
 - **SKIP if normal expansion is active (C < 3)**: This prevents double expansion from both step triggers and TP-driven expansion
 - **Permanent Lock Logic**: Once a pair fires expansion, it is permanently added to `_pairs_tp_expanded` and cannot fire expansion again
 - If C == 3, triggers expansion via artificial TP mechanism
+
+---
+
+### Phase 6: Directional Guards (Global)
+
+- **Initial Bias**: Captured during Group 1 INIT (`self.group_direction`).
+- **Global Restriction**: Blocks further expansion in the direction of the initial trend for **ALL** groups.
+- **Goal**: Prevent the bot from "chasing" the trend indefinitely via step triggers.
 
 ---
 
@@ -304,3 +313,21 @@ def _count_completed_pairs_for_group(self, group_id: int) -> int:
 | `max_positions` | Max trades per pair before hedge |
 | `lot_sizes` | Array of lot sizes by trade index |
 | `GROUP_OFFSET` | Pair index offset per group (default: 100) |
+
+---
+
+## Trade Audit Logging
+
+For easier debugging and auditability, the system maintains a `logs/trade_audit_{symbol}.csv` file.
+
+### Column Structure
+
+1. **#No**: Sequential trade number (persistent).
+2. **Pair**: Pair index (e.g., 0, 1, 100, 101).
+3. **Type**: BUY or SELL.
+4. **Name**: Leg name (e.g., B0, S1, S100).
+5. **Entry**: Actual execution price.
+6. **TP**: Take Profit level at entry.
+7. **SL**: Stop Loss level at entry.
+8. **Trade No**: `trade_count` (how many times this pair has cycled).
+9. **Activity**: Descriptive log of the event (e.g., "ENTRY", "TP HIT", "SL HIT", "ARTIFICIAL TP & INIT").
