@@ -598,3 +598,52 @@ If C == 2: _force_artificial_tp_and_init()
 ## Invariant Added
 
 1. **LOCKED ENTRY PRICES IMMUTABLE:** Once `locked_buy_entry` or `locked_sell_entry` is set (non-zero), it NEVER changes. Re-entries must use these exact prices.
+
+---
+
+## Session Date: 2026-01-25
+
+---
+
+## Fixes Implemented This Session
+
+### 1. Unified Directional Guards (Global Application)
+
+**Problem:** Directional guards (blocking expansion in the direction of the initial trend) were only applied if `self.current_group == 1`. The user requested this logic to apply to ALL groups to ensure consistent behavior across the entire grid lifecycle.
+
+**Fix:** Removed the `current_group == 1` condition from all guard checks and unified the bias capture.
+
+1. **Renamed Attribute**: `self.group_1_direction` was renamed to `self.group_direction` to reflect its global scope.
+2. **Global Checks**: Removed `if self.current_group == 1` from:
+    - `_check_step_triggers()` (Bullish/Bearish guards)
+    - `_expand_bullish()` / `_expand_bearish()`
+    - `_create_next_positive_pair()` / `_create_next_negative_pair()`
+3. **Capture Logic**: Initial direction (BULLISH/BEARISH) is still captured during Group 1 initialization but now restricts expansion for all subsequent groups.
+
+**Locations:** `symbol_engine.py` (lines ~415, ~768, ~928, ~966, ~988, ~1056, ~2656, ~2731)
+
+---
+
+### 2. State Persistence Fix (Syntax/Metadata)
+
+**Problem:** Manual code edits introduced broken logic in `save_state` and `load_state`.
+
+- `save_state`: Metadata dictionary had unquoted keys and invalid syntax (e.g., `": self`).
+- `load_state`: Attempted to assign to `self` directly (e.g., `self = metadata.get('...)`).
+
+**Fix:** Corrected dictionary serialization and variable assignments.
+
+- Restored `"group_direction": self.group_direction` in `metadata_dict`.
+- Fixed `load_state` to assign to `self.group_direction`.
+
+**Locations:** `symbol_engine.py` (lines ~4247-4283)
+
+---
+
+### 3. Startup and Indentation Fix
+
+**Problem:** A stray `1` character was inserted during manual editing, causing an `IndentationError` and preventing the bot from starting.
+
+**Fix:** Removed the stray character and corrected indentation block for legacy fields.
+
+**Location:** `symbol_engine.py` (line ~411)
