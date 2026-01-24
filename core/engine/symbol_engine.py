@@ -960,11 +960,13 @@ class SymbolEngine:
             bear_level = pair.sell_price
             
             if bid <= bear_level + T:
-                # [DIRECTIONAL GUARD] Group 1 Bearish Expansion Restriction
-                if self.current_group == 1 and self.group_1_direction == "BEARISH":
-                    # We already moved DOWN to initialize Group 1, don't expand further DOWN
-                    # via step triggers. Rely on TP expansion for lower groups.
-                    # print(f"[GUARD] Group 1 BEARISH expansion BLOCKED (Init was BEARISH)")
+                # [DIRECTIONAL GUARD] Bearish Expansion Restriction
+                # If ANY group was initialized BEARISH, we don't expand further DOWN via step triggers
+                # in the same group. We force retracement or TP.
+                if self.group_1_direction == "BEARISH":
+                    # [GUARD] Blocking Bearish expansion (Init was BEARISH)
+                    # We already moved DOWN to initialize, don't expand further DOWN via step triggers
+                    # Rely on TP expansion for lower groups.
                     pass
                 else:
                     print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}, Group={self.current_group}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
@@ -981,9 +983,10 @@ class SymbolEngine:
                 print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
                 return
 
-            # [DIRECTIONAL GUARD] Group 1 Bullish Expansion Restriction
-            if self.current_group == 1 and self.group_1_direction == "BULLISH":
-                print(f" {self.symbol}: [GUARD] Blocking Bullish expansion in Group 1 (Init was BULLISH)")
+            # [DIRECTIONAL GUARD] Bullish Expansion Restriction
+            # Removed self.current_group == 1 check to apply globally as requested
+            if self.group_1_direction == "BULLISH":
+                print(f" {self.symbol}: [GUARD] Blocking Bullish expansion (Init was BULLISH)")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -1048,9 +1051,10 @@ class SymbolEngine:
                 print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
                 return
 
-            # [DIRECTIONAL GUARD] Group 1 Bearish Expansion Restriction
-            if self.current_group == 1 and self.group_1_direction == "BEARISH":
-                print(f" {self.symbol}: [GUARD] Blocking Bearish expansion in Group 1 (Init was BEARISH)")
+            # [DIRECTIONAL GUARD] Bearish Expansion Restriction
+            # Removed self.current_group == 1 check to apply globally as requested
+            if self.group_1_direction == "BEARISH":
+                print(f" {self.symbol}: [GUARD] Blocking Bearish expansion (Init was BEARISH)")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -3416,7 +3420,7 @@ class SymbolEngine:
                 # ============================================
                 # ATOMIC HEDGE (Moved from Polling Loop)
                 # ============================================
-                if pair.trade_count == self.max_positions and self.hedge_enabled:
+                if pair.trade_count >= self.max_positions and self.hedge_enabled:
                     # Deterministic Hedge Direction Logic
                     hedge_dir = None
                     is_odd = (self.max_positions % 2 != 0)
@@ -3680,7 +3684,8 @@ class SymbolEngine:
             
         for idx, pair in self.pairs.items():
             # Check if this pair needs a hedge
-            if pair.trade_count == self.max_positions and not pair.hedge_active:
+            # Check if this pair needs a hedge
+            if pair.trade_count >= self.max_positions and not pair.hedge_active:
                 # Determine hedge direction (opposite of next_action, or based on exposure)
                 # If next_action is "buy", we sold last, so hedge with buy
                 # If next_action is "sell", we bought last, so hedge with sell
@@ -3717,59 +3722,43 @@ class SymbolEngine:
         point = sym_info.point
         stops_level = max(sym_info.trade_stops_level, 10) * point
         
-        # --- 1. CALCULATE FRESH BOUNDARIES (Don't trust stale pair variables) ---
-        # We define the "Box" of the trade cycle
-        # Upper Limit = Buy Entry + Buy TP Pips (approx) OR Sell Entry + Sell SL Pips
-        # Lower Limit = Sell Entry - Sell TP Pips (approx) OR Buy Entry - Buy SL Pips
         
-        print(f" {self.symbol}: [HEDGE-WARNING] Could not find opposing position to inherit. Using fallback calculation.")
-        # Fallback Logic (Standard Grid Specs)
-        if pair.pair_tp > 0 and pair.pair_sl > 0:
-            h_tp = max(pair.pair_tp, pair.pair_sl) if direction == 'buy' else min(pair.pair_tp, pair.pair_sl)
-            h_sl = min(pair.pair_tp, pair.pair_sl) if direction == 'buy' else max(pair.pair_tp, pair.pair_sl)
+        # --- 1. TRUE INHERITANCE: Find opposing position and mirror it ---
+        # "Inherit from the position it's hedging"
+        
+        target_tp = 0.0
+        target_sl = 0.0
+        found_inheritance = False
+        
+        # Scan ticket map for the opposing leg of THIS pair index
+        target_leg = 'S' if direction == 'buy' else 'B'
+        
+        for ticket, info in self.ticket_map.items():
+            t_idx, t_leg, t_entry, t_tp, t_sl = info
+            if t_idx == pair_index and t_leg == target_leg:
+                # Found the position we are hedging against!
+                # MIRROR LOGIC:
+                # Hedge TP = Opposing SL
+                # Hedge SL = Opposing TP
+                target_tp = t_sl
+                target_sl = t_tp
+                found_inheritance = True
+                print(f" {self.symbol}: [HEDGE-INHERIT] Found Opposing {target_leg} (Ticket {ticket}). Mirroring: TP={target_tp:.5f} SL={target_sl:.5f}")
+                break
+        
+        if found_inheritance:
+            h_tp = target_tp
+            h_sl = target_sl
         else:
-            h_tp = pair.sell_price + self.spread if direction == 'buy' else pair.buy_price - self.spread # Just rough estimate
-            h_sl = pair.sell_price - self.spread if direction == 'buy' else pair.buy_price + self.spread
-    
-        
-        # If we have existing values, use them to define the range, otherwise calculate
-        # We assume the "Upper" is the Buy's TP level and "Lower" is Sell's TP level
-        # This matches the "Cycle" logic where both sides share exit levels
-        
-        if pair.pair_tp > 0 and pair.pair_sl > 0:
-            # Standard Inheritance: The box is already defined by the first trade of the cycle
-            upper_limit = max(pair.pair_tp, pair.pair_sl)
-            lower_limit = min(pair.pair_tp, pair.pair_sl)
-        else:
-            # Fallback (Should rarely happen for a maxed pair)
-            tp_pips = float(self.config.get('buy_stop_tp', 20.0)) * point 
-            upper_limit = pair.buy_price + tp_pips
-            lower_limit = pair.sell_price - tp_pips
+            print(f" {self.symbol}: [HEDGE-WARNING] Could not find opposing position to inherit. Using fallback calculation.")
+            # Fallback Logic (Standard Grid Specs)
+            if pair.pair_tp > 0 and pair.pair_sl > 0:
+                 h_tp = max(pair.pair_tp, pair.pair_sl) if direction == 'buy' else min(pair.pair_tp, pair.pair_sl)
+                 h_sl = min(pair.pair_tp, pair.pair_sl) if direction == 'buy' else max(pair.pair_tp, pair.pair_sl)
+            else:
+                 h_tp = pair.sell_price + self.spread if direction == 'buy' else pair.buy_price - self.spread # Just rough estimate
+                 h_sl = pair.sell_price - self.spread if direction == 'buy' else pair.buy_price + self.spread
 
-        # --- 2. ASSIGN BASED ON DIRECTION ---
-        if direction == "buy":
-            # Buying to Hedge a Sell
-            # Hedge TP = Upper Limit (matches Sell SL)
-            # Hedge SL = Lower Limit (matches Sell TP)
-            h_tp = upper_limit
-            h_sl = lower_limit
-            
-            # Sanity Check: Buy TP must be > Price
-            if h_tp <= tick.ask:
-                 print(f"[HEDGE-ADJ] Buy Hedge TP {h_tp:.5f} <= Ask {tick.ask:.5f}. using default offset.")
-                 h_tp = tick.ask + (2000 * point) # Fallback to prevent invalid stops
-                 
-        else:
-            # Selling to Hedge a Buy
-            # Hedge TP = Lower Limit (matches Buy SL)
-            # Hedge SL = Upper Limit (matches Buy TP)
-            h_tp = lower_limit
-            h_sl = upper_limit
-
-            # Sanity Check: Sell TP must be < Price
-            if h_tp >= tick.bid:
-                 print(f"[HEDGE-ADJ] Sell Hedge TP {h_tp:.5f} >= Bid {tick.bid:.5f}. using default offset.")
-                 h_tp = tick.bid - (2000 * point)
 
         # --- 3. FORCE VALIDITY (The "Push" Logic) ---
         # Instead of removing invalid stops, we push them to the nearest valid price
