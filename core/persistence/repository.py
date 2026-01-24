@@ -37,6 +37,22 @@ class Repository:
 
         with open(schema_path, "r") as f:
             await self.db.executescript(f.read())
+        
+        # MIGRATION: Add tp_blocked column to grid_pairs if it doesn't exist
+        try:
+            await self.db.execute("ALTER TABLE grid_pairs ADD COLUMN tp_blocked BOOLEAN DEFAULT 0")
+            print(f"[REPOS] Migration: added 'tp_blocked' column to 'grid_pairs'")
+        except Exception:
+            # Column likely already exists
+            pass
+            
+        # MIGRATION: Add metadata column to symbol_state if it doesn't exist
+        try:
+            await self.db.execute("ALTER TABLE symbol_state ADD COLUMN metadata TEXT DEFAULT '{}'")
+            print(f"[REPOS] Migration: added 'metadata' column to 'symbol_state'")
+        except Exception:
+            pass
+            
         await self.db.commit()
 
     async def get_state(self) -> Dict[str, Any]:
@@ -50,21 +66,22 @@ class Repository:
             return {}
 
     async def save_state(self, phase: str, center_price: float, iteration: int,
-                         cycle_id: int = 0, anchor_price: float = 0.0):
+                         cycle_id: int = 0, anchor_price: float = 0.0, metadata: str = '{}'):
         """Upsert symbol state including cycle management fields."""
         await self.db.execute(
             """
-            INSERT INTO symbol_state (symbol, phase, center_price, iteration, last_update_time, cycle_id, anchor_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO symbol_state (symbol, phase, center_price, iteration, last_update_time, cycle_id, anchor_price, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 phase=excluded.phase,
                 center_price=excluded.center_price,
                 iteration=excluded.iteration,
                 last_update_time=excluded.last_update_time,
                 cycle_id=excluded.cycle_id,
-                anchor_price=excluded.anchor_price
+                anchor_price=excluded.anchor_price,
+                metadata=excluded.metadata
             """,
-            (self.symbol, phase, center_price, iteration, time.time(), cycle_id, anchor_price)
+            (self.symbol, phase, center_price, iteration, time.time(), cycle_id, anchor_price, metadata)
         )
         await self.db.commit()
 
@@ -88,8 +105,8 @@ class Repository:
                 trade_count, next_action, is_reopened,
                 buy_in_zone, sell_in_zone,
                 hedge_ticket, hedge_direction, hedge_active,
-                locked_buy_entry, locked_sell_entry
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                locked_buy_entry, locked_sell_entry, tp_blocked
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, pair_index) DO UPDATE SET
                 buy_price=excluded.buy_price,
                 sell_price=excluded.sell_price,
@@ -108,7 +125,8 @@ class Repository:
                 hedge_direction=excluded.hedge_direction,
                 hedge_active=excluded.hedge_active,
                 locked_buy_entry=excluded.locked_buy_entry,
-                locked_sell_entry=excluded.locked_sell_entry
+                locked_sell_entry=excluded.locked_sell_entry,
+                tp_blocked=excluded.tp_blocked
             """,
             (
                 self.symbol, pair_data['index'], pair_data['buy_price'], pair_data['sell_price'],
@@ -122,7 +140,8 @@ class Repository:
                 pair_data.get('hedge_direction', None),
                 pair_data.get('hedge_active', 0),
                 pair_data.get('locked_buy_entry', 0.0),
-                pair_data.get('locked_sell_entry', 0.0)
+                pair_data.get('locked_sell_entry', 0.0),
+                int(pair_data.get('tp_blocked', False))
             )
         )
         await self.db.commit()

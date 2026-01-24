@@ -193,7 +193,8 @@ class StrategyOrchestrator:
             await self.strategies[symbol].on_external_tick(tick_data)
 
     def get_active_symbols(self) -> List[str]:
-        return list(self.active_symbols)
+        """Returns symbols that are currently active AND running."""
+        return [sym for sym, strategy in self.strategies.items() if strategy.running]
 
     def get_status(self) -> Dict[str, Any]:
         """

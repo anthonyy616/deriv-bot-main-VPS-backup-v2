@@ -165,6 +165,18 @@ class TradingEngine:
                 if not self.timeout_graceful_stop_triggered:
                     await self._check_timeout_graceful_stop()
                 
+                # CHECK COMPLETION: If timeout triggered, see if all bots have finished
+                if self.timeout_graceful_stop_triggered:
+                    total_running = 0
+                    for orch in all_orchestrators:
+                        total_running += sum(1 for s in orch.strategies.values() if s.running)
+                    
+                    if total_running == 0:
+                        logger.warning("[TIMEOUT] All symbols finished graceful stop. Shutting down engine.")
+                        print(f"\n[TIMEOUT] All symbols finished. Engine stopping.")
+                        await self.stop()
+                        break
+                
                 # 1. Collect all active symbols from all active users (orchestrators)
                 all_orchestrators = list(self.bot_manager.bots.values())
                 active_symbols = set()
@@ -282,8 +294,8 @@ class TradingEngine:
             # Set graceful_stop on all symbol engines
             for orch in all_orchestrators:
                 for symbol, strategy in orch.strategies.items():
-                    if hasattr(strategy, 'graceful_stop') and not strategy.graceful_stop:
-                        strategy.graceful_stop = True
+                    if hasattr(strategy, 'stop') and not strategy.graceful_stop:
+                        await strategy.stop()
                         print(f"[TIMEOUT] {symbol}: Graceful stop activated")
             
             self.timeout_graceful_stop_triggered = True

@@ -92,6 +92,7 @@ class GridPair:
     
     locked_buy_entry: float = 0.0   # The actual execution price when BUY first fired
     locked_sell_entry: float = 0.0  # The actual execution price when SELL first fired
+    tp_blocked: bool = False        # Permanent retirement flag (set on TP/SL)
     
     def get_next_lot(self, lot_sizes: list) -> float:
         """
@@ -411,6 +412,7 @@ class SymbolEngine:
         # Legacy fields (maintained for compatibility)
         self.cycle_id: int = 0                    # Maps to current_group for now
         self.anchor_price: float = 0.0            # Per-cycle anchor (startup or TP price)
+        self.group_1_direction: Optional[str] = None # "BULLISH" or "BEARISH"
         self.tolerance: float = 5.0               # T = ±5 fixed trigger tolerance
         self.bot_magic_base: int = 50000          # Base magic number for orders
         
@@ -753,7 +755,12 @@ class SymbolEngine:
         """
         await self._execute_group_init(self.current_group, self.anchor_price)
     
-    async def _execute_group_init(self, group_id: int, anchor_price: float):
+    async def _execute_group_init(self, group_id: int, anchor_price: float, is_bullish_source: bool = True):
+        # Capture Group 1 Directional Intent
+        if group_id == 1:
+            self.group_1_direction = "BULLISH" if is_bullish_source else "BEARISH"
+            print(f"[GROUP_INIT] Group 1 Intent Cached: {self.group_1_direction}")
+        
         # GRACEFUL STOP GUARD: Block new group creation during graceful stop
         if self.graceful_stop:
             print(f"[GROUP_INIT] {self.symbol}: Graceful stop active, blocking new group {group_id}")
@@ -910,8 +917,15 @@ class SymbolEngine:
             bull_level = pair.buy_price  # Use the stored buy_price for this pair
             
             if ask >= bull_level - T:
-                print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}, Group={self.current_group}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
-                await self._expand_bullish(incomplete_bull_pair)
+                # [DIRECTIONAL GUARD] Group 1 Bullish Expansion Restriction
+                if self.current_group == 1 and self.group_1_direction == "BULLISH":
+                    # We already moved UP to initialize Group 1, don't expand further UP 
+                    # via step triggers. Rely on TP expansion for higher groups.
+                    # print(f"[GUARD] Group 1 BULLISH expansion BLOCKED (Init was BULLISH)")
+                    pass
+                else:
+                    print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}, Group={self.current_group}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
+                    await self._expand_bullish(incomplete_bull_pair)
         
         # ================================================================
         # BEARISH EXPANSION: Price moving down
@@ -939,8 +953,15 @@ class SymbolEngine:
             bear_level = pair.sell_price
             
             if bid <= bear_level + T:
-                print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}, Group={self.current_group}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
-                await self._expand_bearish(incomplete_bear_pair)
+                # [DIRECTIONAL GUARD] Group 1 Bearish Expansion Restriction
+                if self.current_group == 1 and self.group_1_direction == "BEARISH":
+                    # We already moved DOWN to initialize Group 1, don't expand further DOWN
+                    # via step triggers. Rely on TP expansion for lower groups.
+                    # print(f"[GUARD] Group 1 BEARISH expansion BLOCKED (Init was BEARISH)")
+                    pass
+                else:
+                    print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}, Group={self.current_group}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
+                    await self._expand_bearish(incomplete_bear_pair)
     
     async def _expand_bullish(self, pair_to_complete: int):
         """Expand grid bullish: complete pair N with B, start pair N+1 with S.
@@ -951,6 +972,11 @@ class SymbolEngine:
             C = self._get_c_highwater(self.current_group)
             if C >= 3:
                 print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
+                return
+
+            # [DIRECTIONAL GUARD] Group 1 Bullish Expansion Restriction
+            if self.current_group == 1 and self.group_1_direction == "BULLISH":
+                print(f" {self.symbol}: [GUARD] Blocking Bullish expansion in Group 1 (Init was BULLISH)")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -1013,6 +1039,11 @@ class SymbolEngine:
             C = self._get_c_highwater(self.current_group)
             if C >= 3:
                 print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
+                return
+
+            # [DIRECTIONAL GUARD] Group 1 Bearish Expansion Restriction
+            if self.current_group == 1 and self.group_1_direction == "BEARISH":
+                print(f" {self.symbol}: [GUARD] Blocking Bearish expansion in Group 1 (Init was BEARISH)")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -2036,11 +2067,13 @@ class SymbolEngine:
         # Find incomplete pair (exactly 1 leg open)
         incomplete_ticket = None
         incomplete_pair_idx = None
+        incomplete_leg = None
         
         for p_idx, legs_dict in pair_legs_map.items():
             if len(legs_dict) == 1:
                 incomplete_pair_idx = p_idx
-                # Get the only ticket
+                # Get the ticket and leg
+                incomplete_leg = list(legs_dict.keys())[0]
                 incomplete_ticket = list(legs_dict.values())[0]
                 break
         
@@ -2063,8 +2096,9 @@ class SymbolEngine:
             return
 
         init_price = event_price if event_price is not None else (tick.ask + tick.bid)/2
-        print(f"[ARTIFICIAL-TP] Firing INIT for Group {self.current_group + 1} at {init_price:.2f}")
-        await self._execute_group_init(self.current_group + 1, init_price)
+        is_bullish_source = (incomplete_leg == 'B') if incomplete_leg else True
+        print(f"[ARTIFICIAL-TP] Firing INIT for Group {self.current_group + 1} at {init_price:.2f} (Bullish={is_bullish_source})")
+        await self._execute_group_init(self.current_group + 1, init_price, is_bullish_source=is_bullish_source)
 
     async def _execute_tp_expansion(self, group_id: int, event_price: float, is_bullish: bool, C: int):
         """
@@ -2320,11 +2354,17 @@ class SymbolEngine:
                 was_completed = pair and pair.buy_filled and pair.sell_filled
                 was_incomplete = not was_completed
 
+                # RETIREMENT LOGIC: Permanently block re-entries after TP or SL hit
+                if pair and not pair.tp_blocked:
+                    if tp_touched or sl_touched or reason in ["TP", "SL"]:
+                        pair.tp_blocked = True
+                        print(f"[BLOCK] Pair {pair_idx} retired permanently (hit {reason})")
+
                 # DEBUG: Trace pair flags to identify incorrect "completed" detection for INIT pairs
                 if pair:
                     print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f} "
                         f"buy_filled={pair.buy_filled} sell_filled={pair.sell_filled} "
-                        f"Completed={was_completed} Group={group_id}")
+                        f"Completed={was_completed} Group={group_id} Blocked={pair.tp_blocked}")
                 else:
                     print(f"[DROP] Ticket={ticket} Pair={pair_idx} Leg={leg} Reason={reason} Price={event_price:.2f} "
                         f"Pair=None! Group={group_id}")
@@ -2342,9 +2382,9 @@ class SymbolEngine:
                         elif self.graceful_stop:
                             print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> graceful stop active, no INIT")
                         else:
-                            print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> Firing INIT for Group {self.current_group + 1}")
+                            print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> Firing INIT for Group {self.current_group + 1} (Bullish={is_bullish})")
                             self._incomplete_pairs_init_triggered.add(pair_idx)
-                            await self._execute_group_init(self.current_group + 1, event_price)
+                            await self._execute_group_init(self.current_group + 1, event_price, is_bullish_source=is_bullish)
                     else:
                         # Completed-pair TP
                         # FORCE NORMAL EXPANSION using High-Water C
@@ -2601,6 +2641,11 @@ class SymbolEngine:
         if not edge_pair:
             return
         
+        # [DIRECTIONAL GUARD] Group 1 Bullish Expansion Restriction (from Chain/Direct)
+        if self.current_group == 1 and self.group_1_direction == "BULLISH":
+            print(f" {self.symbol}: [GUARD] Blocking Bullish chain expansion to Pair {edge_idx+1} (Init was BULLISH)")
+            return
+        
         new_idx = edge_idx + 1
         
         # [FIX #1] Guard: If this pair already exists and SELL is filled (from chain), skip
@@ -2669,6 +2714,11 @@ class SymbolEngine:
         """
         edge_pair = self.pairs.get(edge_idx)
         if not edge_pair:
+            return
+        
+        # [DIRECTIONAL GUARD] Group 1 Bearish Expansion Restriction (from Chain/Direct)
+        if self.current_group == 1 and self.group_1_direction == "BEARISH":
+            print(f" {self.symbol}: [GUARD] Blocking Bearish chain expansion to Pair {edge_idx-1} (Init was BEARISH)")
             return
         
         new_idx = edge_idx - 1
@@ -3426,6 +3476,10 @@ class SymbolEngine:
         tolerance = self.spread * 0.1  # 10% of spread, or use fixed 5.0 points
         
         for idx, pair in sorted_items:
+            # RETIREMENT GUARD: Block all re-entries if pair reached TP/SL
+            if pair.tp_blocked:
+                continue
+            
             # GROUPS+CAP GATE: Only process pairs that have EVER been completed
             # (both buy_filled and sell_filled are True at some point)
             # Expansion is handled by step triggers, this is only for toggle trading
@@ -4152,10 +4206,16 @@ class SymbolEngine:
     
     async def save_state(self):
         """Persist grid state to SQLite including cycle management."""
-        # Save Symbol State with cycle fields
+        # Prepare metadata blob
+        metadata_dict = {
+            "group_1_direction": self.group_1_direction
+        }
+        metadata_json = json.dumps(metadata_dict)
+
         await self.repository.save_state(
             self.phase, self.center_price, self.iteration,
-            self.cycle_id, self.anchor_price
+            self.cycle_id, self.anchor_price,
+            metadata=metadata_json
         )
         
         # Save All Pairs
@@ -4176,6 +4236,14 @@ class SymbolEngine:
         # Load cycle management fields
         self.cycle_id = state.get('cycle_id', 0)
         self.anchor_price = state.get('anchor_price', 0.0)
+        
+        # Load metadata
+        metadata_json = state.get('metadata', '{}')
+        try:
+            metadata = json.loads(metadata_json)
+            self.group_1_direction = metadata.get('group_1_direction')
+        except Exception:
+            self.group_1_direction = None
         
         # Restore last deal check time to prevent missing deals
         last_update_str = state.get('last_update_time')
@@ -4219,6 +4287,7 @@ class SymbolEngine:
             pair.is_reopened = bool(row['is_reopened'])
             pair.buy_in_zone = bool(row['buy_in_zone'])
             pair.sell_in_zone = bool(row['sell_in_zone'])
+            pair.tp_blocked = bool(row.get('tp_blocked', False))
             
             # ===== ROBUST STATE SYNCHRONIZATION =====
             # Enforce invariants regardless of what was saved in DB.
