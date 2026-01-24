@@ -412,7 +412,7 @@ class SymbolEngine:
         # Legacy fields (maintained for compatibility)
         self.cycle_id: int = 0                    # Maps to current_group for now
         self.anchor_price: float = 0.0            # Per-cycle anchor (startup or TP price)
-        self.group_1_direction: Optional[str] = None # "BULLISH" or "BEARISH"
+        self.group_direction: Optional[str] = None # "BULLISH" or "BEARISH"
         self.tolerance: float = 5.0               # T = ±5 fixed trigger tolerance
         self.bot_magic_base: int = 50000          # Base magic number for orders
         
@@ -765,12 +765,12 @@ class SymbolEngine:
     async def _execute_group_init(self, group_id: int, anchor_price: float, is_bullish_source: bool = True):
         # Capture Group 1 Directional Intent
         if group_id == 1:
-            self.group_1_direction = "BULLISH" if is_bullish_source else "BEARISH"
-            print(f"[GROUP_INIT] Group 1 Intent Cached: {self.group_1_direction}")
+            self.group_direction = "BULLISH" if is_bullish_source else "BEARISH"
+            print(f"[GROUP_INIT] Group 1 Intent Cached: {self.group_direction}")
         
         # GRACEFUL STOP GUARD: Block new group creation during graceful stop
         if self.graceful_stop:
-            print(f"[GROUP_INIT] {self.symbol}: Graceful stop active, blocking new group {group_id}")
+            #print(f"[GROUP_INIT] {self.symbol}: Graceful stop active, blocking new group {group_id}")
             return
 
         tick = mt5.symbol_info_tick(self.symbol)
@@ -924,11 +924,11 @@ class SymbolEngine:
             bull_level = pair.buy_price  # Use the stored buy_price for this pair
             
             if ask >= bull_level - T:
-                # [DIRECTIONAL GUARD] Group 1 Bullish Expansion Restriction
-                if self.current_group == 1 and self.group_1_direction == "BULLISH":
+                # [DIRECTIONAL GUARD] Bullish Expansion Restriction
+                if self.group_direction == "BULLISH":
                     # We already moved UP to initialize Group 1, don't expand further UP 
                     # via step triggers. Rely on TP expansion for higher groups.
-                    # print(f"[GUARD] Group 1 BULLISH expansion BLOCKED (Init was BULLISH)")
+                    # print(f"[GUARD] Bullish expansion BLOCKED (Init was BULLISH)")
                     pass
                 else:
                     print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}, Group={self.current_group}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
@@ -963,7 +963,7 @@ class SymbolEngine:
                 # [DIRECTIONAL GUARD] Bearish Expansion Restriction
                 # If ANY group was initialized BEARISH, we don't expand further DOWN via step triggers
                 # in the same group. We force retracement or TP.
-                if self.group_1_direction == "BEARISH":
+                if self.group_direction == "BEARISH":
                     # [GUARD] Blocking Bearish expansion (Init was BEARISH)
                     # We already moved DOWN to initialize, don't expand further DOWN via step triggers
                     # Rely on TP expansion for lower groups.
@@ -985,8 +985,8 @@ class SymbolEngine:
 
             # [DIRECTIONAL GUARD] Bullish Expansion Restriction
             # Removed self.current_group == 1 check to apply globally as requested
-            if self.group_1_direction == "BULLISH":
-                print(f" {self.symbol}: [GUARD] Blocking Bullish expansion (Init was BULLISH)")
+            if self.group_direction == "BULLISH":
+                #print(f" {self.symbol}: [GUARD] Blocking Bullish expansion (Init was BULLISH)")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -1053,8 +1053,8 @@ class SymbolEngine:
 
             # [DIRECTIONAL GUARD] Bearish Expansion Restriction
             # Removed self.current_group == 1 check to apply globally as requested
-            if self.group_1_direction == "BEARISH":
-                print(f" {self.symbol}: [GUARD] Blocking Bearish expansion (Init was BEARISH)")
+            if self.group_direction == "BEARISH":
+                #print(f" {self.symbol}: [GUARD] Blocking Bearish expansion (Init was BEARISH)")
                 return
 
             tick = mt5.symbol_info_tick(self.symbol)
@@ -2652,8 +2652,8 @@ class SymbolEngine:
         if not edge_pair:
             return
         
-        # [DIRECTIONAL GUARD] Group 1 Bullish Expansion Restriction (from Chain/Direct)
-        if self.current_group == 1 and self.group_1_direction == "BULLISH":
+        # [DIRECTIONAL GUARD] Bullish Expansion Restriction (from Chain/Direct)
+        if self.group_direction == "BULLISH":
             print(f" {self.symbol}: [GUARD] Blocking Bullish chain expansion to Pair {edge_idx+1} (Init was BULLISH)")
             return
         
@@ -2727,8 +2727,8 @@ class SymbolEngine:
         if not edge_pair:
             return
         
-        # [DIRECTIONAL GUARD] Group 1 Bearish Expansion Restriction (from Chain/Direct)
-        if self.current_group == 1 and self.group_1_direction == "BEARISH":
+        # [DIRECTIONAL GUARD] Bearish Expansion Restriction (from Chain/Direct)
+        if self.group_direction == "BEARISH":
             print(f" {self.symbol}: [GUARD] Blocking Bearish chain expansion to Pair {edge_idx-1} (Init was BEARISH)")
             return
         
@@ -4245,7 +4245,7 @@ class SymbolEngine:
         """Persist grid state to SQLite including cycle management."""
         # Prepare metadata blob
         metadata_dict = {
-            "group_1_direction": self.group_1_direction
+            "group_direction": self.group_direction
         }
         metadata_json = json.dumps(metadata_dict)
 
@@ -4278,9 +4278,9 @@ class SymbolEngine:
         metadata_json = state.get('metadata', '{}')
         try:
             metadata = json.loads(metadata_json)
-            self.group_1_direction = metadata.get('group_1_direction')
+            self.group_direction = metadata.get('group_direction')
         except Exception:
-            self.group_1_direction = None
+            self.group_direction = None
         
         # Restore last deal check time to prevent missing deals
         last_update_str = state.get('last_update_time')
