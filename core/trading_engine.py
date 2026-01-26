@@ -299,3 +299,13 @@ class TradingEngine:
                         print(f"[TIMEOUT] {symbol}: Graceful stop activated")
             
             self.timeout_graceful_stop_triggered = True
+            # [HARD STOP] Set failsafe time (5 minutes from now)
+            self.force_stop_time = datetime.now() + timedelta(minutes=5)
+            print(f"[TIMEOUT] Hard stop failsafe set for {self.force_stop_time.strftime('%H:%M:%S')} (5 mins)")
+
+        # [HARD STOP CHECK]
+        if self.timeout_graceful_stop_triggered and self.force_stop_time:
+            if datetime.now() > self.force_stop_time:
+                logger.critical("[TIMEOUT] Hard stop triggered (Graceful stop exceeded 5 mins). Forcing shutdown.")
+                print(f"\n[TIMEOUT] Hard stop triggered! Forcing shutdown...")
+                await self.stop()

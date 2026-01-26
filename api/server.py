@@ -261,6 +261,39 @@ async def get_session_log(session_id: str, bot = Depends(get_current_bot)):
         return PlainTextResponse(content)
     raise HTTPException(404, "Session not found")
 
+@app.get("/history/groups")
+async def get_group_logs(bot = Depends(get_current_bot)):
+    """Get list of group log files for this user"""
+    from pathlib import Path
+    log_dir = bot.session_logger.log_dir
+    logs = []
+    if log_dir.exists():
+        for file in sorted(log_dir.glob("groups_*.log"), reverse=True):
+            logs.append({
+                "id": file.stem,
+                "name": file.name,
+                "path": str(file)
+            })
+        # Also include group table files
+        for file in sorted(log_dir.glob("group_*_table.txt"), reverse=True):
+            logs.append({
+                "id": file.stem,
+                "name": file.name,
+                "path": str(file)
+            })
+    return logs
+
+@app.get("/history/groups/{filename}")
+async def get_group_log_content(filename: str, bot = Depends(get_current_bot)):
+    """Get contents of a specific group log file"""
+    from pathlib import Path
+    from fastapi.responses import PlainTextResponse
+    log_dir = bot.session_logger.log_dir
+    log_path = log_dir / filename
+    if log_path.exists() and log_path.is_file():
+        return PlainTextResponse(log_path.read_text(encoding="utf-8"))
+    raise HTTPException(404, "Group log not found")
+
 # Mount static folder for assets (css/js images)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
