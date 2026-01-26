@@ -470,13 +470,13 @@ class GroupLogger:
         with open(self.main_log_path, "a", encoding="utf-8") as f:
             f.write(log_line)
 
-        # Write to group-specific log
-        safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
-        group_log_path = os.path.join(
-            self.log_dir, f"group_{group_id}_{safe_symbol}_{self.session_id}.log"
-        )
-        with open(group_log_path, "a", encoding="utf-8") as f:
-            f.write(log_line)
+        # Write to group-specific log (DISABLED by request for Single File)
+        # safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
+        # group_log_path = os.path.join(
+        #     self.log_dir, f"group_{group_id}_{safe_symbol}_{self.session_id}.log"
+        # )
+        # with open(group_log_path, "a", encoding="utf-8") as f:
+        #     f.write(log_line)
 
     def _write_group_table(self, group_id: int):
         """Write current group table state to file."""
@@ -492,9 +492,14 @@ class GroupLogger:
     def write_raw_group_table(self, group_id: int, content: str):
         """Write raw content to the group table file (used by SymbolEngine)."""
         safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
-        table_path = os.path.join(
-            self.log_dir, f"group_{group_id}_{safe_symbol}_{self.session_id}_table.txt"
-        )
+        
+        if str(group_id) == "ALL":
+             # Consolidated filename
+             filename = f"groups_table_{self.session_id}.txt"
+        else:
+             filename = f"group_{group_id}_{safe_symbol}_{self.session_id}_table.txt"
+             
+        table_path = os.path.join(self.log_dir, filename)
         with open(table_path, "w", encoding="utf-8") as f:
             f.write(content)
 

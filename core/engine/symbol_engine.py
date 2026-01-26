@@ -2086,6 +2086,35 @@ class SymbolEngine:
         # [PRIMARY] Position drop detection for TP/SL and group rollover
         await self._check_position_drops(ask, bid)
 
+        # ================================================================
+        # [SATURATION TRIGGER] Proactive Check for C >= 3
+        # RESTRICTED: Applies ONLY to Group 0 per user requirement.
+        # Checks if Group 0 is done and forces rollover immediately.
+        # ================================================================
+        try:
+            # 1. Get High-Water C for active group
+            c_highwater = self._get_c_highwater(self.current_group)
+            
+            # 2. Check Saturation (C >= 3)
+            # Use a latch to prevent repeated firing for the same group transition
+            next_group = self.current_group + 1
+            
+            # USER RULE: "Only for group 0 should this apply"
+            if self.current_group == 0 and c_highwater >= 3 and not self._is_group_init_triggered(next_group):
+                print(f"[SATURATION] Group {self.current_group} reached C={c_highwater} >= 3. Forcing Artificial TP/Init (Proactive, Group 0 Special).")
+                
+                # Create a minimal tick object/dict if needed for the call
+                tick_obj = type('Tick', (), {'ask': ask, 'bid': bid})()
+                
+                # FORCE THE HANDOFF
+                await self._force_artificial_tp_and_init(tick_obj, event_price=(ask+bid)/2)
+                
+                # Mark as triggered to prevent spam
+                self._mark_group_init_triggered(next_group)
+                
+        except Exception as e:
+            print(f"[ERROR] Saturation Check: {e}")
+
         try:
             # [STEP TRIGGERS] Check anchor geometry triggers
             await self._check_step_triggers(ask, bid)
@@ -2619,33 +2648,44 @@ class SymbolEngine:
                 else:
                     # ================================================================
                     # FALLBACK INFERENCE: Position closed between ticks before we latched flags.
-                    # Infer TP/SL based on current market price vs stored TP/SL levels.
-                    # This ensures expansion fires even if position closes faster than polling.
+                    # Compare distances. If price is WAY CLOSER to TP than SL, it's a TP.
                     # ================================================================
+                    
                     if leg == 'B':  # BUY position
-                        # If current bid is at or above TP, it was TP
-                        if bid >= tp_price:
+                        current_price = bid
+                        dist_tp = abs(current_price - tp_price)
+                        dist_sl = abs(current_price - sl_price)
+                        
+                        # Tie-breaker: If within 10% of TP distance? No, direct comparison is usually enough.
+                        # But SL is usually far away.
+                        # If dist_tp < dist_sl, likely TP.
+                        
+                        if dist_tp < dist_sl:
                             is_tp = True
                             event_price = tp_price
                             reason = "TP"
-                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> TP (bid={bid:.2f} >= tp={tp_price:.2f})")
+                            print(f"[DROP-INFER] Ticket={ticket} Leg=B -> TP (bid={current_price:.2f} closer to TP={tp_price:.2f} than SL={sl_price:.2f})")
                         else:
                             is_tp = False
                             event_price = sl_price
                             reason = "SL"
-                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> SL (bid={bid:.2f} < tp={tp_price:.2f})")
+                            print(f"[DROP-INFER] Ticket={ticket} Leg=B -> SL (bid={current_price:.2f} closer to SL={sl_price:.2f} than TP={tp_price:.2f})")
+                            
                     else:  # SELL position
-                        # If current ask is at or below TP, it was TP
-                        if ask <= tp_price:
+                        current_price = ask
+                        dist_tp = abs(current_price - tp_price)
+                        dist_sl = abs(current_price - sl_price)
+                        
+                        if dist_tp < dist_sl:
                             is_tp = True
                             event_price = tp_price
                             reason = "TP"
-                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> TP (ask={ask:.2f} <= tp={tp_price:.2f})")
+                            print(f"[DROP-INFER] Ticket={ticket} Leg=S -> TP (ask={current_price:.2f} closer to TP={tp_price:.2f} than SL={sl_price:.2f})")
                         else:
                             is_tp = False
                             event_price = sl_price
                             reason = "SL"
-                            print(f"[DROP-INFER] Ticket={ticket} Pair={pair_idx} Leg={leg} -> SL (ask={ask:.2f} > tp={tp_price:.2f})")
+                            print(f"[DROP-INFER] Ticket={ticket} Leg=S -> SL (ask={current_price:.2f} closer to SL={sl_price:.2f} than TP={tp_price:.2f})")
 
                 # Determine completed/incomplete using IN-MEMORY pair state (not MT5 positions).
                 # This remembers "ever filled" even if one leg already closed via SL.
@@ -4947,6 +4987,22 @@ class SymbolEngine:
             self.grid_truth.add_level(pair.buy_price, pair.sell_price, idx)
             
         print(f" {self.symbol}: Loaded state (Phase={self.phase}, Pairs={len(self.pairs)})")
+
+    # ========================================================================
+    # GROUP TRANSITION HELPERS
+    # ========================================================================
+    def _is_group_init_triggered(self, group_id: int) -> bool:
+        """Check if INIT for a specific group has already been fired."""
+        # Use lazy initialization for backward compatibility with state loading
+        if not hasattr(self, '_triggered_groups'):
+             self._triggered_groups = set()
+        return group_id in self._triggered_groups
+
+    def _mark_group_init_triggered(self, group_id: int):
+        """Mark a group as triggered to prevent duplicate INIT calls."""
+        if not hasattr(self, '_triggered_groups'):
+             self._triggered_groups = set()
+        self._triggered_groups.add(group_id)
 
 
 # Alias for backward compatibility
