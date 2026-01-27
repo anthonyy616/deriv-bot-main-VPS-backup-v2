@@ -1042,23 +1042,16 @@ class SymbolEngine:
         if not group_pairs:
             return
         
-        # Separate positive and negative pairs within current group
-        positive_pairs = [idx for idx in group_pairs.keys() if idx > 0 or (self.current_group > 0 and idx >= self.current_group * 100)]
-        negative_pairs = [idx for idx in group_pairs.keys() if idx < 0 or (self.current_group > 0 and idx < self.current_group * 100)]
-        
-        # For Group 1+, adjust positive/negative classification based on group offset
-        if self.current_group > 0:
-            offset = self._get_pair_offset(self.current_group)
-            # Within Group 1+, "positive" means >= offset, "negative" means < offset
-            positive_pairs = [idx for idx in group_pairs.keys() if idx >= offset]
-            negative_pairs = [idx for idx in group_pairs.keys() if idx < offset]
+        # [FIX] Unify search: Search ALL pairs in group for incomplete legs
+        # We search from highest index to lowest (closest to anchor for bearish, highest for bullish)
+        all_pair_indices = sorted(group_pairs.keys(), reverse=True)
         
         # ================================================================
         # BULLISH EXPANSION: Price moving up
         # ================================================================
         # Find the highest INCOMPLETE pair in current group (has S, no B)
         incomplete_bull_pair = None
-        for idx in sorted(positive_pairs, reverse=True):  # Check from highest
+        for idx in all_pair_indices:  # Check from highest
             pair = group_pairs.get(idx)
             if pair and pair.sell_filled and not pair.buy_filled:
                 incomplete_bull_pair = idx
@@ -1091,21 +1084,15 @@ class SymbolEngine:
         # BEARISH EXPANSION: Price moving down
         # ================================================================
         # Find the lowest INCOMPLETE pair in current group (has B, no S)
+        # Search from highest index (closest to anchor/current) to lowest
         incomplete_bear_pair = None
         
-        # For Group 0, check Pair 0 explicitly
-        if self.current_group == 0:
-            pair0 = group_pairs.get(0)
-            if pair0 and pair0.buy_filled and not pair0.sell_filled:
-                incomplete_bear_pair = 0
-        
-        if incomplete_bear_pair is None:
-            # Check negative/lower pairs from highest (closest to anchor) to lowest
-            for idx in sorted(negative_pairs, reverse=True):
-                pair = group_pairs.get(idx)
-                if pair and pair.buy_filled and not pair.sell_filled:
-                    incomplete_bear_pair = idx
-                    break
+        for idx in all_pair_indices:
+            pair = group_pairs.get(idx)
+            # Find closest pair with BUY filled but SELL empty
+            if pair and pair.buy_filled and not pair.sell_filled:
+                incomplete_bear_pair = idx
+                break
         
         if incomplete_bear_pair is not None:
             # Use the stored sell_price for this pair
