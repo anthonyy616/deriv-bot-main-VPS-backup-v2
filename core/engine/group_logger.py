@@ -109,7 +109,7 @@ class GroupLogger:
 
         # Update Buy Index
         p_buy = self._get_or_create_pair(group, b_idx)
-        p_buy.buy_leg.status = "ACTIVE"
+        p_buy.buy_leg.status = "ACTIVE" if b_ticket else "PENDING"
         p_buy.buy_leg.entry = b_entry if b_entry else anchor
         p_buy.buy_leg.tp = b_tp
         p_buy.buy_leg.sl = b_sl
@@ -118,7 +118,7 @@ class GroupLogger:
 
         # Update Sell Index
         p_sell = self._get_or_create_pair(group, s_idx)
-        p_sell.sell_leg.status = "ACTIVE"
+        p_sell.sell_leg.status = "ACTIVE" if s_ticket else "PENDING"
         p_sell.sell_leg.entry = s_entry if s_entry else anchor
         p_sell.sell_leg.tp = s_tp
         p_sell.sell_leg.sl = s_sl

@@ -513,6 +513,22 @@ class SymbolEngine:
     @property
     def hedge_lot_size(self) -> float:
         return float(self.config.get('hedge_lot_size', 0.01))
+
+    @property
+    def buy_stop_tp_pips(self) -> float:
+        return float(self.config.get('buy_stop_tp', self.spread))
+
+    @property
+    def buy_stop_sl_pips(self) -> float:
+        return float(self.config.get('buy_stop_sl', self.spread))
+
+    @property
+    def sell_stop_tp_pips(self) -> float:
+        return float(self.config.get('sell_stop_tp', self.spread))
+
+    @property
+    def sell_stop_sl_pips(self) -> float:
+        return float(self.config.get('sell_stop_sl', self.spread))
     
     # ========================================================================
     # PRICE-ANCHORED PAIR INDEX CALCULATION
@@ -1724,7 +1740,52 @@ class SymbolEngine:
     # ========================================================================
     # PHASE HANDLERS
     # ========================================================================
-    
+
+    def _recover_pair_from_position(self, index: int, position):
+        """Recover a GridPair from an existing MT5 position."""
+        import MetaTrader5 as mt5
+        
+        # Determine if it's BUY or SELL
+        is_buy = (position.type == mt5.ORDER_TYPE_BUY)
+        
+        # Default prices
+        buy_price = position.price_open
+        sell_price = position.price_open
+        
+        if is_buy:
+            # Found BUY leg. Derive SELL leg.
+            buy_price = position.price_open
+            sell_price = buy_price - self.spread
+        else:
+            # Found SELL leg. Derive BUY leg.
+            sell_price = position.price_open
+            buy_price = sell_price + self.spread
+            
+        pair = GridPair(index=index, buy_price=buy_price, sell_price=sell_price)
+        pair.group_id = self.current_group
+        
+        if is_buy:
+            pair.buy_filled = True
+            pair.buy_ticket = position.ticket
+            pair.buy_in_zone = True
+            # Check for close
+            # pair.buy_closed_at = ...
+        else:
+            pair.sell_filled = True
+            pair.sell_ticket = position.ticket
+            pair.sell_in_zone = True
+            
+        # Determine State
+        # If B0 filled, we anticipate S0 pending or S1 next.
+        # "advance_toggle" logic usually sets next_action.
+        if is_buy:
+             pair.next_action = "sell"
+        else:
+             pair.next_action = "buy"
+
+        self.pairs[index] = pair
+        #print(f" {self.symbol}: [RECOVERY] Recovered Pair {index} from MT5 ticket {position.ticket}")
+
     async def _handle_init(self, ask: float, bid: float):
         """
         INIT: Rigid State Machine for Atomic Startup.
@@ -1753,6 +1814,28 @@ class SymbolEngine:
                         print(f" {self.symbol}: [INIT] Found B0 in MT5. recovering state.")
                         if 0 not in self.pairs:
                             self._recover_pair_from_position(0, b0_pos)
+                            
+                        # [LOGGER] Sync recovered Group 0
+                        if self.group_logger:
+                             b0_price = b0_pos.price_open
+                             # Guess S0 price/ticket
+                             s0_price = b0_price - self.spread
+                             self.group_logger.log_init(
+                                group_id=0,
+                                anchor=b0_price,
+                                is_bullish_source=True,
+                                b_idx=0, s_idx=0,
+                                b_ticket=b0_pos.ticket,
+                                s_ticket=0, # Unknown/Pending
+                                b_entry=b0_price,
+                                s_entry=s0_price,
+                                b_tp=b0_price + self.spread,
+                                b_sl=b0_price - self.spread,
+                                s_tp=s0_price - self.spread,
+                                s_sl=s0_price + self.spread,
+                                lots=self.lot_sizes[0]
+                             )
+
                         self.init_step = 1
                     else:
                         # Validate spread/price before entry? (Optional)
@@ -1775,6 +1858,23 @@ class SymbolEngine:
                             # Place S0 pending stop immediately? No, logic says S1 is next logic step.
                             # But we usually place the Sell Stop for B0 here too.
                             pair0.sell_pending_ticket = self._place_pending_order("sell_stop", pair0.sell_price, 0)
+                            
+                            # [LOGGER] Log Group 0 Init
+                            if self.group_logger:
+                                self.group_logger.log_init(
+                                    group_id=0,
+                                    anchor=b0_price,
+                                    is_bullish_source=True, # Assuming B0 start is bullish
+                                    b_idx=0, s_idx=0,
+                                    b_ticket=ticket, s_ticket=0,
+                                    b_entry=b0_price,
+                                    s_entry=pair0.sell_price, # S0 pending
+                                    b_tp=b0_price + self.buy_stop_tp_pips, # Configured TP (Buy)
+                                    b_sl=b0_price - self.buy_stop_sl_pips, # Configured SL (Buy)
+                                    s_tp=pair0.sell_price - self.sell_stop_tp_pips, # Configured TP (Sell)
+                                    s_sl=pair0.sell_price + self.sell_stop_sl_pips, # Configured SL (Sell)
+                                    lots=self.lot_sizes[0]
+                                )
                             
                             self.init_step = 1
                             print(f" {self.symbol}: [INIT] B0 Complete. Step 0 -> 1")
@@ -1801,19 +1901,37 @@ class SymbolEngine:
                             if 1 not in self.pairs:
                                 # Recover Pair 1
                                 self._recover_pair_from_position(1, s1_pos[0])
+                                
+                                # [LOGGER] Sync Recovered S1
+                                if self.group_logger:
+                                    p1_entry = s1_pos[0].price_open
+                                    self.group_logger.update_pair(
+                                        group_id=self.current_group,
+                                        pair_idx=1,
+                                        trade_type="SELL",
+                                        entry=p1_entry,
+                                        tp=p1_entry - self.sell_stop_tp_pips,
+                                        sl=p1_entry + self.sell_stop_sl_pips,
+                                        status="ACTIVE",
+                                        lots=self.lot_sizes[1] if 1 < len(self.lot_sizes) else 0.01,
+                                        ticket=s1_pos[0].ticket
+                                    )
+                                    # Log B1 (Pending)
+                                    b1_entry = p1_entry + self.spread # Reconstruct B1 price
+                                    self.group_logger.update_pair(
+                                        group_id=self.current_group,
+                                        pair_idx=1,
+                                        trade_type="BUY",
+                                        entry=b1_entry,
+                                        tp=b1_entry + self.buy_stop_tp_pips,
+                                        sl=b1_entry - self.buy_stop_sl_pips,
+                                        status="PENDING",
+                                        lots=self.lot_sizes[1] if 1 < len(self.lot_sizes) else 0.01
+                                    )
+
                             self.init_step = 2
 
                     if not s1_exists:
-                        # Execute S1
-                        # S1 Price is typically B0 + Spread (Sell Limit location) 
-                        # OR if we want 'Locked Step', maybe we open S1 at B0's Sell Price?
-                        # Grid Logic: B0=Center. S1 logic usually triggers when price rises.
-                        # BUT "init" implies forcing the grid structure.
-                        # Standard interpretation: "B0 and S1" usually means "B0 and S0 (Companion)" or "B0 and B1/S1 pair".
-                        # Given previous code "s1_price = pair0.buy_price" -> This implies S1 is actually S0 (the sell side of pair 0)?
-                        # NO, Magic 50001 implies Pair 1.
-                        # Let's stick to: Pair 1 Sell is at (B0 + Spread).
-                        
                         pair0 = self.pairs.get(0)
                         if not pair0: return 
                         
@@ -1826,17 +1944,6 @@ class SymbolEngine:
                         
                         p1_sell_target = pair0.buy_price # Effectively Center Price
                         
-                        # Check price condition? 
-                        # If we just force open S1 at market, it might be far off if price hasn't moved.
-                        # "Strict Atomic Execution" usually implies verifying they EXIST.
-                        # If price is not there, we should place a LIMIT/STOP order?
-                        # The user says "Execute S1".
-                        # Let's place it as PENDING if not valid for market?
-                        # Actually, previous code tried to execute MARKET order implies it expects price to be there OR forces it.
-                        # Let's try to place a PENDING order for S1 if Market is not valid, OR just wait.
-                        # But Constraint says "If self.init_step == 1, Execute S1 -> Set init_step = 2".
-                        # If we place a pending order, is that "Executed"? Yes, it establishes the grid.
-                        
                         print(f" {self.symbol}: [INIT] Establishing S1 (Pair 1).")
                         pair1 = GridPair(index=1, buy_price=p1_buy_price, sell_price=p1_sell_target)
                         # FIX: Positive pairs start with SELL, so set next_action="sell"
@@ -1845,10 +1952,7 @@ class SymbolEngine:
                         pair1.group_id = self.current_group  # Track group membership
                         self.pairs[1] = pair1
                         
-                        # For INIT, we typically want the grid ACTIVE.
-                        # If we place a pending SELL LIMIT at p1_sell_target (which is B0 price), it will fill if price > B0.
-                        # If price is at B0, Sell Limit @ B0 fills immediately? No, Limit Sell is "price >= target".
-                        # If current price ~ B0, Sell Limit @ B0 is marketable.
+                      
                         
                         # Let's try Market Execution if close, else Pending.
                         ticket_s1 = await self._execute_market_order("sell", p1_sell_target, 1)
@@ -1861,11 +1965,39 @@ class SymbolEngine:
                              print(f" {self.symbol}: [INIT] S1 Filled (Market). Step 1 -> 2")
                              self.init_step = 2
                         else:
-                             # Market failed (maybe distance?), place Pending
+                             # Market failed, place Pending
                              print(f" {self.symbol}: [INIT] S1 Market failed. Placing Pending Sell Limit.")
                              pair1.sell_pending_ticket = self._place_pending_order("sell_limit", p1_sell_target, 1)
                              pair1.buy_pending_ticket = self._place_pending_order("buy_stop", p1_buy_price, 1)
+                             pair1.buy_pending_ticket = self._place_pending_order("buy_stop", p1_buy_price, 1)
                              # We consider S1 "established" (pending or filled).
+                             
+                             # [LOGGER] Log Pair 1 (S1) creation
+                             if self.group_logger:
+                                 # S1 (Sell Limit/Market)
+                                 self.group_logger.update_pair(
+                                     group_id=self.current_group,
+                                     pair_idx=1,
+                                     trade_type="SELL",
+                                     entry=p1_sell_target,
+                                     tp=p1_sell_target - self.spread, # Estimated
+                                     sl=p1_sell_target + self.spread,
+                                     status="ACTIVE" if ticket_s1 else "PENDING", # Market vs Limit
+                                     lots=self.lot_sizes[1] if 1 < len(self.lot_sizes) else 0.01,
+                                     ticket=ticket_s1 if ticket_s1 else pair1.sell_pending_ticket
+                                 )
+                                 # B1 (Buy Stop)
+                                 self.group_logger.update_pair(
+                                    group_id=self.current_group,
+                                    pair_idx=1,
+                                    trade_type="BUY",
+                                    entry=p1_buy_price,
+                                    tp=p1_buy_price + self.spread,
+                                    sl=p1_buy_price - self.spread,
+                                    status="PENDING",
+                                    lots=self.lot_sizes[1] if 1 < len(self.lot_sizes) else 0.01
+                                 )
+                             
                              self.init_step = 2
 
             if self.init_step == 2:
@@ -2030,6 +2162,31 @@ class SymbolEngine:
             pair.sell_pending_ticket = self._place_pending_order("sell_limit", sell_price, index)
             pair.buy_pending_ticket = self._place_pending_order("buy_stop", buy_price, index)
             
+            # [LOGGER] Log creation of PENDING pairs so they don't show as 0.00
+            if self.group_logger:
+                # Log SELL Leg (Limit)
+                self.group_logger.update_pair(
+                    group_id=self.current_group, # Expanded pairs usually belong to current group
+                    pair_idx=index,
+                    trade_type="SELL",
+                    entry=sell_price,
+                    tp=sell_price - self.sell_stop_tp_pips, # Configured TP (Sell)
+                    sl=sell_price + self.sell_stop_sl_pips, # Configured SL (Sell)
+                    status="PENDING",
+                    lots=self.lot_sizes[pair.trade_count] if pair.trade_count < len(self.lot_sizes) else 0.01
+                )
+                # Log BUY Leg (Stop)
+                self.group_logger.update_pair(
+                    group_id=self.current_group,
+                    pair_idx=index,
+                    trade_type="BUY",
+                    entry=buy_price,
+                    tp=buy_price + self.buy_stop_tp_pips,
+                    sl=buy_price - self.buy_stop_sl_pips,
+                    status="PENDING",
+                    lots=self.lot_sizes[pair.trade_count] if pair.trade_count < len(self.lot_sizes) else 0.01
+                )
+            
             print(f" {self.symbol}: Pair {index} Created (ABOVE). S@{sell_price:.2f} B@{buy_price:.2f} [next=SELL]")
         else:
             # NEGATIVE GRID (below reference)
@@ -2048,6 +2205,31 @@ class SymbolEngine:
             # Below current price: Buy Limit (triggers first), Sell Stop
             pair.buy_pending_ticket = self._place_pending_order("buy_limit", buy_price, index)
             pair.sell_pending_ticket = self._place_pending_order("sell_stop", sell_price, index)
+
+            # [LOGGER] Log creation of PENDING pairs so they don't show as 0.00
+            if self.group_logger:
+                # Log BUY Leg (Limit)
+                self.group_logger.update_pair(
+                    group_id=self.current_group,
+                    pair_idx=index,
+                    trade_type="BUY",
+                    entry=buy_price,
+                    tp=buy_price + self.buy_stop_tp_pips,
+                    sl=buy_price - self.buy_stop_sl_pips,
+                    status="PENDING",
+                    lots=self.lot_sizes[pair.trade_count] if pair.trade_count < len(self.lot_sizes) else 0.01
+                )
+                # Log SELL Leg (Stop)
+                self.group_logger.update_pair(
+                    group_id=self.current_group,
+                    pair_idx=index,
+                    trade_type="SELL",
+                    entry=sell_price,
+                    tp=sell_price - self.sell_stop_tp_pips,
+                    sl=sell_price + self.sell_stop_sl_pips,
+                    status="PENDING",
+                    lots=self.lot_sizes[pair.trade_count] if pair.trade_count < len(self.lot_sizes) else 0.01
+                )
             
             print(f" {self.symbol}: Pair {index} Created (BELOW). B@{buy_price:.2f} S@{sell_price:.2f} [next=BUY]")
         
@@ -3032,7 +3214,7 @@ class SymbolEngine:
         
         symbol_info = mt5.symbol_info(self.symbol)
         if not symbol_info:
-            return mt5.ORDER_FILLING_FOK  # Default for Deriv
+            return mt5.ORDER_FILLING_FOK  # Default for Weltrade
         
         # Check which modes are supported (filling_mode is a bitmask)
         # Bitmask values: FOK=1, IOC=2, RETURN=4 (or similar depending on broker)
