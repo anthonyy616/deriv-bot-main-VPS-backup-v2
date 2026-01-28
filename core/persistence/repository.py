@@ -43,7 +43,13 @@ class Repository:
             await self.db.execute("ALTER TABLE grid_pairs ADD COLUMN tp_blocked BOOLEAN DEFAULT 0")
             print(f"[REPOS] Migration: added 'tp_blocked' column to 'grid_pairs'")
         except Exception:
-            # Column likely already exists
+            pass
+
+        # MIGRATION: Add group_id column to grid_pairs if it doesn't exist
+        try:
+            await self.db.execute("ALTER TABLE grid_pairs ADD COLUMN group_id INTEGER DEFAULT 0")
+            print(f"[REPOS] Migration: added 'group_id' column to 'grid_pairs'")
+        except Exception:
             pass
             
         # MIGRATION: Add metadata column to symbol_state if it doesn't exist
@@ -105,8 +111,8 @@ class Repository:
                 trade_count, next_action, is_reopened,
                 buy_in_zone, sell_in_zone,
                 hedge_ticket, hedge_direction, hedge_active,
-                locked_buy_entry, locked_sell_entry, tp_blocked
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                locked_buy_entry, locked_sell_entry, tp_blocked, group_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, pair_index) DO UPDATE SET
                 buy_price=excluded.buy_price,
                 sell_price=excluded.sell_price,
@@ -126,7 +132,8 @@ class Repository:
                 hedge_active=excluded.hedge_active,
                 locked_buy_entry=excluded.locked_buy_entry,
                 locked_sell_entry=excluded.locked_sell_entry,
-                tp_blocked=excluded.tp_blocked
+                tp_blocked=excluded.tp_blocked,
+                group_id=excluded.group_id
             """,
             (
                 self.symbol, pair_data['index'], pair_data['buy_price'], pair_data['sell_price'],
@@ -141,7 +148,8 @@ class Repository:
                 pair_data.get('hedge_active', 0),
                 pair_data.get('locked_buy_entry', 0.0),
                 pair_data.get('locked_sell_entry', 0.0),
-                int(pair_data.get('tp_blocked', False))
+                int(pair_data.get('tp_blocked', False)),
+                pair_data.get('group_id', 0)
             )
         )
         await self.db.commit()

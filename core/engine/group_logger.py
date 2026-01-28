@@ -16,17 +16,22 @@ from collections import defaultdict
 
 
 @dataclass
-class PairData:
-    """Data for a single pair within a group."""
-    pair_idx: int
-    trade_type: str = ""  # "BUY" or "SELL"
+class PairLegData:
+    """Data for a single leg (Buy or Sell) of a pair."""
+    status: str = "PENDING" # PENDING, ACTIVE, TP, SL, CLOSED, WAITING
     entry: float = 0.0
     tp: float = 0.0
     sl: float = 0.0
-    re_entries: int = 0
     lots: float = 0.0
-    status: str = "PENDING"  # PENDING, ACTIVE, TP, SL, CLOSED
     ticket: int = 0
+    re_entries: int = 0
+
+@dataclass
+class PairData:
+    """Data for a single pair (index) containing both Buy and Sell legs."""
+    pair_idx: int
+    buy_leg: PairLegData = field(default_factory=PairLegData)
+    sell_leg: PairLegData = field(default_factory=PairLegData)
 
 
 @dataclass
@@ -45,35 +50,21 @@ class GroupData:
 class GroupLogger:
     """
     Structured logger for trading groups.
-
-    Creates readable table-formatted logs per group with:
-    - Pair details: Type, Entry, TP, SL, Re-entries, Lots, Status
-    - Group status: C count, Anchor, Direction, Retracement direction
-    - Event history
+    Creates readable table-formatted logs per group.
     """
-
     # Table formatting constants
     HEADER_CHAR = "═"
     ROW_CHAR = "─"
     COL_SEP = "│"
 
     def __init__(self, symbol: str, log_dir: str = "logs", user_id: str = None):
-        """
-        Initialize the group logger.
-
-        Args:
-            symbol: Trading symbol (e.g., "BTCUSD")
-            log_dir: Base directory for log files
-            user_id: User ID for per-user logging (matches SessionLogger structure)
-        """
+        """Initialize the group logger."""
         self.symbol = symbol
         self.user_id = user_id
         self.groups: Dict[int, GroupData] = {}
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Determine log directory based on user_id
-        # If user_id provided, use same structure as SessionLogger: logs/users/{user_id}/sessions/
-        # Otherwise use logs/ directly for debugging
+        # Determine log directory
         from pathlib import Path
         root_dir = Path(__file__).resolve().parent.parent.parent
 
@@ -82,7 +73,6 @@ class GroupLogger:
         else:
             self.log_dir = root_dir / log_dir
 
-        # Ensure log directory exists
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir = str(self.log_dir)
 
@@ -97,6 +87,11 @@ class GroupLogger:
         if group_id not in self.groups:
             self.groups[group_id] = GroupData(group_id=group_id)
         return self.groups[group_id]
+        
+    def _get_or_create_pair(self, group: GroupData, pair_idx: int) -> PairData:
+        if pair_idx not in group.pairs:
+            group.pairs[pair_idx] = PairData(pair_idx=pair_idx)
+        return group.pairs[pair_idx]
 
     def log_init(self, group_id: int, anchor: float, is_bullish_source: bool,
                  b_idx: int, s_idx: int, b_ticket: int = 0, s_ticket: int = 0,
@@ -104,47 +99,31 @@ class GroupLogger:
                  b_tp: float = 0, s_tp: float = 0,
                  b_sl: float = 0, s_sl: float = 0,
                  lots: float = 0.01):
-        """
-        Log group initialization.
-
-        Args:
-            group_id: The group being initialized
-            anchor: Anchor price for the group
-            is_bullish_source: True if INIT was caused by bullish TP
-            b_idx: Buy pair index
-            s_idx: Sell pair index
-            b_ticket: Buy ticket number
-            s_ticket: Sell ticket number
-        """
+        """Log group initialization."""
         group = self._get_or_create_group(group_id)
         group.anchor = anchor
         group.init_direction = "BULLISH" if is_bullish_source else "BEARISH"
-        # Pending retracement is OPPOSITE of init direction
         group.pending_retracement = "BEARISH" if is_bullish_source else "BULLISH"
         group.c_count = 0
         group.settled = False
 
-        # Add the INIT pairs
-        group.pairs[b_idx] = PairData(
-            pair_idx=b_idx,
-            trade_type="BUY",
-            entry=b_entry if b_entry else anchor,
-            tp=b_tp,
-            sl=b_sl,
-            lots=lots,
-            status="ACTIVE",
-            ticket=b_ticket
-        )
-        group.pairs[s_idx] = PairData(
-            pair_idx=s_idx,
-            trade_type="SELL",
-            entry=s_entry if s_entry else anchor,
-            tp=s_tp,
-            sl=s_sl,
-            lots=lots,
-            status="ACTIVE",
-            ticket=s_ticket
-        )
+        # Update Buy Index
+        p_buy = self._get_or_create_pair(group, b_idx)
+        p_buy.buy_leg.status = "ACTIVE"
+        p_buy.buy_leg.entry = b_entry if b_entry else anchor
+        p_buy.buy_leg.tp = b_tp
+        p_buy.buy_leg.sl = b_sl
+        p_buy.buy_leg.lots = lots
+        p_buy.buy_leg.ticket = b_ticket
+
+        # Update Sell Index
+        p_sell = self._get_or_create_pair(group, s_idx)
+        p_sell.sell_leg.status = "ACTIVE"
+        p_sell.sell_leg.entry = s_entry if s_entry else anchor
+        p_sell.sell_leg.tp = s_tp
+        p_sell.sell_leg.sl = s_sl
+        p_sell.sell_leg.lots = lots
+        p_sell.sell_leg.ticket = s_ticket
 
         # Log event
         event = {
@@ -154,9 +133,7 @@ class GroupLogger:
             "details": f"B{b_idx}+S{s_idx}, Pending retracement: {group.pending_retracement}"
         }
         group.events.append(event)
-
         self._write_event(group_id, event)
-        # self._write_group_table(group_id)
 
     def log_expansion(self, group_id: int, expansion_type: str,
                       pair_idx: int, trade_type: str, entry: float,
@@ -165,55 +142,38 @@ class GroupLogger:
                       seed_entry: float = None, seed_tp: float = None,
                       seed_sl: float = None, seed_ticket: int = 0,
                       is_atomic: bool = True, c_count: int = 0):
-        """
-        Log grid expansion (atomic or non-atomic).
-
-        Args:
-            group_id: Group being expanded
-            expansion_type: "TP_EXPAND", "STEP_EXPAND", "RETRACEMENT"
-            pair_idx: Completing pair index
-            trade_type: "BUY" or "SELL"
-            entry, tp, sl, lots: Trade details
-            seed_idx: New seeded pair index (None for non-atomic)
-            is_atomic: True if both legs fired, False for single leg
-            c_count: Current C count after expansion
-        """
+        """Log grid expansion."""
         group = self._get_or_create_group(group_id)
         group.c_count = c_count
 
-        # Update/add completing pair
-        if pair_idx not in group.pairs:
-            group.pairs[pair_idx] = PairData(pair_idx=pair_idx)
+        # Main completing pair
+        p1 = self._get_or_create_pair(group, pair_idx)
+        leg1 = p1.buy_leg if trade_type == "BUY" else p1.sell_leg
+        leg1.status = "ACTIVE"
+        leg1.entry = entry
+        leg1.tp = tp
+        leg1.sl = sl
+        leg1.lots = lots
+        leg1.ticket = ticket
 
-        pair = group.pairs[pair_idx]
-        pair.trade_type = trade_type
-        pair.entry = entry
-        pair.tp = tp
-        pair.sl = sl
-        pair.lots = lots
-        pair.status = "ACTIVE"
-        pair.ticket = ticket
-
-        # Add seeded pair if atomic
+        # Seed pair (if atomic)
         if is_atomic and seed_idx is not None:
-            group.pairs[seed_idx] = PairData(
-                pair_idx=seed_idx,
-                trade_type=seed_type or ("SELL" if trade_type == "BUY" else "BUY"),
-                entry=seed_entry or entry,
-                tp=seed_tp or 0,
-                sl=seed_sl or 0,
-                lots=lots,
-                status="ACTIVE",
-                ticket=seed_ticket
-            )
+             p2 = self._get_or_create_pair(group, seed_idx)
+             seed_dir = seed_type or ("SELL" if trade_type == "BUY" else "BUY")
+             leg2 = p2.buy_leg if seed_dir == "BUY" else p2.sell_leg
+             leg2.status = "ACTIVE"
+             leg2.entry = seed_entry or entry
+             leg2.tp = seed_tp or 0
+             leg2.sl = seed_sl or 0
+             leg2.lots = lots
+             leg2.ticket = seed_ticket
 
         # Log event
         atomic_str = "ATOMIC" if is_atomic else "NON-ATOMIC"
+        msg = f"[{atomic_str}] {trade_type[0]}{pair_idx}"
         if is_atomic and seed_idx is not None:
-            msg = f"[{atomic_str}] {trade_type[0]}{pair_idx} + {seed_type[0] if seed_type else ('S' if trade_type == 'BUY' else 'B')}{seed_idx}"
-        else:
-            msg = f"[{atomic_str}] {trade_type[0]}{pair_idx} only"
-
+            msg += f" + {seed_dir[0]}{seed_idx}"
+            
         event = {
             "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
             "type": expansion_type,
@@ -221,9 +181,7 @@ class GroupLogger:
             "details": f"C={c_count}, Entry={entry:.2f}"
         }
         group.events.append(event)
-
         self._write_event(group_id, event)
-        # self._write_group_table(group_id)
 
     def log_retracement_expansion(self, group_id: int, direction: str,
                                    level: int, target_price: float,
@@ -234,70 +192,45 @@ class GroupLogger:
                                    lots: float, c_count: int,
                                    is_atomic: bool = True,
                                    s_ticket: int = 0, b_ticket: int = 0):
-        """
-        Log retracement-based expansion after INIT.
-
-        Args:
-            group_id: Group being expanded
-            direction: "BULLISH" or "BEARISH" retracement
-            level: Retracement level number (1, 2, 3...)
-            target_price: Price that triggered retracement
-        """
+        """Log retracement-based expansion."""
         group = self._get_or_create_group(group_id)
         group.c_count = c_count
 
-        # Add pairs
         if is_atomic or direction == "BEARISH":
-            group.pairs[s_idx] = PairData(
-                pair_idx=s_idx,
-                trade_type="SELL",
-                entry=s_entry,
-                tp=s_tp,
-                sl=s_sl,
-                lots=lots,
-                status="ACTIVE",
-                ticket=s_ticket
-            )
+            p_sell = self._get_or_create_pair(group, s_idx)
+            p_sell.sell_leg.status = "ACTIVE"
+            p_sell.sell_leg.entry = s_entry
+            p_sell.sell_leg.tp = s_tp
+            p_sell.sell_leg.sl = s_sl
+            p_sell.sell_leg.lots = lots
+            p_sell.sell_leg.ticket = s_ticket
 
         if is_atomic or direction == "BULLISH":
-            group.pairs[b_idx] = PairData(
-                pair_idx=b_idx,
-                trade_type="BUY",
-                entry=b_entry,
-                tp=b_tp,
-                sl=b_sl,
-                lots=lots,
-                status="ACTIVE",
-                ticket=b_ticket
-            )
-
-        atomic_str = "ATOMIC" if is_atomic else "NON-ATOMIC"
-        if is_atomic:
-            msg = f"[{atomic_str}] S{s_idx} + B{b_idx}"
-        else:
-            if direction == "BEARISH":
-                msg = f"[{atomic_str}] S{s_idx} only"
-            else:
-                msg = f"[{atomic_str}] B{b_idx} only"
+            p_buy = self._get_or_create_pair(group, b_idx)
+            p_buy.buy_leg.status = "ACTIVE"
+            p_buy.buy_leg.entry = b_entry
+            p_buy.buy_leg.tp = b_tp
+            p_buy.buy_leg.sl = b_sl
+            p_buy.buy_leg.lots = lots
+            p_buy.buy_leg.ticket = b_ticket
 
         event = {
             "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
             "type": "RETRACEMENT",
             "message": f"{direction} retracement L{level} @ {target_price:.2f}",
-            "details": f"{msg}, C={c_count}"
+            "details": f"C={c_count}"
         }
         group.events.append(event)
-
         self._write_event(group_id, event)
-        # self._write_group_table(group_id)
 
     def log_tp_hit(self, group_id: int, pair_idx: int, leg: str,
                    price: float, was_incomplete: bool = False):
         """Log TP hit event."""
         group = self._get_or_create_group(group_id)
-
         if pair_idx in group.pairs:
-            group.pairs[pair_idx].status = "TP"
+            p = group.pairs[pair_idx]
+            l = p.buy_leg if leg in ["BUY", "B"] else p.sell_leg
+            l.status = "TP"
 
         incomplete_str = " (INCOMPLETE)" if was_incomplete else ""
         event = {
@@ -312,9 +245,10 @@ class GroupLogger:
     def log_sl_hit(self, group_id: int, pair_idx: int, leg: str, price: float):
         """Log SL hit event."""
         group = self._get_or_create_group(group_id)
-
         if pair_idx in group.pairs:
-            group.pairs[pair_idx].status = "SL"
+             p = group.pairs[pair_idx]
+             l = p.buy_leg if leg in ["BUY", "B"] else p.sell_leg
+             l.status = "SL"
 
         event = {
             "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
@@ -329,6 +263,11 @@ class GroupLogger:
                                  leg: str, entry: float, reason: str = "INIT_COMPLETE"):
         """Log non-atomic completing leg fired with INIT."""
         group = self._get_or_create_group(group_id)
+        # Assuming this sets the leg to ACTIVE
+        p = self._get_or_create_pair(group, pair_idx)
+        l = p.buy_leg if leg in ["BUY", "B"] else p.sell_leg
+        l.status = "ACTIVE"
+        l.entry = entry
 
         event = {
             "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
@@ -344,115 +283,137 @@ class GroupLogger:
                     tp: float = None, sl: float = None,
                     re_entries: int = None, lots: float = None,
                     status: str = None, ticket: int = None):
-        """Update specific fields of a pair."""
+        """Update specific fields of a pair LEG."""
         group = self._get_or_create_group(group_id)
-
-        if pair_idx not in group.pairs:
-            group.pairs[pair_idx] = PairData(pair_idx=pair_idx)
-
-        pair = group.pairs[pair_idx]
-        if trade_type is not None:
-            pair.trade_type = trade_type
-        if entry is not None:
-            pair.entry = entry
-        if tp is not None:
-            pair.tp = tp
-        if sl is not None:
-            pair.sl = sl
-        if re_entries is not None:
-            pair.re_entries = re_entries
-        if lots is not None:
-            pair.lots = lots
-        if status is not None:
-            pair.status = status
-        if ticket is not None:
-            pair.ticket = ticket
+        p = self._get_or_create_pair(group, pair_idx)
+        
+        # If trade_type is provided, update that leg. 
+        # If NOT provided, we might be calling generically? 
+        # SymbolEngine should pass trade_type for updates.
+        
+        if trade_type:
+            l = p.buy_leg if trade_type in ["BUY", "B"] else p.sell_leg
+            if entry is not None: l.entry = entry
+            if tp is not None: l.tp = tp
+            if sl is not None: l.sl = sl
+            if re_entries is not None: l.re_entries = re_entries
+            if lots is not None: l.lots = lots
+            if status is not None: l.status = status
+            if ticket is not None: l.ticket = ticket
 
     def update_c_count(self, group_id: int, c_count: int):
         """Update C count for a group."""
         group = self._get_or_create_group(group_id)
         group.c_count = c_count
 
-    def render_group_table(self, group_id: int) -> str:
-        """
-        Render a formatted table for a single group.
 
-        Returns:
-            Formatted string with group table
+    def render_group_table(self, group_id: int, current_price: float = 0.0) -> List[str]:
+        """
+        Render a formatted table for a single group as a list of strings.
         """
         if group_id not in self.groups:
-            return f"Group {group_id}: No data"
+            return [f"Group {group_id}: No data"]
 
         group = self.groups[group_id]
         lines = []
 
         # Header
-        width = 95
-        header_line = self.HEADER_CHAR * width
-        lines.append(header_line)
-
-        title = f"GROUP {group_id} - {group.init_direction} INIT @ {group.anchor:.2f}"
-        lines.append(title.center(width))
-
+        width = 110 # Expanded width
+        header_line = self.ROW_CHAR * width
+        
+        # Group Status Header
+        status_info = f"C={group.c_count}"
+        if group.settled:
+            status_info += " | SETTLED"
+            
+        title = f" [GROUP {group_id}] {group.init_direction} INIT @ {group.anchor:.2f} | Retrace: {group.pending_retracement} | {status_info}"
+        lines.append(title)
         lines.append(header_line)
 
         # Column headers
+        # Seq | Leg | Status | Entry | TP | SL | Lot | Notes
         col_header = (
-            f"{'Pair':<6}{self.COL_SEP}"
-            f"{'Type':<6}{self.COL_SEP}"
-            f"{'Entry':>12}{self.COL_SEP}"
-            f"{'TP':>12}{self.COL_SEP}"
-            f"{'SL':>12}{self.COL_SEP}"
-            f"{'Re-entries':>10}{self.COL_SEP}"
-            f"{'Lots':>8}{self.COL_SEP}"
-            f"{'Status':<8}"
+            f" {'Leg':<6} {self.COL_SEP}"
+            f" {'Status':<10} {self.COL_SEP}"
+            f" {'Entry':>10} {self.COL_SEP}"
+            f" {'TP':>10} {self.COL_SEP}"
+            f" {'SL':>10} {self.COL_SEP}"
+            f" {'Lots':>6} {self.COL_SEP}"
+            f" {'Re':>3}"
         )
         lines.append(col_header)
-
-        # Separator
-        sep_line = self.ROW_CHAR * width
-        lines.append(sep_line)
+        lines.append(header_line)
 
         # Sort pairs by index
         sorted_pairs = sorted(group.pairs.items(), key=lambda x: x[0])
 
         for pair_idx, pair in sorted_pairs:
-            prefix = "B" if pair.trade_type == "BUY" else "S"
-            row = (
-                f"{prefix}{pair_idx:<5}{self.COL_SEP}"
-                f"{pair.trade_type:<6}{self.COL_SEP}"
-                f"{pair.entry:>12.2f}{self.COL_SEP}"
-                f"{pair.tp:>12.2f}{self.COL_SEP}"
-                f"{pair.sl:>12.2f}{self.COL_SEP}"
-                f"{pair.re_entries:>10}{self.COL_SEP}"
-                f"{pair.lots:>8.2f}{self.COL_SEP}"
-                f"{pair.status:<8}"
+            # Render BUY Leg
+            leg_b = pair.buy_leg
+            
+            row_b = (
+                f" B{pair_idx:<5} {self.COL_SEP}"
+                f" {leg_b.status:<10} {self.COL_SEP}"
+                f" {leg_b.entry:>10.2f} {self.COL_SEP}"
+                f" {leg_b.tp:>10.2f} {self.COL_SEP}"
+                f" {leg_b.sl:>10.2f} {self.COL_SEP}"
+                f" {leg_b.lots:>6.2f} {self.COL_SEP}"
+                f" {leg_b.re_entries:>3}"
             )
-            lines.append(row)
+            lines.append(row_b)
 
-        # Footer with status
+            # Render SELL Leg
+            leg_s = pair.sell_leg
+            
+            row_s = (
+                f" S{pair_idx:<5} {self.COL_SEP}"
+                f" {leg_s.status:<10} {self.COL_SEP}"
+                f" {leg_s.entry:>10.2f} {self.COL_SEP}"
+                f" {leg_s.tp:>10.2f} {self.COL_SEP}"
+                f" {leg_s.sl:>10.2f} {self.COL_SEP}"
+                f" {leg_s.lots:>6.2f} {self.COL_SEP}"
+                f" {leg_s.re_entries:>3}"
+            )
+            lines.append(row_s)
+            
+            # Separator between pairs for readability? Optional.
+            # lines.append(self.ROW_CHAR * width)
+
         lines.append(header_line)
-        status_line = (
-            f"C={group.c_count} {self.COL_SEP} "
-            f"Pending Retracement: {group.pending_retracement} {self.COL_SEP} "
-            f"Settled: {'Yes' if group.settled else 'No'}"
-        )
-        lines.append(status_line)
+        
+        # Activity Log for this group
+        lines.append(f" [GROUP {group_id} ACTIVITY]")
+        if not group.events:
+             lines.append(" (No events)")
+        else:
+             for event in group.events[-10:]: # Last 10 events to keep it readable
+                 lines.append(f" {event['time']} | {event['type']:<15} | {event['message']}")
+        
         lines.append(header_line)
+        return lines
 
-        return "\n".join(lines)
-
-    def render_all_groups(self) -> str:
-        """Render tables for all groups."""
+    def render_full_log(self, current_price: float = 0.0) -> str:
+        """Render the complete log file content."""
+        width = 110
+        master_lines = []
+        master_lines.append(self.HEADER_CHAR * width)
+        
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        header_info = f" SYMBOL: {self.symbol:<10}  PRICE: {current_price:<10.2f}  TIME: {ts}"
+        master_lines.append(header_info.center(width))
+        master_lines.append(self.HEADER_CHAR * width)
+        master_lines.append("")
+        
+        # Render each group
         if not self.groups:
-            return "No groups initialized"
-
-        tables = []
-        for group_id in sorted(self.groups.keys()):
-            tables.append(self.render_group_table(group_id))
-            tables.append("")  # Empty line between groups
-
-        return "\n".join(tables)
+            master_lines.append(" No groups initialized.")
+        else:
+            for group_id in sorted(self.groups.keys()):
+                group_lines = self.render_group_table(group_id, current_price)
+                master_lines.extend(group_lines)
+                master_lines.append("") # Spacing
+                
+        return "\n".join(master_lines)
 
     def _write_event(self, group_id: int, event: Dict[str, Any]):
         """Write event to log files."""
@@ -466,42 +427,34 @@ class GroupLogger:
             log_line += f" | {details}"
         log_line += "\n"
 
-        # Write to main log
+        # Write to main log (Persistent History)
         with open(self.main_log_path, "a", encoding="utf-8") as f:
             f.write(log_line)
 
-        # Write to group-specific log (DISABLED by request for Single File)
-        # safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
-        # group_log_path = os.path.join(
-        #     self.log_dir, f"group_{group_id}_{safe_symbol}_{self.session_id}.log"
-        # )
-        # with open(group_log_path, "a", encoding="utf-8") as f:
-        #     f.write(log_line)
-
-    def _write_group_table(self, group_id: int):
-        """Write current group table state to file."""
-        safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
-        table_path = os.path.join(
-            self.log_dir, f"group_{group_id}_{safe_symbol}_{self.session_id}_table.txt"
-        )
-
-        table = self.render_group_table(group_id)
-        with open(table_path, "w", encoding="utf-8") as f:
-            f.write(table)
-
-    def write_raw_group_table(self, group_id: int, content: str):
-        """Write raw content to the group table file (used by SymbolEngine)."""
-        safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
+    def update_log_file(self, current_price: float = 0.0):
+        """Update the main single log file with latest state."""
+        content = self.render_full_log(current_price)
         
-        if str(group_id) == "ALL":
-             # Consolidated filename
-             filename = f"groups_table_{self.session_id}.txt"
-        else:
-             filename = f"group_{group_id}_{safe_symbol}_{self.session_id}_table.txt"
-             
-        table_path = os.path.join(self.log_dir, filename)
-        with open(table_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        # Overwrite mode - we want the file to represent CURRENT state
+        # The user said "all the tables should and MUST be in one file"
+        # and "in tabular manner". State snapshot is best for this.
+        
+        # Use a fixed filename for the session so it doesn't rotate endlessly
+        # "groups_table_{session_id}.txt"
+        
+        filename = f"groups_log_{self.session_id}.txt"
+        path = os.path.join(self.log_dir, filename)
+        
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            print(f"Error writing group log: {e}")
+
+    # Legacy/Aliases
+    def write_raw_group_table(self, group_id, content):
+        pass # Deprecated by update_log_file
+
 
     def print_group_table(self, group_id: int):
         """Print group table to console."""

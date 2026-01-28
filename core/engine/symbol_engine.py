@@ -1163,6 +1163,11 @@ class SymbolEngine:
             if C == 2:
                 print(f"[NON-ATOMIC] C was 2, now 3 after B{pair_to_complete}. Filling leg only. Waiting for Incomplete TP to drive Init.")
                 
+                # [GROUP 0 SATURATION] Force Artificial TP if Group 0
+                if self.current_group == 0:
+                    print(f"[GROUP 0 SATURATION] C=3 reached via Step Expansion. Forcing Artificial TP.")
+                    await self._force_artificial_tp_and_init(tick, event_price=(tick.ask+tick.bid)/2)
+                
                 # Log non-atomic expansion
                 self.group_logger.log_expansion(
                     group_id=self.current_group,
@@ -1268,6 +1273,11 @@ class SymbolEngine:
             # DIRECT SOLUTION: Just fill the leg. Do NOT force Init.
             if C == 2:
                 print(f"[NON-ATOMIC] C was 2, now 3 after S{pair_to_complete}. Filling leg only. Waiting for Incomplete TP to drive Init.")
+
+                # [GROUP 0 SATURATION] Force Artificial TP if Group 0
+                if self.current_group == 0:
+                    print(f"[GROUP 0 SATURATION] C=3 reached via Step Expansion. Forcing Artificial TP.")
+                    await self._force_artificial_tp_and_init(tick, event_price=(tick.ask+tick.bid)/2)
                 
                 # Log non-atomic expansion
                 self.group_logger.log_expansion(
@@ -2305,7 +2315,14 @@ class SymbolEngine:
                     print(f"[TP-EXPAND] C==2: B{complete_idx} only (Non-Atomic Fill)")
                     # Fire Non-Atomic Leg ONLY
                     await self._place_single_leg_tp("buy", tick.ask, complete_idx)
-                    # DO NOT Force Init. Wait for Incomplete Pair TP.
+                    
+                    # [GROUP LOGIC]
+                    if group_id == 0:
+                        print(f"[GROUP 0 SATURATION] C=3 reached via TP Expansion. Forcing Artificial TP.")
+                        await self._force_artificial_tp_and_init(tick, event_price=event_price)
+                    else:
+                        print(f"[GROUP {group_id} TP-EXPAND] C=3 reached. Waiting for Incomplete Pair TP to trigger Init.")
+                        # Not forcing Init. Wait for Incomplete Pair TP.
                 else:
                     print(f"[TP-EXPAND] Atomic: B{complete_idx} + S{seed_idx}")
                     await self._place_atomic_bullish_tp(event_price, complete_idx, seed_idx)
@@ -2351,7 +2368,14 @@ class SymbolEngine:
                     print(f"[TP-EXPAND] C==2: S{complete_idx} only (Non-Atomic Fill)")
                     # Fire Non-Atomic Leg ONLY
                     await self._place_single_leg_tp("sell", tick.bid, complete_idx)
-                    # DO NOT Force Init. Wait for Incomplete Pair TP.
+                    
+                    # [GROUP LOGIC]
+                    if group_id == 0:
+                        print(f"[GROUP 0 SATURATION] C=3 reached via TP Expansion. Forcing Artificial TP.")
+                        await self._force_artificial_tp_and_init(tick, event_price=event_price)
+                    else:
+                        print(f"[GROUP {group_id} TP-EXPAND] C=3 reached. Waiting for Incomplete Pair TP to trigger Init.")
+                        # Not forcing Init. Wait for Incomplete Pair TP.
                 else:
                     print(f"[TP-EXPAND] Atomic: S{complete_idx} + B{seed_idx}")
                     await self._place_atomic_bearish_tp(event_price, complete_idx, seed_idx)
@@ -3903,6 +3927,23 @@ class SymbolEngine:
                  ticket=ticket
             )
     
+    def _init_group_logger(self):
+        """Initialize the GroupLogger."""
+        # Extract user_id from session_logger if available
+        user_id = None
+        if self.session_logger and hasattr(self.session_logger, 'user_id'):
+            user_id = self.session_logger.user_id
+
+        self.group_logger = GroupLogger(
+            symbol=self.symbol,
+            # lot_sizes=self.lot_sizes, # removed arg from constructor in recent GroupLogger update?
+            # self.lot_sizes, spread etc are NOT in constructor of new GroupLogger!
+            # New GroupLogger(symbol, log_dir, user_id).
+            # I must check GroupLogger constructor again.
+            log_dir="logs",
+            user_id=user_id
+        )
+    
     async def terminate(self):
         """
         Nuclear option: Close ALL positions associated with this strategy immediately.
@@ -4177,7 +4218,7 @@ class SymbolEngine:
 
     
     async def save_state(self):
-        """Persist grid state to SQLite including cycle management."""
+        """Persist grid state to SQLite and update Group Logs."""
         # Prepare metadata blob
         metadata_dict = {
             "group_direction": self.group_direction
@@ -4193,6 +4234,21 @@ class SymbolEngine:
         # Save All Pairs
         for pair in self.pairs.values():
             await self.repository.upsert_pair(asdict(pair))
+            
+        # [LOGGER INTEGRATION] Update the tabular log file
+        if self.group_logger:
+            # Check if we have a valid current price
+            price = self.current_price
+            if price == 0.0:
+                 # Try to get from last tick if available
+                 tick = mt5.symbol_info_tick(self.symbol)
+                 if tick:
+                     price = (tick.bid + tick.ask) / 2
+            
+            # Sync internal state if needed (GroupLogger tracks its own state based on events)
+            # But we want to ensure P/L is updated.
+            # Passing price is enough.
+            self.group_logger.update_log_file(price)
 
     async def load_state(self):
         """Load grid state from SQLite."""
@@ -4260,7 +4316,50 @@ class SymbolEngine:
             pair.buy_in_zone = bool(row['buy_in_zone'])
             pair.sell_in_zone = bool(row['sell_in_zone'])
             pair.tp_blocked = bool(row.get('tp_blocked', False))
+        
+            # [PERSISTENCE] Restore group_id (default to 0 if missing)
+            pair.group_id = row.get('group_id', 0)
             
+            # [LOGGER SYNC] Restore state to GroupLogger
+            if self.group_logger:
+                # Sync Buy Leg
+                b_status = "PENDING"
+                if pair.tp_blocked:
+                    b_status = "CLOSED"
+                elif pair.buy_filled:
+                    b_status = "ACTIVE"
+                    
+                self.group_logger.update_pair(
+                    group_id=pair.group_id,
+                    pair_idx=idx,
+                    trade_type="BUY",
+                    entry=pair.locked_buy_entry if pair.locked_buy_entry else pair.buy_price,
+                    status=b_status,
+                    ticket=pair.buy_ticket,
+                    tp=pair.pair_tp if pair.trade_count % 2 == 1 else pair.pair_sl, # Approximation of current targets
+                    sl=pair.pair_sl if pair.trade_count % 2 == 1 else pair.pair_tp,
+                    lots=pair.get_next_lot(self.lot_sizes) or 0.0
+                )
+                
+                # Sync Sell Leg
+                s_status = "PENDING"
+                if pair.tp_blocked:
+                    s_status = "CLOSED"
+                elif pair.sell_filled:
+                    s_status = "ACTIVE"
+                    
+                self.group_logger.update_pair(
+                    group_id=pair.group_id,
+                    pair_idx=idx,
+                    trade_type="SELL",
+                    entry=pair.locked_sell_entry if pair.locked_sell_entry else pair.sell_price,
+                    status=s_status,
+                    ticket=pair.sell_ticket,
+                    tp=pair.pair_sl if pair.trade_count % 2 == 1 else pair.pair_tp, # Inversed for Sell? Logic complex.
+                    sl=pair.pair_tp if pair.trade_count % 2 == 1 else pair.pair_sl,
+                    lots=pair.get_next_lot(self.lot_sizes) or 0.0
+                )
+
             # ===== ROBUST STATE SYNCHRONIZATION =====
             # Enforce invariants regardless of what was saved in DB.
             # This prevents race conditions after crashes/restarts.
