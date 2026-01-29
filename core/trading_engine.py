@@ -56,6 +56,8 @@ class TradingEngine:
         # Graceful stop timeout tracking
         self.start_time: datetime = None  # Set when tick loop starts
         self.timeout_graceful_stop_triggered: bool = False
+        self.force_stop_time: datetime = None  # Hard stop failsafe
+        self.db_cleanup_task: asyncio.Task = None  # 5-min cleanup timer
 
     def _init_mt5(self) -> bool:
         """
@@ -152,6 +154,9 @@ class TradingEngine:
         
         while self.running:
             try:
+                # 1. Collect all orchestrators FIRST (needed for timeout check and tick processing)
+                all_orchestrators = list(self.bot_manager.bots.values())
+                
                 # Periodic health check
                 self.tick_count += 1
                 if self.tick_count % self.HEALTH_CHECK_INTERVAL == 0:
@@ -174,11 +179,13 @@ class TradingEngine:
                     if total_running == 0:
                         logger.warning("[TIMEOUT] All symbols finished graceful stop. Shutting down engine.")
                         print(f"\n[TIMEOUT] All symbols finished. Engine stopping.")
+                        # Schedule DB cleanup in 5 minutes
+                        if self.db_cleanup_task is None:
+                            self.db_cleanup_task = asyncio.create_task(self._schedule_db_cleanup())
                         await self.stop()
                         break
                 
-                # 1. Collect all active symbols from all active users (orchestrators)
-                all_orchestrators = list(self.bot_manager.bots.values())
+                # 2. Collect active symbols from all orchestrators
                 active_symbols = set()
                 
                 for orch in all_orchestrators:
@@ -256,6 +263,24 @@ class TradingEngine:
             "consecutive_errors": self.consecutive_errors,
             "running": self.running
         }
+    
+    async def _schedule_db_cleanup(self):
+        """
+        Delete DB 5 minutes after graceful stop completion.
+        Called when all engines finish graceful stop.
+        """
+        db_path = "db/grid_v3.db"
+        print(f"\n[CLEANUP] Database cleanup scheduled in 5 minutes...")
+        print(f"[CLEANUP] File: {db_path}")
+        
+        await asyncio.sleep(300)  # 5 minutes
+        
+        if os.path.exists(db_path):
+            try:
+                os.remove(db_path)
+                print(f"[CLEANUP] ✓ Deleted database: {db_path}")
+            except Exception as e:
+                print(f"[CLEANUP] ✗ Could not delete database: {e}")
     
     async def _check_timeout_graceful_stop(self):
         """

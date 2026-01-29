@@ -2138,6 +2138,33 @@ class SymbolEngine:
                              pair1.advance_toggle()
                              pair1.buy_pending_ticket = self._place_pending_order("buy_stop", p1_buy_price, 1)
                              print(f" {self.symbol}: [INIT] S1 Filled (Market). Step 1 -> 2")
+                             
+                             # [LOGGER] Log S1 fill to group logger
+                             if self.group_logger:
+                                 actual_s1_entry = pair1.locked_sell_entry if pair1.locked_sell_entry > 0 else p1_sell_target
+                                 self.group_logger.update_pair(
+                                     group_id=self.current_group,
+                                     pair_idx=1,
+                                     trade_type="SELL",
+                                     entry=actual_s1_entry,
+                                     tp=actual_s1_entry - self.sell_stop_tp_pips,
+                                     sl=actual_s1_entry + self.sell_stop_sl_pips,
+                                     status="ACTIVE",
+                                     lots=self.lot_sizes[1] if 1 < len(self.lot_sizes) else 0.01,
+                                     ticket=ticket_s1
+                                 )
+                                 # B1 (Buy Stop - Pending)
+                                 self.group_logger.update_pair(
+                                     group_id=self.current_group,
+                                     pair_idx=1,
+                                     trade_type="BUY",
+                                     entry=p1_buy_price,
+                                     tp=p1_buy_price + self.buy_stop_tp_pips,
+                                     sl=p1_buy_price - self.buy_stop_sl_pips,
+                                     status="PENDING",
+                                     lots=self.lot_sizes[1] if 1 < len(self.lot_sizes) else 0.01
+                                 )
+                             
                              self.init_step = 2
                         else:
                              # Market failed, place Pending
@@ -4292,6 +4319,7 @@ class SymbolEngine:
     def get_status(self) -> Dict[str, Any]:
         return {
             "running": self.running,
+            "graceful_stop": self.graceful_stop,
             "current_price": self.current_price,
             "open_positions": self.open_positions_count,
             "step": len(self.pairs),

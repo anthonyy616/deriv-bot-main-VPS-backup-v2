@@ -626,6 +626,21 @@
                     <p class="text-slate-500 text-sm text-center py-4">Click "Refresh" to load session history</p>
                 </div>
             </div>
+
+            <!-- Group Logs Panel -->
+            <div
+                class="md:col-span-3 bg-white dark:bg-slate-800 p-5 rounded-lg border border-slate-200 dark:border-slate-700">
+                <div class="flex justify-between items-center mb-3">
+                    <h2 class="text-lg font-semibold">Group Logs</h2>
+                    <button onclick="loadGroupLogs()"
+                        class="text-xs bg-slate-600 hover:bg-slate-700 text-white px-3 py-1 rounded">
+                        Refresh
+                    </button>
+                </div>
+                <div id="group-logs-list" class="space-y-2 max-h-48 overflow-y-auto">
+                    <p class="text-slate-500 text-sm text-center py-4">Click "Refresh" to load group logs</p>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1087,20 +1102,32 @@
             const statusBadge = document.getElementById('status-badge');
             const toggleBtn = document.getElementById('toggle-btn');
 
-            if (status.running) {
+            if (status.graceful_stop) {
+                // GRACEFUL STOP IN PROGRESS - show yellow "Stopping..." state
+                statusBadge.innerHTML = '<div class="h-2 w-2 rounded-full bg-yellow-400 animate-pulse"></div> Stopping...';
+                statusBadge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-yellow-500/10 text-yellow-500 border border-yellow-500/20";
+                toggleBtn.textContent = "Stopping...";
+                toggleBtn.className = "px-4 py-1.5 bg-yellow-600 text-white text-sm font-medium rounded cursor-not-allowed opacity-75";
+                toggleBtn.disabled = true;
+                if (lastRunningState !== 'stopping') log("⏳ Graceful stop in progress - completing open positions...");
+                lastRunningState = 'stopping';
+            } else if (status.running) {
                 statusBadge.innerHTML = '<div class="h-2 w-2 rounded-full bg-green-400 animate-pulse"></div> Active';
                 statusBadge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-green-500/10 text-green-500 border border-green-500/20";
                 toggleBtn.textContent = "Stop Bot";
                 toggleBtn.className = "px-4 py-1.5 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded";
-                if (!lastRunningState) log(`🚀 Bot Running. Step ${status.step}`);
+                toggleBtn.disabled = false;
+                if (lastRunningState !== true) log(`🚀 Bot Running. Step ${status.step}`);
+                lastRunningState = true;
             } else {
                 statusBadge.innerHTML = '<div class="h-2 w-2 rounded-full bg-slate-400"></div> Offline';
                 statusBadge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-200 text-slate-500 dark:bg-slate-800 dark:text-slate-400";
                 toggleBtn.textContent = "Start Bot";
                 toggleBtn.className = "px-4 py-1.5 bg-green-600 hover:bg-green-700 text-white text-sm font-medium rounded";
-                if (lastRunningState) log("🛑 Bot Stopped.");
+                toggleBtn.disabled = false;
+                if (lastRunningState && lastRunningState !== false) log("🛑 Bot Stopped.");
+                lastRunningState = false;
             }
-            lastRunningState = status.running;
         }
 
         async function logout() {
@@ -1177,6 +1204,50 @@
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = filename || `${sessionId}.txt`;
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            }
+        }
+
+        // --- Group Log Functions ---
+        async function loadGroupLogs() {
+            const container = document.getElementById('group-logs-list');
+            container.innerHTML = '<p class="text-slate-400 text-sm text-center py-2">Loading...</p>';
+
+            const logs = await apiCall('/history/groups');
+            if (!logs || logs.length === 0) {
+                container.innerHTML = '<p class="text-slate-500 text-sm text-center py-4">No group logs found</p>';
+                return;
+            }
+
+            container.innerHTML = logs.map(log => `
+                <div class="flex justify-between items-center p-2 bg-slate-900 rounded border border-slate-700">
+                    <span class="text-sm text-slate-300">${log.name}</span>
+                    <div class="flex gap-2">
+                        <button onclick="viewGroupLog('${log.name}')" class="text-xs bg-blue-600 hover:bg-blue-700 px-2 py-1 rounded">View</button>
+                        <button onclick="downloadGroupLog('${log.name}')" class="text-xs bg-green-600 hover:bg-green-700 px-2 py-1 rounded">Download</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        async function viewGroupLog(filename) {
+            const content = await fetchText(`/history/groups/${encodeURIComponent(filename)}`);
+            if (content) {
+                const win = window.open('', '_blank', 'width=1000,height=700');
+                win.document.write(`<html><head><title>Group Log - ${filename}</title><style>body{background:#1e293b;color:#94a3b8;font-family:monospace;padding:20px;white-space:pre-wrap;}</style></head><body>${content}</body></html>`);
+            }
+        }
+
+        async function downloadGroupLog(filename) {
+            const content = await fetchText(`/history/groups/${encodeURIComponent(filename)}`);
+            if (content) {
+                const blob = new Blob([content], { type: 'text/plain' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
                 a.click();
                 a.remove();
                 URL.revokeObjectURL(url);

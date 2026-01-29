@@ -204,6 +204,7 @@ class StrategyOrchestrator:
         if not self.strategies:
             return {
                 "running": False,
+                "graceful_stop": False,
                 "current_price": 0,
                 "open_positions": 0,
                 "step": 0,
@@ -216,6 +217,7 @@ class StrategyOrchestrator:
         total_positions = 0
         running_any = False
         is_resetting_any = False
+        graceful_stop_any = False
         per_symbol_status = {}
         
         for symbol, bot in self.strategies.items():
@@ -226,6 +228,8 @@ class StrategyOrchestrator:
                 running_any = True
             if s.get('is_resetting', False):
                 is_resetting_any = True
+            if s.get('graceful_stop', False):
+                graceful_stop_any = True
         
         # For backward compatibility, use first bot for single-value fields
         first_bot = list(self.strategies.values())[0] if self.strategies else None
@@ -233,6 +237,7 @@ class StrategyOrchestrator:
 
         return {
             "running": running_any,
+            "graceful_stop": graceful_stop_any,
             "current_price": first_bot.current_price if first_bot else 0,
             "open_positions": total_positions,
             "step": first_status.get('step', 0),

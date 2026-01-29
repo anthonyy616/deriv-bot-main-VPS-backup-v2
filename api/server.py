@@ -258,15 +258,7 @@ async def get_history(bot = Depends(get_current_bot)):
     sessions = bot.session_logger.get_sessions()
     return sessions
 
-@app.get("/history/{session_id}")
-async def get_session_log(session_id: str, bot = Depends(get_current_bot)):
-    """Get contents of a specific session log"""
-    content = bot.session_logger.get_session_content(session_id)
-    if content:
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(content)
-    raise HTTPException(404, "Session not found")
-
+# NOTE: Specific routes MUST come BEFORE parameterized routes in FastAPI
 @app.get("/history/groups")
 async def get_group_logs(bot = Depends(get_current_bot)):
     """Get list of group log files for this user"""
@@ -305,6 +297,15 @@ async def get_group_log_content(filename: str, bot = Depends(get_current_bot)):
     if log_path.exists() and log_path.is_file():
         return PlainTextResponse(log_path.read_text(encoding="utf-8"))
     raise HTTPException(404, "Group log not found")
+
+@app.get("/history/{session_id}")
+async def get_session_log(session_id: str, bot = Depends(get_current_bot)):
+    """Get contents of a specific session log"""
+    content = bot.session_logger.get_session_content(session_id)
+    if content:
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content)
+    raise HTTPException(404, "Session not found")
 
 # Mount static folder for assets (css/js images)
 app.mount("/static", StaticFiles(directory="static"), name="static")
