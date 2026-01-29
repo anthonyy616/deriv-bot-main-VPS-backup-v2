@@ -927,11 +927,15 @@ class SymbolEngine:
         # ========================================================================
         # LOG INIT TO GROUP LOGGER
         # ========================================================================
-        # TASK 6 FIX: Use configured TP/SL pips instead of spread
-        b_tp = b_price + self.buy_stop_tp_pips  # TP is configured pips above entry for buy
-        b_sl = b_price - self.buy_stop_sl_pips  # SL is configured pips below entry for buy
-        s_tp = s_price - self.sell_stop_tp_pips  # TP is configured pips below entry for sell
-        s_sl = s_price + self.sell_stop_sl_pips  # SL is configured pips above entry for sell
+        # Use actual fill prices from locked entries if available, else use grid prices
+        actual_b_entry = pair_b.locked_buy_entry if pair_b.locked_buy_entry > 0 else b_price
+        actual_s_entry = pair_s.locked_sell_entry if pair_s.locked_sell_entry > 0 else s_price
+
+        # TASK 6 FIX: Use configured TP/SL pips based on actual fill prices
+        b_tp = actual_b_entry + self.buy_stop_tp_pips  # TP is configured pips above entry for buy
+        b_sl = actual_b_entry - self.buy_stop_sl_pips  # SL is configured pips below entry for buy
+        s_tp = actual_s_entry - self.sell_stop_tp_pips  # TP is configured pips below entry for sell
+        s_sl = actual_s_entry + self.sell_stop_sl_pips  # SL is configured pips above entry for sell
 
         self.group_logger.log_init(
             group_id=group_id,
@@ -941,8 +945,8 @@ class SymbolEngine:
             s_idx=s_idx,
             b_ticket=ticket_b,
             s_ticket=ticket_s,
-            b_entry=b_price,
-            s_entry=s_price,
+            b_entry=actual_b_entry,
+            s_entry=actual_s_entry,
             b_tp=b_tp,
             s_tp=s_tp,
             b_sl=b_sl,
@@ -1185,15 +1189,16 @@ class SymbolEngine:
                     print(f"[GROUP 0 SATURATION] C=3 reached via Step Expansion. Forcing Artificial TP.")
                     await self._force_artificial_tp_and_init(tick, event_price=(tick.ask+tick.bid)/2)
                 
-                # Log non-atomic expansion
+                # Log non-atomic expansion - use actual fill price if available
+                actual_entry = pair.locked_buy_entry if pair.locked_buy_entry > 0 else pair.buy_price
                 self.group_logger.log_expansion(
                     group_id=self.current_group,
                     expansion_type="STEP_EXPAND",
                     pair_idx=pair_to_complete,
                     trade_type="BUY",
-                    entry=pair.buy_price,
-                    tp=pair.buy_price + self.buy_stop_tp_pips,
-                    sl=pair.buy_price - self.buy_stop_sl_pips,
+                    entry=actual_entry,
+                    tp=actual_entry + self.buy_stop_tp_pips,
+                    sl=actual_entry - self.buy_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.buy_ticket,
                     is_atomic=False,
@@ -1224,22 +1229,24 @@ class SymbolEngine:
                     new_pair.sell_ever_opened = True
                 new_pair.advance_toggle()
 
-                # Log atomic expansion
+                # Log atomic expansion - use actual fill prices if available
+                actual_entry = pair.locked_buy_entry if pair.locked_buy_entry > 0 else pair.buy_price
+                seed_actual_entry = new_pair.locked_sell_entry if new_pair.locked_sell_entry > 0 else new_pair.sell_price
                 self.group_logger.log_expansion(
                     group_id=self.current_group,
                     expansion_type="STEP_EXPAND",
                     pair_idx=pair_to_complete,
                     trade_type="BUY",
-                    entry=pair.buy_price,
-                    tp=pair.buy_price + self.buy_stop_tp_pips,
-                    sl=pair.buy_price - self.buy_stop_sl_pips,
+                    entry=actual_entry,
+                    tp=actual_entry + self.buy_stop_tp_pips,
+                    sl=actual_entry - self.buy_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.buy_ticket,
                     seed_idx=new_pair_idx,
                     seed_type="SELL",
-                    seed_entry=new_pair.sell_price,
-                    seed_tp=new_pair.sell_price - self.sell_stop_tp_pips,
-                    seed_sl=new_pair.sell_price + self.sell_stop_sl_pips,
+                    seed_entry=seed_actual_entry,
+                    seed_tp=seed_actual_entry - self.sell_stop_tp_pips,
+                    seed_sl=seed_actual_entry + self.sell_stop_sl_pips,
                     seed_ticket=ticket,
                     is_atomic=True,
                     c_count=C + 1
@@ -1296,15 +1303,16 @@ class SymbolEngine:
                     print(f"[GROUP 0 SATURATION] C=3 reached via Step Expansion. Forcing Artificial TP.")
                     await self._force_artificial_tp_and_init(tick, event_price=(tick.ask+tick.bid)/2)
                 
-                # Log non-atomic expansion
+                # Log non-atomic expansion - use actual fill price if available
+                actual_entry = pair.locked_sell_entry if pair.locked_sell_entry > 0 else pair.sell_price
                 self.group_logger.log_expansion(
                     group_id=self.current_group,
                     expansion_type="STEP_EXPAND",
                     pair_idx=pair_to_complete,
                     trade_type="SELL",
-                    entry=pair.sell_price,
-                    tp=pair.sell_price - self.sell_stop_tp_pips,
-                    sl=pair.sell_price + self.sell_stop_sl_pips,
+                    entry=actual_entry,
+                    tp=actual_entry - self.sell_stop_tp_pips,
+                    sl=actual_entry + self.sell_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.sell_ticket,
                     is_atomic=False,
@@ -1335,22 +1343,24 @@ class SymbolEngine:
                     new_pair.buy_ever_opened = True
                 new_pair.advance_toggle()
 
-                # Log atomic expansion
+                # Log atomic expansion - use actual fill prices if available
+                actual_entry = pair.locked_sell_entry if pair.locked_sell_entry > 0 else pair.sell_price
+                seed_actual_entry = new_pair.locked_buy_entry if new_pair.locked_buy_entry > 0 else new_pair.buy_price
                 self.group_logger.log_expansion(
                     group_id=self.current_group,
                     expansion_type="STEP_EXPAND",
                     pair_idx=pair_to_complete,
                     trade_type="SELL",
-                    entry=pair.sell_price,
-                    tp=pair.sell_price - self.sell_stop_tp_pips,
-                    sl=pair.sell_price + self.sell_stop_sl_pips,
+                    entry=actual_entry,
+                    tp=actual_entry - self.sell_stop_tp_pips,
+                    sl=actual_entry + self.sell_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.sell_ticket,
                     seed_idx=new_pair_idx,
                     seed_type="BUY",
-                    seed_entry=new_pair.buy_price,
-                    seed_tp=new_pair.buy_price + self.buy_stop_tp_pips,
-                    seed_sl=new_pair.buy_price - self.buy_stop_sl_pips,
+                    seed_entry=seed_actual_entry,
+                    seed_tp=seed_actual_entry + self.buy_stop_tp_pips,
+                    seed_sl=seed_actual_entry - self.buy_stop_sl_pips,
                     seed_ticket=ticket,
                     is_atomic=True,
                     c_count=C + 1
@@ -1363,7 +1373,7 @@ class SymbolEngine:
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
             return
-        
+
         pair1 = self.pairs.get(1)
         if pair1 and not pair1.buy_filled:
             ticket = await self._execute_market_order("buy", pair1.buy_price, 1, reason="STEP1")
@@ -1371,19 +1381,44 @@ class SymbolEngine:
                 pair1.buy_filled = True
                 pair1.buy_ticket = ticket
                 pair1.advance_toggle()
-        
+
         # S2: Create Pair 2 with sell
-        pair2 = GridPair(index=2, buy_price=self.anchor_price + 2*self.spread, 
+        pair2 = GridPair(index=2, buy_price=self.anchor_price + 2*self.spread,
                          sell_price=self.anchor_price + self.spread)
         pair2.next_action = "sell"
         pair2.group_id = self.current_group  # Track group membership
         self.pairs[2] = pair2
-        
+
         ticket = await self._execute_market_order("sell", pair2.sell_price, 2, reason="STEP1")
         if ticket:
             pair2.sell_filled = True
             pair2.sell_ticket = ticket
             pair2.advance_toggle()
+
+        # LOG STEP1 BULLISH to GroupLogger - use actual fill prices
+        if pair1:
+            actual_b1_entry = pair1.locked_buy_entry if pair1.locked_buy_entry > 0 else pair1.buy_price
+            actual_s2_entry = pair2.locked_sell_entry if pair2.locked_sell_entry > 0 else pair2.sell_price
+            C = self._count_completed_pairs_for_group(0)
+            self.group_logger.log_expansion(
+                group_id=0,
+                expansion_type="STEP_EXPAND",
+                pair_idx=1,
+                trade_type="BUY",
+                entry=actual_b1_entry,
+                tp=actual_b1_entry + self.buy_stop_tp_pips,
+                sl=actual_b1_entry - self.buy_stop_sl_pips,
+                lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                ticket=pair1.buy_ticket,
+                seed_idx=2,
+                seed_type="SELL",
+                seed_entry=actual_s2_entry,
+                seed_tp=actual_s2_entry - self.sell_stop_tp_pips,
+                seed_sl=actual_s2_entry + self.sell_stop_sl_pips,
+                seed_ticket=pair2.sell_ticket,
+                is_atomic=True,
+                c_count=C
+            )
     
     async def _execute_step1_single_leg_bullish(self):
         """Step 1 Bullish (C==2): Place B1 ONLY to complete Pair 1, no S2."""
@@ -1396,18 +1431,34 @@ class SymbolEngine:
                 pair1.advance_toggle() # S2 skipped, Advanced toggle incremenents the trade count but does not execute a trade ie B1, so it won't fire
                 print(f"[STEP1_SINGLE] B1 placed, S2 skipped (C==2)")
 
+                # LOG STEP1 SINGLE BULLISH to GroupLogger - use actual fill price
+                actual_entry = pair1.locked_buy_entry if pair1.locked_buy_entry > 0 else pair1.buy_price
+                self.group_logger.log_expansion(
+                    group_id=0,
+                    expansion_type="STEP_EXPAND",
+                    pair_idx=1,
+                    trade_type="BUY",
+                    entry=actual_entry,
+                    tp=actual_entry + self.buy_stop_tp_pips,
+                    sl=actual_entry - self.buy_stop_sl_pips,
+                    lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                    ticket=pair1.buy_ticket,
+                    is_atomic=False,
+                    c_count=3
+                )
+
 
     
     async def _execute_step1_bearish(self):
         """Step 1 Bearish: Place S0 + B-1 atomically.
-        
+
         S0 completes Pair 0 (already has B0 from INIT)
         B-1 starts Pair -1
         """
         tick = mt5.symbol_info_tick(self.symbol)
         if not tick:
             return
-        
+
         # S0: Complete Pair 0 (Pair 0 already has B0 from INIT)
         pair0 = self.pairs.get(0)
         if pair0 and not pair0.sell_filled:
@@ -1416,19 +1467,44 @@ class SymbolEngine:
                 pair0.sell_filled = True
                 pair0.sell_ticket = ticket
                 pair0.advance_toggle()
-        
+
         # B-1: Start Pair -1 (buy only)
-        pair_neg1 = GridPair(index=-1, buy_price=self.anchor_price - self.spread, 
+        pair_neg1 = GridPair(index=-1, buy_price=self.anchor_price - self.spread,
                              sell_price=self.anchor_price - 2*self.spread)
         pair_neg1.next_action = "buy"
         pair_neg1.group_id = self.current_group  # Track group membership
         self.pairs[-1] = pair_neg1
-        
+
         ticket = await self._execute_market_order("buy", pair_neg1.buy_price, -1, reason="STEP1")
         if ticket:
             pair_neg1.buy_filled = True
             pair_neg1.buy_ticket = ticket
             pair_neg1.advance_toggle()
+
+        # LOG STEP1 BEARISH to GroupLogger - use actual fill prices
+        if pair0:
+            actual_s0_entry = pair0.locked_sell_entry if pair0.locked_sell_entry > 0 else pair0.sell_price
+            actual_b_neg1_entry = pair_neg1.locked_buy_entry if pair_neg1.locked_buy_entry > 0 else pair_neg1.buy_price
+            C = self._count_completed_pairs_for_group(0)
+            self.group_logger.log_expansion(
+                group_id=0,
+                expansion_type="STEP_EXPAND",
+                pair_idx=0,
+                trade_type="SELL",
+                entry=actual_s0_entry,
+                tp=actual_s0_entry - self.sell_stop_tp_pips,
+                sl=actual_s0_entry + self.sell_stop_sl_pips,
+                lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                ticket=pair0.sell_ticket,
+                seed_idx=-1,
+                seed_type="BUY",
+                seed_entry=actual_b_neg1_entry,
+                seed_tp=actual_b_neg1_entry + self.buy_stop_tp_pips,
+                seed_sl=actual_b_neg1_entry - self.buy_stop_sl_pips,
+                seed_ticket=pair_neg1.buy_ticket,
+                is_atomic=True,
+                c_count=C
+            )
     
     async def _execute_step1_single_leg_bearish(self):
         """Step 1 Bearish (C==2): Place S0 ONLY to complete Pair 0, no B-1."""
@@ -1441,6 +1517,22 @@ class SymbolEngine:
                 pair0.sell_ticket = ticket
                 pair0.advance_toggle()
                 print(f"[STEP1_SINGLE] S0 placed, B-1 skipped (C==2)")
+
+                # LOG STEP1 SINGLE BEARISH to GroupLogger - use actual fill price
+                actual_entry = pair0.locked_sell_entry if pair0.locked_sell_entry > 0 else pair0.sell_price
+                self.group_logger.log_expansion(
+                    group_id=0,
+                    expansion_type="STEP_EXPAND",
+                    pair_idx=0,
+                    trade_type="SELL",
+                    entry=actual_entry,
+                    tp=actual_entry - self.sell_stop_tp_pips,
+                    sl=actual_entry + self.sell_stop_sl_pips,
+                    lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                    ticket=pair0.sell_ticket,
+                    is_atomic=False,
+                    c_count=3
+                )
     
     async def _execute_step2_bullish(self):
         """Step 2 Bullish: Place B2 + S3 atomically."""
@@ -1451,19 +1543,44 @@ class SymbolEngine:
                 pair2.buy_filled = True
                 pair2.buy_ticket = ticket
                 pair2.advance_toggle()
-        
+
         # S3
         pair3 = GridPair(index=3, buy_price=self.anchor_price + 3*self.spread,
                          sell_price=self.anchor_price + 2*self.spread)
         pair3.next_action = "sell"
         pair3.group_id = self.current_group  # Track group membership
         self.pairs[3] = pair3
-        
+
         ticket = await self._execute_market_order("sell", pair3.sell_price, 3, reason="STEP2")
         if ticket:
             pair3.sell_filled = True
             pair3.sell_ticket = ticket
             pair3.advance_toggle()
+
+        # LOG STEP2 BULLISH to GroupLogger - use actual fill prices
+        if pair2:
+            actual_b2_entry = pair2.locked_buy_entry if pair2.locked_buy_entry > 0 else pair2.buy_price
+            actual_s3_entry = pair3.locked_sell_entry if pair3.locked_sell_entry > 0 else pair3.sell_price
+            C = self._count_completed_pairs_for_group(0)
+            self.group_logger.log_expansion(
+                group_id=0,
+                expansion_type="STEP_EXPAND",
+                pair_idx=2,
+                trade_type="BUY",
+                entry=actual_b2_entry,
+                tp=actual_b2_entry + self.buy_stop_tp_pips,
+                sl=actual_b2_entry - self.buy_stop_sl_pips,
+                lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                ticket=pair2.buy_ticket,
+                seed_idx=3,
+                seed_type="SELL",
+                seed_entry=actual_s3_entry,
+                seed_tp=actual_s3_entry - self.sell_stop_tp_pips,
+                seed_sl=actual_s3_entry + self.sell_stop_sl_pips,
+                seed_ticket=pair3.sell_ticket,
+                is_atomic=True,
+                c_count=C
+            )
     
     async def _execute_step2_single_leg_bullish(self):
         """Step 2 Bullish (C >= 2): Place B2 ONLY, no S3."""
@@ -1475,10 +1592,26 @@ class SymbolEngine:
                 pair2.buy_ticket = ticket
                 pair2.advance_toggle()
                 print(f"[STEP2_SINGLE] B2 placed, S3 skipped (C >= 2)")
+
+                # LOG STEP2 SINGLE BULLISH to GroupLogger - use actual fill price
+                actual_entry = pair2.locked_buy_entry if pair2.locked_buy_entry > 0 else pair2.buy_price
+                self.group_logger.log_expansion(
+                    group_id=0,
+                    expansion_type="STEP_EXPAND",
+                    pair_idx=2,
+                    trade_type="BUY",
+                    entry=actual_entry,
+                    tp=actual_entry + self.buy_stop_tp_pips,
+                    sl=actual_entry - self.buy_stop_sl_pips,
+                    lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                    ticket=pair2.buy_ticket,
+                    is_atomic=False,
+                    c_count=3
+                )
     
     async def _execute_step2_bearish(self):
         """Step 2 Bearish: Place S-1 + B-2 atomically.
-        
+
         S-1 completes Pair -1 (already has B-1 from Step 1)
         B-2 starts Pair -2
         """
@@ -1490,19 +1623,44 @@ class SymbolEngine:
                 pair_neg1.sell_filled = True
                 pair_neg1.sell_ticket = ticket
                 pair_neg1.advance_toggle()
-        
+
         # B-2: Start Pair -2 (buy only)
         pair_neg2 = GridPair(index=-2, buy_price=self.anchor_price - 2*self.spread,
                              sell_price=self.anchor_price - 3*self.spread)
         pair_neg2.next_action = "buy"
         pair_neg2.group_id = self.current_group  # Track group membership
         self.pairs[-2] = pair_neg2
-        
+
         ticket = await self._execute_market_order("buy", pair_neg2.buy_price, -2, reason="STEP2")
         if ticket:
             pair_neg2.buy_filled = True
             pair_neg2.buy_ticket = ticket
             pair_neg2.advance_toggle()
+
+        # LOG STEP2 BEARISH to GroupLogger - use actual fill prices
+        if pair_neg1:
+            actual_s_neg1_entry = pair_neg1.locked_sell_entry if pair_neg1.locked_sell_entry > 0 else pair_neg1.sell_price
+            actual_b_neg2_entry = pair_neg2.locked_buy_entry if pair_neg2.locked_buy_entry > 0 else pair_neg2.buy_price
+            C = self._count_completed_pairs_for_group(0)
+            self.group_logger.log_expansion(
+                group_id=0,
+                expansion_type="STEP_EXPAND",
+                pair_idx=-1,
+                trade_type="SELL",
+                entry=actual_s_neg1_entry,
+                tp=actual_s_neg1_entry - self.sell_stop_tp_pips,
+                sl=actual_s_neg1_entry + self.sell_stop_sl_pips,
+                lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                ticket=pair_neg1.sell_ticket,
+                seed_idx=-2,
+                seed_type="BUY",
+                seed_entry=actual_b_neg2_entry,
+                seed_tp=actual_b_neg2_entry + self.buy_stop_tp_pips,
+                seed_sl=actual_b_neg2_entry - self.buy_stop_sl_pips,
+                seed_ticket=pair_neg2.buy_ticket,
+                is_atomic=True,
+                c_count=C
+            )
     
     async def _execute_step2_single_leg_bearish(self):
         """Step 2 Bearish (C == 2): Place S-2 ONLY to complete Pair -2, no B-3."""
@@ -1515,6 +1673,22 @@ class SymbolEngine:
                 pair_neg2.sell_ticket = ticket
                 pair_neg2.advance_toggle()
                 print(f"[STEP2_SINGLE] S-2 placed, B-3 skipped (C == 2)")
+
+                # LOG STEP2 SINGLE BEARISH to GroupLogger - use actual fill price
+                actual_entry = pair_neg2.locked_sell_entry if pair_neg2.locked_sell_entry > 0 else pair_neg2.sell_price
+                self.group_logger.log_expansion(
+                    group_id=0,
+                    expansion_type="STEP_EXPAND",
+                    pair_idx=-2,
+                    trade_type="SELL",
+                    entry=actual_entry,
+                    tp=actual_entry - self.sell_stop_tp_pips,
+                    sl=actual_entry + self.sell_stop_sl_pips,
+                    lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                    ticket=pair_neg2.sell_ticket,
+                    is_atomic=False,
+                    c_count=3
+                )
     
     async def _enforce_hedge_invariants_gated(self):
         """
@@ -2498,7 +2672,26 @@ class SymbolEngine:
                     print(f"[TP-EXPAND] C==2: B{complete_idx} only (Non-Atomic Fill)")
                     # Fire Non-Atomic Leg ONLY
                     await self._place_single_leg_tp("buy", tick.ask, complete_idx)
-                    
+
+                    # LOG THE NON-ATOMIC FILL to GroupLogger
+                    pair_complete = self.pairs.get(complete_idx)
+                    if pair_complete:
+                        # Use locked_buy_entry if available (actual fill), else use tick.ask
+                        actual_entry = pair_complete.locked_buy_entry if pair_complete.locked_buy_entry > 0 else tick.ask
+                        self.group_logger.log_expansion(
+                            group_id=group_id,
+                            expansion_type="TP_EXPAND",
+                            pair_idx=complete_idx,
+                            trade_type="BUY",
+                            entry=actual_entry,
+                            tp=actual_entry + self.buy_stop_tp_pips,
+                            sl=actual_entry - self.buy_stop_sl_pips,
+                            lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                            ticket=pair_complete.buy_ticket if pair_complete else 0,
+                            is_atomic=False,
+                            c_count=C + 1
+                        )
+
                     # [GROUP LOGIC]
                     if group_id == 0:
                         print(f"[GROUP 0 SATURATION] C=3 reached via TP Expansion. Forcing Artificial TP.")
@@ -2514,21 +2707,24 @@ class SymbolEngine:
                     pair_complete = self.pairs.get(complete_idx)
                     pair_seed = self.pairs.get(seed_idx)
                     if pair_complete and pair_seed:
+                        # Use locked entries (actual fill prices) if available, else fall back to grid prices
+                        actual_entry = pair_complete.locked_buy_entry if pair_complete.locked_buy_entry > 0 else pair_complete.buy_price
+                        seed_actual_entry = pair_seed.locked_sell_entry if pair_seed.locked_sell_entry > 0 else pair_seed.sell_price
                         self.group_logger.log_expansion(
                             group_id=group_id,
                             expansion_type="TP_EXPAND",
                             pair_idx=complete_idx,
                             trade_type="BUY",
-                            entry=pair_complete.buy_price,
-                            tp=pair_complete.buy_price + self.buy_stop_tp_pips,
-                            sl=pair_complete.buy_price - self.buy_stop_sl_pips,
+                            entry=actual_entry,
+                            tp=actual_entry + self.buy_stop_tp_pips,
+                            sl=actual_entry - self.buy_stop_sl_pips,
                             lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                             ticket=pair_complete.buy_ticket if pair_complete else 0,
                             seed_idx=seed_idx,
                             seed_type="SELL",
-                            seed_entry=pair_seed.sell_price,
-                            seed_tp=pair_seed.sell_price - self.sell_stop_tp_pips,
-                            seed_sl=pair_seed.sell_price + self.sell_stop_sl_pips,
+                            seed_entry=seed_actual_entry,
+                            seed_tp=seed_actual_entry - self.sell_stop_tp_pips,
+                            seed_sl=seed_actual_entry + self.sell_stop_sl_pips,
                             seed_ticket=pair_seed.sell_ticket if pair_seed else 0,
                             is_atomic=True,
                             c_count=C + 1
@@ -2551,7 +2747,26 @@ class SymbolEngine:
                     print(f"[TP-EXPAND] C==2: S{complete_idx} only (Non-Atomic Fill)")
                     # Fire Non-Atomic Leg ONLY
                     await self._place_single_leg_tp("sell", tick.bid, complete_idx)
-                    
+
+                    # LOG THE NON-ATOMIC FILL to GroupLogger
+                    pair_complete = self.pairs.get(complete_idx)
+                    if pair_complete:
+                        # Use locked_sell_entry if available (actual fill), else use tick.bid
+                        actual_entry = pair_complete.locked_sell_entry if pair_complete.locked_sell_entry > 0 else tick.bid
+                        self.group_logger.log_expansion(
+                            group_id=group_id,
+                            expansion_type="TP_EXPAND",
+                            pair_idx=complete_idx,
+                            trade_type="SELL",
+                            entry=actual_entry,
+                            tp=actual_entry - self.sell_stop_tp_pips,
+                            sl=actual_entry + self.sell_stop_sl_pips,
+                            lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
+                            ticket=pair_complete.sell_ticket if pair_complete else 0,
+                            is_atomic=False,
+                            c_count=C + 1
+                        )
+
                     # [GROUP LOGIC]
                     if group_id == 0:
                         print(f"[GROUP 0 SATURATION] C=3 reached via TP Expansion. Forcing Artificial TP.")
@@ -2567,21 +2782,24 @@ class SymbolEngine:
                     pair_complete = self.pairs.get(complete_idx)
                     pair_seed = self.pairs.get(seed_idx)
                     if pair_complete and pair_seed:
+                        # Use locked entries (actual fill prices) if available, else fall back to grid prices
+                        actual_entry = pair_complete.locked_sell_entry if pair_complete.locked_sell_entry > 0 else pair_complete.sell_price
+                        seed_actual_entry = pair_seed.locked_buy_entry if pair_seed.locked_buy_entry > 0 else pair_seed.buy_price
                         self.group_logger.log_expansion(
                             group_id=group_id,
                             expansion_type="TP_EXPAND",
                             pair_idx=complete_idx,
                             trade_type="SELL",
-                            entry=pair_complete.sell_price,
-                            tp=pair_complete.sell_price - self.sell_stop_tp_pips,
-                            sl=pair_complete.sell_price + self.sell_stop_sl_pips,
+                            entry=actual_entry,
+                            tp=actual_entry - self.sell_stop_tp_pips,
+                            sl=actual_entry + self.sell_stop_sl_pips,
                             lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                             ticket=pair_complete.sell_ticket if pair_complete else 0,
                             seed_idx=seed_idx,
                             seed_type="BUY",
-                            seed_entry=pair_seed.buy_price,
-                            seed_tp=pair_seed.buy_price + self.buy_stop_tp_pips,
-                            seed_sl=pair_seed.buy_price - self.buy_stop_sl_pips,
+                            seed_entry=seed_actual_entry,
+                            seed_tp=seed_actual_entry + self.buy_stop_tp_pips,
+                            seed_sl=seed_actual_entry - self.buy_stop_sl_pips,
                             seed_ticket=pair_seed.buy_ticket if pair_seed else 0,
                             is_atomic=True,
                             c_count=C + 1
