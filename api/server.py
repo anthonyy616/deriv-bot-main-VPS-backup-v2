@@ -271,10 +271,16 @@ async def get_session_log(session_id: str, bot = Depends(get_current_bot)):
 async def get_group_logs(bot = Depends(get_current_bot)):
     """Get list of group log files for this user"""
     from pathlib import Path
+    import itertools
     log_dir = bot.session_logger.log_dir
     logs = []
     if log_dir.exists():
-        for file in sorted(log_dir.glob("groups_*.log"), reverse=True):
+        # TASK 3 FIX: Include both .log and .txt file types
+        log_files = itertools.chain(
+            log_dir.glob("groups_log_*.txt"),  # Table snapshots
+            log_dir.glob("groups_*.log")       # Event logs
+        )
+        for file in sorted(log_files, key=lambda f: f.stat().st_mtime, reverse=True):
             logs.append({
                 "id": file.stem,
                 "name": file.name,

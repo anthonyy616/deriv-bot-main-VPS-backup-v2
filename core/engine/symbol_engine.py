@@ -927,10 +927,11 @@ class SymbolEngine:
         # ========================================================================
         # LOG INIT TO GROUP LOGGER
         # ========================================================================
-        b_tp = b_price + self.spread  # TP is spread above entry for buy
-        b_sl = b_price - self.spread  # SL is spread below entry for buy
-        s_tp = s_price - self.spread  # TP is spread below entry for sell
-        s_sl = s_price + self.spread  # SL is spread above entry for sell
+        # TASK 6 FIX: Use configured TP/SL pips instead of spread
+        b_tp = b_price + self.buy_stop_tp_pips  # TP is configured pips above entry for buy
+        b_sl = b_price - self.buy_stop_sl_pips  # SL is configured pips below entry for buy
+        s_tp = s_price - self.sell_stop_tp_pips  # TP is configured pips below entry for sell
+        s_sl = s_price + self.sell_stop_sl_pips  # SL is configured pips above entry for sell
 
         self.group_logger.log_init(
             group_id=group_id,
@@ -1191,8 +1192,8 @@ class SymbolEngine:
                     pair_idx=pair_to_complete,
                     trade_type="BUY",
                     entry=pair.buy_price,
-                    tp=pair.buy_price + self.spread,
-                    sl=pair.buy_price - self.spread,
+                    tp=pair.buy_price + self.buy_stop_tp_pips,
+                    sl=pair.buy_price - self.buy_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.buy_ticket,
                     is_atomic=False,
@@ -1230,15 +1231,15 @@ class SymbolEngine:
                     pair_idx=pair_to_complete,
                     trade_type="BUY",
                     entry=pair.buy_price,
-                    tp=pair.buy_price + self.spread,
-                    sl=pair.buy_price - self.spread,
+                    tp=pair.buy_price + self.buy_stop_tp_pips,
+                    sl=pair.buy_price - self.buy_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.buy_ticket,
                     seed_idx=new_pair_idx,
                     seed_type="SELL",
                     seed_entry=new_pair.sell_price,
-                    seed_tp=new_pair.sell_price - self.spread,
-                    seed_sl=new_pair.sell_price + self.spread,
+                    seed_tp=new_pair.sell_price - self.sell_stop_tp_pips,
+                    seed_sl=new_pair.sell_price + self.sell_stop_sl_pips,
                     seed_ticket=ticket,
                     is_atomic=True,
                     c_count=C + 1
@@ -1302,8 +1303,8 @@ class SymbolEngine:
                     pair_idx=pair_to_complete,
                     trade_type="SELL",
                     entry=pair.sell_price,
-                    tp=pair.sell_price - self.spread,
-                    sl=pair.sell_price + self.spread,
+                    tp=pair.sell_price - self.sell_stop_tp_pips,
+                    sl=pair.sell_price + self.sell_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.sell_ticket,
                     is_atomic=False,
@@ -1341,15 +1342,15 @@ class SymbolEngine:
                     pair_idx=pair_to_complete,
                     trade_type="SELL",
                     entry=pair.sell_price,
-                    tp=pair.sell_price - self.spread,
-                    sl=pair.sell_price + self.spread,
+                    tp=pair.sell_price - self.sell_stop_tp_pips,
+                    sl=pair.sell_price + self.sell_stop_sl_pips,
                     lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                     ticket=pair.sell_ticket,
                     seed_idx=new_pair_idx,
                     seed_type="BUY",
                     seed_entry=new_pair.buy_price,
-                    seed_tp=new_pair.buy_price + self.spread,
-                    seed_sl=new_pair.buy_price - self.spread,
+                    seed_tp=new_pair.buy_price + self.buy_stop_tp_pips,
+                    seed_sl=new_pair.buy_price - self.buy_stop_sl_pips,
                     seed_ticket=ticket,
                     is_atomic=True,
                     c_count=C + 1
@@ -2519,15 +2520,15 @@ class SymbolEngine:
                             pair_idx=complete_idx,
                             trade_type="BUY",
                             entry=pair_complete.buy_price,
-                            tp=pair_complete.buy_price + self.spread,
-                            sl=pair_complete.buy_price - self.spread,
+                            tp=pair_complete.buy_price + self.buy_stop_tp_pips,
+                            sl=pair_complete.buy_price - self.buy_stop_sl_pips,
                             lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                             ticket=pair_complete.buy_ticket if pair_complete else 0,
                             seed_idx=seed_idx,
                             seed_type="SELL",
                             seed_entry=pair_seed.sell_price,
-                            seed_tp=pair_seed.sell_price - self.spread,
-                            seed_sl=pair_seed.sell_price + self.spread,
+                            seed_tp=pair_seed.sell_price - self.sell_stop_tp_pips,
+                            seed_sl=pair_seed.sell_price + self.sell_stop_sl_pips,
                             seed_ticket=pair_seed.sell_ticket if pair_seed else 0,
                             is_atomic=True,
                             c_count=C + 1
@@ -2572,15 +2573,15 @@ class SymbolEngine:
                             pair_idx=complete_idx,
                             trade_type="SELL",
                             entry=pair_complete.sell_price,
-                            tp=pair_complete.sell_price - self.spread,
-                            sl=pair_complete.sell_price + self.spread,
+                            tp=pair_complete.sell_price - self.sell_stop_tp_pips,
+                            sl=pair_complete.sell_price + self.sell_stop_sl_pips,
                             lots=self.lot_sizes[0] if self.lot_sizes else 0.01,
                             ticket=pair_complete.sell_ticket if pair_complete else 0,
                             seed_idx=seed_idx,
                             seed_type="BUY",
                             seed_entry=pair_seed.buy_price,
-                            seed_tp=pair_seed.buy_price + self.spread,
-                            seed_sl=pair_seed.buy_price - self.spread,
+                            seed_tp=pair_seed.buy_price + self.buy_stop_tp_pips,
+                            seed_sl=pair_seed.buy_price - self.buy_stop_sl_pips,
                             seed_ticket=pair_seed.buy_ticket if pair_seed else 0,
                             is_atomic=True,
                             c_count=C + 1
@@ -2847,6 +2848,18 @@ class SymbolEngine:
                         # Get verified high-water C
                         C_highwater = self._get_c_highwater(self.current_group)
                         
+                        # TASK 5 FIX: Log TP hit BEFORE any blocking checks
+                        # This ensures ALL completed pair TPs appear in activity logs
+                        if self.group_logger:
+                            leg_str = "B" if is_bullish else "S"
+                            self.group_logger.log_tp_hit(
+                                group_id=group_id,
+                                pair_idx=pair_idx,
+                                leg=leg_str,
+                                price=event_price,
+                                was_incomplete=False  # This is a completed pair TP
+                            )
+                        
                         if pair_idx in self._pairs_tp_expanded:
                             print(f"[TP-BLOCKED] Pair={pair_idx} already fired expansion")
                             
@@ -2862,8 +2875,7 @@ class SymbolEngine:
                             self._pairs_tp_expanded.add(pair_idx)
                         elif group_id < self.current_group - 1:
                             print(f"[TP-COMPLETE] Ancestor Group {group_id} < {self.current_group - 1} -> Ignoring for expansion (prevent double execution)")
-                            # Still mark as expanded to prevent repeated logs, but don't drive expansion
-                            self._pairs_tp_expanded.add(pair_idx)
+                            # TASK 2 FIX: Do NOT add to _pairs_tp_expanded - ancestor check naturally blocks on every evaluation
 
                 # Hedge close (leave your existing behavior)
                 pair = self.pairs.get(pair_idx)
@@ -3041,6 +3053,7 @@ class SymbolEngine:
             buy_price=new_buy_price,
             sell_price=new_sell_price
         )
+        new_pair.group_id = self.current_group  # TASK 1 FIX: Assign group_id
         
         # Positive pairs START with SELL
         new_pair.next_action = "sell"
@@ -3122,6 +3135,7 @@ class SymbolEngine:
             buy_price=new_buy_price,
             sell_price=new_sell_price
         )
+        new_pair.group_id = self.current_group  # TASK 1 FIX: Assign group_id
         
         # Negative pairs START with BUY
         new_pair.next_action = "buy"
@@ -4510,16 +4524,18 @@ class SymbolEngine:
                     b_status = "CLOSED"
                 elif pair.buy_filled:
                     b_status = "ACTIVE"
-                    
+                
+                buy_entry = pair.locked_buy_entry if pair.locked_buy_entry else pair.buy_price
                 self.group_logger.update_pair(
                     group_id=pair.group_id,
                     pair_idx=idx,
                     trade_type="BUY",
-                    entry=pair.locked_buy_entry if pair.locked_buy_entry else pair.buy_price,
+                    entry=buy_entry,
                     status=b_status,
                     ticket=pair.buy_ticket,
-                    tp=pair.pair_tp if pair.trade_count % 2 == 1 else pair.pair_sl, # Approximation of current targets
-                    sl=pair.pair_sl if pair.trade_count % 2 == 1 else pair.pair_tp,
+                    # TASK 6 FIX: Use configured TP/SL pips instead of pair-stored values
+                    tp=buy_entry + self.buy_stop_tp_pips,
+                    sl=buy_entry - self.buy_stop_sl_pips,
                     lots=pair.get_next_lot(self.lot_sizes) or 0.0
                 )
                 
@@ -4529,16 +4545,18 @@ class SymbolEngine:
                     s_status = "CLOSED"
                 elif pair.sell_filled:
                     s_status = "ACTIVE"
-                    
+                
+                sell_entry = pair.locked_sell_entry if pair.locked_sell_entry else pair.sell_price
                 self.group_logger.update_pair(
                     group_id=pair.group_id,
                     pair_idx=idx,
                     trade_type="SELL",
-                    entry=pair.locked_sell_entry if pair.locked_sell_entry else pair.sell_price,
+                    entry=sell_entry,
                     status=s_status,
                     ticket=pair.sell_ticket,
-                    tp=pair.pair_sl if pair.trade_count % 2 == 1 else pair.pair_tp, # Inversed for Sell? Logic complex.
-                    sl=pair.pair_tp if pair.trade_count % 2 == 1 else pair.pair_sl,
+                    # TASK 6 FIX: Use configured TP/SL pips instead of pair-stored values
+                    tp=sell_entry - self.sell_stop_tp_pips,
+                    sl=sell_entry + self.sell_stop_sl_pips,
                     lots=pair.get_next_lot(self.lot_sizes) or 0.0
                 )
 

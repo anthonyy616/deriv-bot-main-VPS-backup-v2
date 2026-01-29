@@ -243,21 +243,13 @@ class GroupLogger:
         self._write_event(group_id, event)
 
     def log_sl_hit(self, group_id: int, pair_idx: int, leg: str, price: float):
-        """Log SL hit event."""
+        """Log SL hit event - TASK 4 FIX: Only update status, don't add to activity."""
         group = self._get_or_create_group(group_id)
         if pair_idx in group.pairs:
              p = group.pairs[pair_idx]
              l = p.buy_leg if leg in ["BUY", "B"] else p.sell_leg
              l.status = "SL"
-
-        event = {
-            "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-            "type": "SL",
-            "message": f"{leg}{pair_idx} hit SL @ {price:.2f}",
-            "details": f"Group={group_id}"
-        }
-        group.events.append(event)
-        self._write_event(group_id, event)
+        # DO NOT add event or write to log - keeps activity clean
 
     def log_non_atomic_complete(self, group_id: int, pair_idx: int,
                                  leg: str, entry: float, reason: str = "INIT_COMPLETE"):
