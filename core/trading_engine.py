@@ -300,7 +300,11 @@ class TradingEngine:
         # Get global config from first orchestrator
         try:
             global_config = all_orchestrators[0].config_manager.get_global_config()
-            max_runtime = global_config.get("max_runtime_minutes", 0)
+            max_runtime = float(global_config.get("max_runtime_minutes", 0))
+            if self.tick_count % 300 == 0:  # Log every ~30 seconds (assuming 100ms ticks)
+                  elapsed = datetime.now() - self.start_time
+                  elapsed_mins = elapsed.total_seconds() / 60
+                  logger.debug(f"[TIMEOUT CHECK] Elapsed: {elapsed_mins:.1f}m / Max: {max_runtime}m")
         except Exception:
             return
         

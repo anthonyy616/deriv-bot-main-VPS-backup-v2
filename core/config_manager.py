@@ -181,6 +181,10 @@ class ConfigManager:
     def get_config(self) -> Dict[str, Any]:
         return self.config
     
+    def get_global_config(self) -> Dict[str, Any]:
+        """Get global settings"""
+        return self.config.get("global", {})
+    
     def get_symbol_config(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get config for a specific symbol"""
         return self.config.get("symbols", {}).get(symbol)

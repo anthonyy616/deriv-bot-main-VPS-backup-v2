@@ -375,6 +375,7 @@ class SymbolEngine:
         # --- Auto-restart tracking ---
         self.last_trade_time: float = 0         # Last time we had active trades
         self.no_trade_timeout: float = 10.0    # Seconds before auto-restart (10 seconds)
+        self.last_log_update_time: float = time.time() # Last time we updated the group log file
         
         # --- Debug Trade History (REMOVED - now in DB) ---
         self.global_trade_counter: int = 0               # Total trades across all pairs
@@ -1893,6 +1894,11 @@ class SymbolEngine:
         self.current_price = ask
         self.open_positions_count = tick_data.get('positions_count', 0)
         
+        # [LOG POLLING] Update group log file periodically (every 5s)
+        if self.group_logger and time.time() - self.last_log_update_time > 5.0:
+            self.group_logger.update_log_file(self.current_price)
+            self.last_log_update_time = time.time()
+        
         try:
             self.is_busy = True
             
@@ -1999,7 +2005,7 @@ class SymbolEngine:
                                 group_id=0,
                                 anchor=b0_price,
                                 is_bullish_source=True,
-                                b_idx=0, s_idx=0,
+                                b_idx=0, s_idx=1,
                                 b_ticket=b0_pos.ticket,
                                 s_ticket=0, # Unknown/Pending
                                 b_entry=b0_price,
@@ -2040,7 +2046,7 @@ class SymbolEngine:
                                     group_id=0,
                                     anchor=b0_price,
                                     is_bullish_source=True, # Assuming B0 start is bullish
-                                    b_idx=0, s_idx=0,
+                                    b_idx=0, s_idx=1,
                                     b_ticket=ticket, s_ticket=0,
                                     b_entry=b0_price,
                                     s_entry=pair0.sell_price, # S0 pending
