@@ -18,6 +18,7 @@ from typing import Dict, Optional, List, Any, Set
 from collections import defaultdict, deque
 import asyncio
 import time
+import logging
 import MetaTrader5 as mt5
 from datetime import datetime, timedelta
 
@@ -460,6 +461,19 @@ class SymbolEngine:
         # Get user_id from session_logger if available
         user_id = session_logger.user_id if session_logger else None
         self.group_logger = GroupLogger(symbol=symbol, log_dir="logs", user_id=user_id)
+
+        # --- TOGGLE DEBUG LOGGER ---
+        self.toggle_logger = logging.getLogger('toggle_trigger')
+        self.toggle_logger.propagate = False  # Prevent terminal spam
+        if not self.toggle_logger.handlers:
+            toggle_handler = logging.FileHandler('logs/toggle_trigger_debug.log')
+            toggle_handler.setFormatter(logging.Formatter('[TOGGLE] %(asctime)s | %(message)s'))
+            self.toggle_logger.addHandler(toggle_handler)
+            self.toggle_logger.setLevel(logging.DEBUG)
+        
+        # De-duplication cache for toggle logs
+        self.last_toggle_log: Dict[int, str] = {}
+        # ---------------------------
 
         # ========================================================================
         # RETRACEMENT TRACKING - For natural expansion after INIT
@@ -3702,6 +3716,14 @@ class SymbolEngine:
             finally:
                 self.trade_in_progress[pair_idx] = False
     
+    def _log_toggle_debug(self, idx: int, message: str):
+        """Helper to deduplicate toggle debug logs."""
+        if self.last_toggle_log.get(idx) == message:
+            return
+        
+        self.toggle_logger.debug(message)
+        self.last_toggle_log[idx] = message
+    
     
     async def _check_virtual_triggers(self, ask: float, bid: float):
         """
@@ -3719,6 +3741,7 @@ class SymbolEngine:
         for idx, pair in sorted_items:
             # RETIREMENT GUARD: Block all re-entries if pair reached TP/SL
             if pair.tp_blocked:
+                self._log_toggle_debug(idx, f"Pair {idx} | Action: NONE | trade_count: {pair.trade_count} | reason: BLOCKED (TP hit)")
                 continue
             
             # ================================================================
@@ -3748,6 +3771,11 @@ class SymbolEngine:
             # Expansion is handled by step triggers, this is only for toggle trading
             # because toggle re-entry should work even after one leg hits TP/SL
             if not (pair.buy_filled and pair.sell_filled):
+                # Only log skip if we might have been interested (e.g. not just totally inactive)
+                # But to avoid flood, maybe skip logging here or use a lower level if configurable?
+                # User asked for: "When toggle is skipped (pair has no positions but conditions not met)"
+                # This gate means the pair isn't "active" for toggle sense.
+                # self.toggle_logger.debug(f"Pair {idx} | Action: NONE | trade_count: {pair.trade_count} | reason: SKIP (Incomplete Pair)")
                 continue
             
             # ================================================================
@@ -3795,6 +3823,11 @@ class SymbolEngine:
                 
                 # 1. Normal Entry (Under Max Cap)
                 if pair.trade_count < self.max_positions:
+                    # Log TRIGGER
+                    next_lot = pair.get_next_lot(self.lot_sizes)
+                    # Use standard logger for TRIGGER as we WANT to see every trade execution attempt
+                    self.toggle_logger.debug(f"Pair {idx} | Action: BUY | trade_count: {pair.trade_count} | lot_size: {next_lot} | reason: TRIGGER")
+                    
                     if await self._execute_trade_with_chain("buy", idx):
                         # Success - check expansion
                         indices = sorted(self.pairs.keys())
@@ -3806,11 +3839,21 @@ class SymbolEngine:
                 else:
                     # Logic block (capped)
                     pair.buy_in_zone = True 
+                    # Log BLOCKED (max_positions)
+                    self._log_toggle_debug(idx, f"Pair {idx} | Action: NONE | trade_count: {pair.trade_count} | reason: BLOCKED (max_positions)")
+                    
                     # [FIX] STILL EXPAND GRID even if trade is blocked by max_positions
                     # This ensures the ladder continues up if price keeps rising
                     indices = sorted(self.pairs.keys())
                     if idx == indices[-1] and idx >= 0:
                         await self._create_next_positive_pair(idx)
+            
+            # Skip Log (Debugging non-trigger)
+            elif buy_in_zone_now and pair.next_action == "buy":
+                 # In zone, correct direction, but 'should_trigger_buy' is False (likely implicit leave-and-return gate for trade_count=0)
+                 # self.toggle_logger.debug(f"Pair {idx} | Action: NONE | trade_count: {pair.trade_count} | reason: SKIP (Waiting for zone re-entry)")
+                 pass
+
 
             if not buy_attempt_failed and not pair.buy_in_zone:
                  pair.buy_in_zone = buy_in_zone_now
@@ -3847,6 +3890,11 @@ class SymbolEngine:
                 
                 # 1. Normal Entry (Under Max Cap)
                 if pair.trade_count < self.max_positions:
+                    # Log TRIGGER
+                    next_lot = pair.get_next_lot(self.lot_sizes)
+                    # Use standard logger for TRIGGER as we WANT to see every trade execution attempt
+                    self.toggle_logger.debug(f"Pair {idx} | Action: SELL | trade_count: {pair.trade_count} | lot_size: {next_lot} | reason: TRIGGER")
+
                     if await self._execute_trade_with_chain("sell", idx):
                         # Success - check expansion
                         indices = sorted(self.pairs.keys())
@@ -3857,11 +3905,19 @@ class SymbolEngine:
                         
                 else:
                     pair.sell_in_zone = True
+                    # Log BLOCKED (max_positions)
+                    self._log_toggle_debug(idx, f"Pair {idx} | Action: NONE | trade_count: {pair.trade_count} | reason: BLOCKED (max_positions)")
+
                     # [FIX] STILL EXPAND GRID even if trade is blocked by max_positions
                     # This ensures the ladder continues down if price keeps falling
                     indices = sorted(self.pairs.keys())
                     if idx == indices[0] and idx <= 0:
                         await self._create_next_negative_pair(idx)
+
+            # Skip Log
+            elif sell_in_zone_now and pair.next_action == "sell":
+                 # self.toggle_logger.debug(f"Pair {idx} | Action: NONE | trade_count: {pair.trade_count} | reason: SKIP (Waiting for zone re-entry)")
+                 pass
 
             if not sell_attempt_failed and not pair.sell_in_zone:
                 pair.sell_in_zone = sell_in_zone_now

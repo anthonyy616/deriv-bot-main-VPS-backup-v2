@@ -287,7 +287,7 @@
             </div>
         </div>
 
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
             <div class="bg-white dark:bg-slate-800 p-4 rounded-lg border border-slate-200 dark:border-slate-700">
                 <div class="text-xs font-medium text-slate-500 dark:text-slate-400 uppercase">Live Price</div>
                 <div id="price-display" class="text-2xl font-bold mt-1 tracking-tight">---</div>
@@ -307,7 +307,7 @@
             </div>
         </div>
 
-        <div class="grid md:grid-cols-3 gap-6">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div
                 class="md:col-span-1 bg-white dark:bg-slate-800 p-5 rounded-lg border border-slate-200 dark:border-slate-700 h-fit">
                 <h2 class="text-lg font-semibold mb-4 border-b pb-2 border-slate-700">Settings</h2>
@@ -827,7 +827,7 @@
         // Render a single asset's accordion settings panel
         function renderAssetSettingsPanel(symbol, safeId, cfg) {
             const spread = cfg.spread || 20;
-            const maxPairs = cfg.max_pairs || 5;    // Grid levels: 1, 3, 5, 7, 9
+            // Max Pairs removed
             const maxPos = cfg.max_positions || 5;  // Trades per pair: 1-20
             const lots = cfg.lot_sizes || [0.01];
             const buyTp = cfg.buy_stop_tp || 50;
@@ -862,21 +862,12 @@
                     </div>
                 </summary>
                 <div class="p-3 space-y-3 border-t border-slate-700">
-                    <!-- Core Settings: Spread, Max Pairs (dropdown), Max Positions (input) -->
-                    <div class="grid grid-cols-3 gap-2">
+                    <!-- Core Settings: Spread, Max Positions (input) -->
+                    <div class="grid grid-cols-2 gap-2">
                         <div>
                             <label class="block text-[10px] text-gray-500">Spread</label>
                             <input type="number" id="spread_${safeId}" step="0.1" value="${spread}"
                                 class="w-full p-1.5 text-sm rounded bg-slate-900 border border-slate-600">
-                        </div>
-                        <div>
-                            <label class="block text-[10px] text-gray-500">Max Pairs</label>
-                            <select id="maxpairs_${safeId}"
-                                class="w-full p-1.5 text-sm rounded bg-slate-900 border border-slate-600">
-                                ${[1, 3, 5, 7, 9].map(n =>
-                `<option value="${n}" ${n === maxPairs ? 'selected' : ''}>${n}</option>`
-            ).join('')}
-                            </select>
                         </div>
                         <div>
                             <label class="block text-[10px] text-gray-500">Max Pos (1-20)</label>
@@ -1000,7 +991,6 @@
 
                 // If enabled, get its settings
                 if (isEnabled) {
-                    const maxPairs = parseInt(document.getElementById(`maxpairs_${safeId}`)?.value) || 5;
                     const maxPos = parseInt(document.getElementById(`maxpos_${safeId}`)?.value) || 5;
 
                     // Collect lot sizes
@@ -1013,7 +1003,6 @@
                     payload.symbols[symbol] = {
                         enabled: true,
                         spread: parseFloat(document.getElementById(`spread_${safeId}`)?.value) || 20,
-                        max_pairs: maxPairs,
                         max_positions: maxPos,
                         lot_sizes: lots,
                         buy_stop_tp: parseFloat(document.getElementById(`buytp_${safeId}`)?.value) || 50,
