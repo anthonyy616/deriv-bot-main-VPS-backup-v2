@@ -2570,6 +2570,13 @@ class SymbolEngine:
                 
                 if history:
                     print(f"[DROP CONFIRMED] {self.symbol} Pair {pair_idx}: Ticket {ticket_id} ({direction}) closed.")
+                    
+                    # [BLOCK RE-ENTRY] Check if this was a TP (Profit > 0)
+                    # If TP hit, block this pair from re-entering via toggle logic
+                    if self._check_if_tp_hit(ticket_id, direction):
+                        pair.tp_blocked = True
+                        print(f"[BLOCK] Pair {pair_idx} blocked from re-entry (TP hit)")
+                        
                     # NUCLEAR RESET DISABLED: Don't close survivor positions
                     # await self._execute_pair_reset(pair_idx, pair, direction)
                     break 
