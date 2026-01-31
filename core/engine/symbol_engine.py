@@ -3109,12 +3109,15 @@ class SymbolEngine:
 
                         # Log TP/SL hit to group logger
                         if is_tp:
+                            # Get lot history for the correct leg
+                            lot_hist = pair.buy_lot_history if leg == 'B' else pair.sell_lot_history
                             self.group_logger.log_tp_hit(
                                 group_id=group_id,
                                 pair_idx=pair_idx,
                                 leg=leg,
                                 price=event_price,
-                                was_incomplete=was_incomplete
+                                was_incomplete=was_incomplete,
+                                lot_history=lot_hist
                             )
                         else:
                             self.group_logger.log_sl_hit(
@@ -3174,12 +3177,15 @@ class SymbolEngine:
                         # This ensures ALL completed pair TPs appear in activity logs
                         if self.group_logger:
                             leg_str = "B" if is_bullish else "S"
+                            # Get lot history for the correct leg (is_bullish means it was a Buy leg)
+                            lot_hist = pair.buy_lot_history if is_bullish else pair.sell_lot_history
                             self.group_logger.log_tp_hit(
                                 group_id=group_id,
                                 pair_idx=pair_idx,
                                 leg=leg_str,
                                 price=event_price,
-                                was_incomplete=False  # This is a completed pair TP
+                                was_incomplete=False,  # This is a completed pair TP
+                                lot_history=lot_hist
                             )
                         
                         if pair_idx in self._pairs_tp_expanded:
@@ -4367,8 +4373,16 @@ class SymbolEngine:
                 # Track lot size history for progression logging
                 if direction == "buy":
                     pair.buy_lot_history.append(volume)
+                    # Push update to GroupLogger (Lot Progression)
+                    if self.group_logger:
+                        self.group_logger.update_pair(self.cycle_id, index, trade_type="BUY", 
+                                                      lot_history=pair.buy_lot_history)
                 elif direction == "sell":
                     pair.sell_lot_history.append(volume)
+                    # Push update to GroupLogger (Lot Progression)
+                    if self.group_logger:
+                        self.group_logger.update_pair(self.cycle_id, index, trade_type="SELL", 
+                                                      lot_history=pair.sell_lot_history)
 
                 # Log successful order
                 self._log_activity("ORDER", f"{leg}{index} OPEN @ {exec_price:.2f} | Lot: {volume:.2f} | TP: {tp:.2f} | SL: {sl:.2f}")
