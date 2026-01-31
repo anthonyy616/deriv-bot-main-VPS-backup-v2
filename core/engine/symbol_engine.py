@@ -851,6 +851,11 @@ class SymbolEngine:
             is_bullish_source: True if triggered by BUY incomplete TP, False if SELL incomplete TP
             trigger_pair_idx: The pair from previous group that triggered INIT (for non-atomic completing leg)
         """
+        offset = self._get_pair_offset(group_id)
+        if offset in self.pairs:
+            #print(f"[GROUP_INIT] BLOCKED: Group {group_id} already has pairs")
+            return #edge case will barely ever happen but im tired of fixing bugs lol
+
         # Capture Group 1 Directional Intent (legacy - now also stored per group)
         if group_id == 1:
             self.group_direction = "BULLISH" if is_bullish_source else "BEARISH"
@@ -5008,7 +5013,7 @@ class SymbolEngine:
             self._incomplete_pairs_init_triggered = set(md.get('_incomplete_pairs_init_triggered', []))
             self._pairs_tp_expanded = set(md.get('_pairs_tp_expanded', []))
             
-            # [FIX CRITICAL] Convert lists of lists back to tuples for set compatibility
+            #  [CRITICAL] Converting lists of lists back to tuples for set compatibility
             logged_tp_raw = md.get('_logged_tp_hits', [])
             self._logged_tp_hits = set()
             for item in logged_tp_raw:
