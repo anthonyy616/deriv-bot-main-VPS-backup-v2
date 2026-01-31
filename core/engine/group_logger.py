@@ -25,6 +25,7 @@ class PairLegData:
     lots: float = 0.0
     ticket: int = 0
     re_entries: int = 0
+    lot_history: List[float] = field(default_factory=list)  # NEW
 
 @dataclass
 class PairData:
@@ -224,19 +225,24 @@ class GroupLogger:
         self._write_event(group_id, event)
 
     def log_tp_hit(self, group_id: int, pair_idx: int, leg: str,
-                   price: float, was_incomplete: bool = False):
-        """Log TP hit event."""
+                   price: float, was_incomplete: bool = False, lot_history: List[float] = None):
+        """Log TP hit event with lot history."""
         group = self._get_or_create_group(group_id)
         if pair_idx in group.pairs:
             p = group.pairs[pair_idx]
             l = p.buy_leg if leg in ["BUY", "B"] else p.sell_leg
             l.status = "TP"
 
+        # Build lot string if history provided
+        lot_str = ""
+        if lot_history:
+            lot_str = f" | Lots: [{', '.join(f'{l:.2f}' for l in lot_history)}] Total: {sum(lot_history):.2f}"
+
         incomplete_str = " (INCOMPLETE)" if was_incomplete else ""
         event = {
             "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
             "type": "TP",
-            "message": f"{leg}{pair_idx} hit TP @ {price:.2f}{incomplete_str}",
+            "message": f"{leg}{pair_idx} hit TP @ {price:.2f}{lot_str}{incomplete_str}",
             "details": f"Group={group_id}"
         }
         group.events.append(event)
@@ -274,7 +280,8 @@ class GroupLogger:
                     trade_type: str = None, entry: float = None,
                     tp: float = None, sl: float = None,
                     re_entries: int = None, lots: float = None,
-                    status: str = None, ticket: int = None):
+                    status: str = None, ticket: int = None,
+                    lot_history: List[float] = None):  # NEW parameter
         """Update specific fields of a pair LEG."""
         group = self._get_or_create_group(group_id)
         p = self._get_or_create_pair(group, pair_idx)
@@ -292,12 +299,19 @@ class GroupLogger:
             if lots is not None: l.lots = lots
             if status is not None: l.status = status
             if ticket is not None: l.ticket = ticket
+            if lot_history is not None: l.lot_history = lot_history  # NEW
 
     def update_c_count(self, group_id: int, c_count: int):
         """Update C count for a group."""
         group = self._get_or_create_group(group_id)
         group.c_count = c_count
 
+
+    def _format_lot_progression(self, lot_history: List[float]) -> str:
+        """Format lot history as progression string."""
+        if not lot_history:
+            return "0.00"
+        return " -> ".join(f"{lot:.2f}" for lot in lot_history)
 
     def render_group_table(self, group_id: int, current_price: float = 0.0) -> List[str]:
         """
@@ -330,8 +344,7 @@ class GroupLogger:
             f" {'Entry':>10} {self.COL_SEP}"
             f" {'TP':>10} {self.COL_SEP}"
             f" {'SL':>10} {self.COL_SEP}"
-            f" {'Lots':>6} {self.COL_SEP}"
-            f" {'Re':>3}"
+            f" {'Lot Progression':>20}"
         )
         lines.append(col_header)
         lines.append(header_line)
@@ -342,6 +355,7 @@ class GroupLogger:
         for pair_idx, pair in sorted_pairs:
             # Render BUY Leg
             leg_b = pair.buy_leg
+            lot_prog_b = self._format_lot_progression(leg_b.lot_history) if leg_b.lot_history else f"{leg_b.lots:.2f}"
             
             row_b = (
                 f" B{pair_idx:<5} {self.COL_SEP}"
@@ -349,13 +363,13 @@ class GroupLogger:
                 f" {leg_b.entry:>10.2f} {self.COL_SEP}"
                 f" {leg_b.tp:>10.2f} {self.COL_SEP}"
                 f" {leg_b.sl:>10.2f} {self.COL_SEP}"
-                f" {leg_b.lots:>6.2f} {self.COL_SEP}"
-                f" {leg_b.re_entries:>3}"
+                f" {lot_prog_b:>20}"
             )
             lines.append(row_b)
 
             # Render SELL Leg
             leg_s = pair.sell_leg
+            lot_prog_s = self._format_lot_progression(leg_s.lot_history) if leg_s.lot_history else f"{leg_s.lots:.2f}"
             
             row_s = (
                 f" S{pair_idx:<5} {self.COL_SEP}"
@@ -363,8 +377,7 @@ class GroupLogger:
                 f" {leg_s.entry:>10.2f} {self.COL_SEP}"
                 f" {leg_s.tp:>10.2f} {self.COL_SEP}"
                 f" {leg_s.sl:>10.2f} {self.COL_SEP}"
-                f" {leg_s.lots:>6.2f} {self.COL_SEP}"
-                f" {leg_s.re_entries:>3}"
+                f" {lot_prog_s:>20}"
             )
             lines.append(row_s)
             

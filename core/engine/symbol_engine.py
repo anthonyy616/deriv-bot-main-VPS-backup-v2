@@ -96,6 +96,10 @@ class GridPair:
     locked_sell_entry: float = 0.0  # The actual execution price when SELL first fired
     tp_blocked: bool = False        # Permanent retirement flag (set on TP/SL)
     
+    # Lot size history for progression tracking
+    buy_lot_history: List[float] = field(default_factory=list)
+    sell_lot_history: List[float] = field(default_factory=list)
+    
     def get_next_lot(self, lot_sizes: list) -> float:
         """
         Get the next lot size for a trade based on trade_count.
@@ -475,6 +479,17 @@ class SymbolEngine:
         self.last_toggle_log: Dict[int, str] = {}
         # ---------------------------
 
+        # --- TRADING ACTIVITY LOGGER (Clean log without FastAPI noise) ---
+        self.activity_logger = logging.getLogger('trading_activity')
+        self.activity_logger.propagate = False  # Prevent terminal spam
+        if not self.activity_logger.handlers:
+            # Ensure logs directory exists
+            os.makedirs('logs', exist_ok=True)
+            activity_handler = logging.FileHandler('logs/trading_activity.log')
+            activity_handler.setFormatter(logging.Formatter('[%(asctime)s.%(msecs)03d] %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
+            self.activity_logger.addHandler(activity_handler)
+            self.activity_logger.setLevel(logging.INFO)
+
         # ========================================================================
         # RETRACEMENT TRACKING - For natural expansion after INIT
         # ========================================================================
@@ -520,6 +535,10 @@ class SymbolEngine:
     def max_positions(self) -> int:
         """Trades per pair: 1-20 (controls lot_sizes length)"""
         return int(self.config.get('max_positions', 5))
+
+    def _log_activity(self, event_type: str, message: str):
+        """Log trading activity to dedicated log file."""
+        self.activity_logger.info(f"[{event_type}] {message}")
 
     @property
     def hedge_enabled(self) -> bool:
@@ -969,6 +988,9 @@ class SymbolEngine:
             lots=self.lot_sizes[0] if self.lot_sizes else 0.01
         )
 
+        # Log INIT activity
+        self._log_activity("INIT", f"Group {group_id} Initialized @ {anchor_price:.2f} (B{b_idx}+S{s_idx})")
+
         # ========================================================================
         # NON-ATOMIC COMPLETING LEG FOR PREVIOUS GROUP
         # ========================================================================
@@ -1219,6 +1241,9 @@ class SymbolEngine:
                     is_atomic=False,
                     c_count=3
                 )
+                
+                # Log Activity
+                self._log_activity("STEP_EXPAND", f"BULLISH B{pair_to_complete} (Non-Atomic) @ {actual_entry:.2f}")
                 return
 
             # Otherwise seed next incomplete: S(pair_to_complete + 1)
@@ -1266,6 +1291,9 @@ class SymbolEngine:
                     is_atomic=True,
                     c_count=C + 1
                 )
+
+                # Log Activity
+                self._log_activity("STEP_EXPAND", f"BULLISH Atomic B{pair_to_complete}+S{new_pair_idx} @ {actual_entry:.2f}/{seed_actual_entry:.2f}")
 
     async def _expand_bearish(self, pair_to_complete: int):
         """Expand grid bearish: complete pair N with S, start pair N-1 with B.
@@ -1333,6 +1361,9 @@ class SymbolEngine:
                     is_atomic=False,
                     c_count=3
                 )
+                
+                # Log Activity
+                self._log_activity("STEP_EXPAND", f"BEARISH S{pair_to_complete} (Non-Atomic) @ {actual_entry:.2f}")
                 return
 
             # Otherwise seed next incomplete: B(pair_to_complete - 1)
@@ -1380,6 +1411,9 @@ class SymbolEngine:
                     is_atomic=True,
                     c_count=C + 1
                 )
+
+                # Log Activity
+                self._log_activity("STEP_EXPAND", f"BEARISH Atomic S{pair_to_complete}+B{new_pair_idx} @ {actual_entry:.2f}/{seed_actual_entry:.2f}")
 
     
     async def _execute_step1_bullish(self):
@@ -2745,6 +2779,8 @@ class SymbolEngine:
                             is_atomic=False,
                             c_count=C + 1
                         )
+                    
+                    self._log_activity("TP_EXPAND", f"TP-Driven B{complete_idx} (Non-Atomic) @ {actual_entry:.2f}")
 
                     # [GROUP LOGIC]
                     if group_id == 0:
@@ -2783,6 +2819,8 @@ class SymbolEngine:
                             is_atomic=True,
                             c_count=C + 1
                         )
+                    
+                    self._log_activity("TP_EXPAND", f"TP-Driven Atomic B{complete_idx}+S{seed_idx} @ {actual_entry:.2f}/{seed_actual_entry:.2f}")
             else:
                 # Bearish: Sell leg hit TP -> Expand DOWN
                 bearish_edge = None
@@ -2820,6 +2858,8 @@ class SymbolEngine:
                             is_atomic=False,
                             c_count=C + 1
                         )
+                    
+                    self._log_activity("TP_EXPAND", f"TP-Driven S{complete_idx} (Non-Atomic) @ {actual_entry:.2f}")
 
                     # [GROUP LOGIC]
                     if group_id == 0:
@@ -2858,6 +2898,8 @@ class SymbolEngine:
                             is_atomic=True,
                             c_count=C + 1
                         )
+
+                    self._log_activity("TP_EXPAND", f"TP-Driven Atomic S{complete_idx}+B{seed_idx} @ {actual_entry:.2f}/{seed_actual_entry:.2f}")
 
     async def _place_single_leg_tp(self, direction: str, price: float, pair_idx: int):
         pair = self.pairs.get(pair_idx)
@@ -3101,7 +3143,12 @@ class SymbolEngine:
                         # Triggered for ALL groups (including > 0)
                         
                         # Check duplicate prevention set first
-                        if pair_idx in self._incomplete_pairs_init_triggered:
+                        # ANCESTOR BLOCK: Pairs from groups < current_group - 1 should NOT fire INIT
+                        # This prevents old groups from hijacking the current group's progression
+                        if group_id < self.current_group - 1:
+                            print(f"[TP-INCOMPLETE-BLOCKED] Pair={pair_idx} Group={group_id} is ANCESTOR (< {self.current_group - 1}), ignoring INIT trigger")
+                            self._log_activity("TP-BLOCKED", f"{leg}{pair_idx} (Group {group_id}) hit TP @ {event_price:.2f} - ANCESTOR GROUP BLOCKED ({group_id} < {self.current_group - 1})")
+                        elif pair_idx in self._incomplete_pairs_init_triggered:
                             print(f"[TP-INCOMPLETE-BLOCKED] Pair={pair_idx} already fired INIT before, skipping")
                         elif self.graceful_stop:
                             print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> graceful stop active, no INIT")
@@ -3109,6 +3156,9 @@ class SymbolEngine:
                             print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> Firing INIT for Group {self.current_group + 1} (Bullish={is_bullish})")
                             self._incomplete_pairs_init_triggered.add(pair_idx)
                             
+                            # Log the activity
+                            self._log_activity("TP", f"{leg}{pair_idx} hit TP @ {event_price:.2f} (INCOMPLETE) -> INIT Group {self.current_group + 1}")
+
                             # Pass triggering pair index so Init can fill the missing leg of previous group
                             await self._execute_group_init(self.current_group + 1, event_price, is_bullish_source=is_bullish, trigger_pair_idx=pair_idx)
 
@@ -3829,6 +3879,7 @@ class SymbolEngine:
                     self.toggle_logger.debug(f"Pair {idx} | Action: BUY | trade_count: {pair.trade_count} | lot_size: {next_lot} | reason: TRIGGER")
                     
                     if await self._execute_trade_with_chain("buy", idx):
+                        self._log_activity("TOGGLE", f"BUY{idx} Manual Toggle @ trade_count={pair.trade_count}")
                         # Success - check expansion
                         indices = sorted(self.pairs.keys())
                         if idx == indices[-1] and idx >= 0:
@@ -3896,6 +3947,7 @@ class SymbolEngine:
                     self.toggle_logger.debug(f"Pair {idx} | Action: SELL | trade_count: {pair.trade_count} | lot_size: {next_lot} | reason: TRIGGER")
 
                     if await self._execute_trade_with_chain("sell", idx):
+                        self._log_activity("TOGGLE", f"SELL{idx} Manual Toggle @ trade_count={pair.trade_count}")
                         # Success - check expansion
                         indices = sorted(self.pairs.keys())
                         if idx == indices[0] and idx <= 0:
@@ -4311,6 +4363,15 @@ class SymbolEngine:
                 elif direction == "sell" and pair.locked_sell_entry == 0.0:
                     pair.locked_sell_entry = exec_price
                     print(f"[LOCKED] Pair {index} SELL entry locked at {exec_price:.2f}")
+
+                # Track lot size history for progression logging
+                if direction == "buy":
+                    pair.buy_lot_history.append(volume)
+                elif direction == "sell":
+                    pair.sell_lot_history.append(volume)
+
+                # Log successful order
+                self._log_activity("ORDER", f"{leg}{index} OPEN @ {exec_price:.2f} | Lot: {volume:.2f} | TP: {tp:.2f} | SL: {sl:.2f}")
             
             return position_ticket
         
