@@ -477,6 +477,9 @@ class SymbolEngine:
         
         # De-duplication cache for toggle logs
         self.last_toggle_log: Dict[int, str] = {}
+        
+        # Track TP hits already logged to prevent duplicates (Bug 6 Fix)
+        self._logged_tp_hits: Set[tuple] = set()  # (pair_idx, leg, group_id)
         # ---------------------------
 
         # --- TRADING ACTIVITY LOGGER (Clean log without FastAPI noise) ---
@@ -1186,8 +1189,8 @@ class SymbolEngine:
                 return
 
             if self.current_group > 0 and C >= 2:
-            #print(f"[EXPAND-BULL] BLOCKED: Group {self.current_group} C={C} >= 2 (non-atomic only for Group 0)")
-            return
+                #print(f"[EXPAND-BULL] BLOCKED: Group {self.current_group} C={C} >= 2 (non-atomic only for Group 0)")
+                return
 
             # [DIRECTIONAL GUARD] Bullish Expansion Restriction
             # Use per-group tracking for direction guards
@@ -3126,16 +3129,22 @@ class SymbolEngine:
 
                         # Log TP/SL hit to group logger
                         if is_tp:
-                            # Get lot history for the correct leg
-                            lot_hist = pair.buy_lot_history if leg == 'B' else pair.sell_lot_history
-                            self.group_logger.log_tp_hit(
-                                group_id=group_id,
-                                pair_idx=pair_idx,
-                                leg=leg,
-                                price=event_price,
-                                was_incomplete=was_incomplete,
-                                lot_history=lot_hist
-                            )
+                            # Prevent duplicate TP logging (Bug 6 Fix)
+                            tp_key = (pair_idx, leg, group_id)
+                            if tp_key in self._logged_tp_hits:
+                                pass  # Skip duplicate
+                            else:
+                                self._logged_tp_hits.add(tp_key)
+                                # Get lot history for the correct leg
+                                lot_hist = pair.buy_lot_history if leg == 'B' else pair.sell_lot_history
+                                self.group_logger.log_tp_hit(
+                                    group_id=group_id,
+                                    pair_idx=pair_idx,
+                                    leg=leg,
+                                    price=event_price,
+                                    was_incomplete=was_incomplete,
+                                    lot_history=lot_hist
+                                )
                         else:
                             self.group_logger.log_sl_hit(
                                 group_id=group_id,
@@ -3159,19 +3168,18 @@ class SymbolEngine:
                 
                 if is_tp:
                     if was_incomplete:
-                        # INCOMPLETE PAIR TP -> Fire INIT for next group
-                        # Triggered for ALL groups (including > 0)
+                        # LOG INCOMPLETE TP HIT to group_logger first (for ALL groups including 0)
                         
-                        # Check duplicate prevention set first
                         # ANCESTOR BLOCK: Pairs from groups < current_group - 1 should NOT fire INIT
-                        # This prevents old groups from hijacking the current group's progression
                         if group_id < self.current_group - 1:
                             print(f"[TP-INCOMPLETE-BLOCKED] Pair={pair_idx} Group={group_id} is ANCESTOR (< {self.current_group - 1}), ignoring INIT trigger")
                             self._log_activity("TP-BLOCKED", f"{leg}{pair_idx} (Group {group_id}) hit TP @ {event_price:.2f} - ANCESTOR GROUP BLOCKED ({group_id} < {self.current_group - 1})")
                         elif pair_idx in self._incomplete_pairs_init_triggered:
                             print(f"[TP-INCOMPLETE-BLOCKED] Pair={pair_idx} already fired INIT before, skipping")
+                            self._log_activity("TP-BLOCKED", f"{leg}{pair_idx} hit TP @ {event_price:.2f} (INCOMPLETE) - DUPLICATE BLOCKED")
                         elif self.graceful_stop:
                             print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> graceful stop active, no INIT")
+                            self._log_activity("TP", f"{leg}{pair_idx} hit TP @ {event_price:.2f} (INCOMPLETE) - GRACEFUL STOP")
                         else:
                             print(f"[TP-INCOMPLETE] Pair={pair_idx} Group={group_id} -> Firing INIT for Group {self.current_group + 1} (Bullish={is_bullish})")
                             self._incomplete_pairs_init_triggered.add(pair_idx)
@@ -3733,6 +3741,38 @@ class SymbolEngine:
                 
                 pair.record_position_open(ticket)
                 pair.advance_toggle()
+                
+                #UPDATE GROUP LOGGER with entry price for toggle trades
+                if self.group_logger:
+                    # Get the actual fill price from locked entries
+                    if direction == "buy":
+                        actual_entry = pair.locked_buy_entry if pair.locked_buy_entry > 0 else pair.buy_price
+                        tp_price = actual_entry + self.buy_stop_tp_pips
+                        sl_price = actual_entry - self.buy_stop_sl_pips
+                    else:
+                        actual_entry = pair.locked_sell_entry if pair.locked_sell_entry > 0 else pair.sell_price
+                        tp_price = actual_entry - self.sell_stop_tp_pips
+                        sl_price = actual_entry + self.sell_stop_sl_pips
+
+                    # Get lot size used (it's in the lot_history now)
+                    if direction == "buy" and pair.buy_lot_history:
+                        lot_used = pair.buy_lot_history[-1]
+                    elif direction == "sell" and pair.sell_lot_history:
+                        lot_used = pair.sell_lot_history[-1]
+                    else:
+                        lot_used = self.lot_sizes[0] if self.lot_sizes else 0.01
+
+                    self.group_logger.update_pair(
+                        group_id=pair.group_id,
+                        pair_idx=pair_idx,
+                        trade_type=direction.upper(),
+                        entry=actual_entry,
+                        tp=tp_price,
+                        sl=sl_price,
+                        lots=lot_used,
+                        status="ACTIVE",
+                        ticket=ticket
+                    )
                 
                 # ============================================
                 # ATOMIC HEDGE (Moved from Polling Loop)

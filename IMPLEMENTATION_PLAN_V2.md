@@ -1,6 +1,6 @@
 # Implementation Plan V2: Critical Bug Fixes
 
-This plan addresses 6 bugs found during code review. All changes are in `core/engine/symbol_engine.py` unless otherwise noted.
+This plan addresses 9 bugs found during code review. All changes are in `core/engine/symbol_engine.py` unless otherwise noted.
 
 ---
 
@@ -320,6 +320,149 @@ if is_tp:
 
 ---
 
+## Bug 7: `_create_next_negative_pair` Missing C Check and Wrong group_id
+
+### Problem
+When toggle trigger fires after non-atomic expansion (e.g., S0 re-entry), it calls `_create_next_negative_pair` to create B-1. This function:
+1. Has NO C check - it creates pairs even when C >= 3 (or C >= 2 for groups > 0)
+2. Sets `new_pair.group_id = self.current_group` instead of using the edge pair's group_id
+
+This caused B-1 to be created when it shouldn't (after non-atomic S0), and B-1 got group_id=2 instead of group_id=0, leading to double INIT firing.
+
+### Location
+**Line 3453** in `_create_next_negative_pair`
+
+### Current Code
+```python
+async def _create_next_negative_pair(self, edge_idx: int):
+    """
+    Create a new negative-index pair below the most-negative existing pair.
+    """
+    edge_pair = self.pairs.get(edge_idx)
+    if edge_pair is None:
+        print(f"[CREATE-NEG] Cannot find edge pair idx={edge_idx}")
+        return
+
+    # ... pair creation logic ...
+
+    new_pair.group_id = self.current_group  # <-- BUG: Wrong group_id!
+```
+
+### Fixed Code
+```python
+async def _create_next_negative_pair(self, edge_idx: int):
+    """
+    Create a new negative-index pair below the most-negative existing pair.
+    """
+    edge_pair = self.pairs.get(edge_idx)
+    if edge_pair is None:
+        print(f"[CREATE-NEG] Cannot find edge pair idx={edge_idx}")
+        return
+
+    # FIX: Add C check to prevent creation after saturation
+    group_id = edge_pair.group_id
+    C = self._get_c_highwater(group_id)
+    if C >= 3:
+        print(f"[CREATE-NEG] BLOCKED: Group {group_id} C={C} >= 3 (saturated)")
+        return
+    if group_id > 0 and C >= 2:
+        print(f"[CREATE-NEG] BLOCKED: Group {group_id} C={C} >= 2 (non-atomic only for Group 0)")
+        return
+
+    # ... pair creation logic ...
+
+    new_pair.group_id = edge_pair.group_id  # <-- FIX: Use edge pair's group_id, not current_group
+```
+
+---
+
+## Bug 8: `_create_next_positive_pair` Missing C Check and Wrong group_id
+
+### Problem
+Same issue as Bug 7 but for positive pair creation. When toggle trigger fires on the positive side, it can create pairs beyond saturation and with wrong group_id.
+
+### Location
+**Line 3370** in `_create_next_positive_pair`
+
+### Current Code
+```python
+async def _create_next_positive_pair(self, edge_idx: int):
+    """
+    Create a new positive-index pair above the most-positive existing pair.
+    """
+    edge_pair = self.pairs.get(edge_idx)
+    if edge_pair is None:
+        print(f"[CREATE-POS] Cannot find edge pair idx={edge_idx}")
+        return
+
+    # ... pair creation logic ...
+
+    new_pair.group_id = self.current_group  # <-- BUG: Wrong group_id!
+```
+
+### Fixed Code
+```python
+async def _create_next_positive_pair(self, edge_idx: int):
+    """
+    Create a new positive-index pair above the most-positive existing pair.
+    """
+    edge_pair = self.pairs.get(edge_idx)
+    if edge_pair is None:
+        print(f"[CREATE-POS] Cannot find edge pair idx={edge_idx}")
+        return
+
+    # FIX: Add C check to prevent creation after saturation
+    group_id = edge_pair.group_id
+    C = self._get_c_highwater(group_id)
+    if C >= 3:
+        print(f"[CREATE-POS] BLOCKED: Group {group_id} C={C} >= 3 (saturated)")
+        return
+    if group_id > 0 and C >= 2:
+        print(f"[CREATE-POS] BLOCKED: Group {group_id} C={C} >= 2 (non-atomic only for Group 0)")
+        return
+
+    # ... pair creation logic ...
+
+    new_pair.group_id = edge_pair.group_id  # <-- FIX: Use edge pair's group_id, not current_group
+```
+
+---
+
+## Bug 9: `_get_group_from_pair` Returns None for Negative Indices
+
+### Problem
+When a pair with negative index doesn't exist in `self.pairs`, `_get_group_from_pair` returns `None` instead of 0. Negative indices (e.g., -1, -2) always belong to Group 0.
+
+This can cause issues when looking up group_id for negative pairs that haven't been created yet.
+
+### Location
+**Line 708** in `_get_group_from_pair`
+
+### Current Code
+```python
+def _get_group_from_pair(self, pair_idx: int) -> int:
+    pair = self.pairs.get(pair_idx)
+    if pair is not None:
+        return pair.group_id
+    if pair_idx >= 0:
+        return pair_idx // self.GROUP_OFFSET
+    # BUG: No return for negative indices when pair doesn't exist!
+    # Returns None implicitly
+```
+
+### Fixed Code
+```python
+def _get_group_from_pair(self, pair_idx: int) -> int:
+    pair = self.pairs.get(pair_idx)
+    if pair is not None:
+        return pair.group_id
+    if pair_idx >= 0:
+        return pair_idx // self.GROUP_OFFSET
+    return 0  # FIX: Negative indices always belong to Group 0
+```
+
+---
+
 ## Summary Checklist
 
 | # | Bug | File | Line | Fix |
@@ -330,6 +473,9 @@ if is_tp:
 | 4 | Toggle trades don't update group_logger | symbol_engine.py | 3718 | Add `group_logger.update_pair()` |
 | 5 | Group 0 incomplete TP not logged | symbol_engine.py | 3140 | Log incomplete TPs for all groups |
 | 6 | Duplicate TP logs | symbol_engine.py | 3110, __init__ | Add dedup set |
+| 7 | `_create_next_negative_pair` no C check + wrong group_id | symbol_engine.py | 3453 | Add C check + use `edge_pair.group_id` |
+| 8 | `_create_next_positive_pair` no C check + wrong group_id | symbol_engine.py | 3370 | Add C check + use `edge_pair.group_id` |
+| 9 | `_get_group_from_pair` returns None for negative indices | symbol_engine.py | 708 | Add `return 0` for negative indices |
 
 ---
 
@@ -341,6 +487,9 @@ if is_tp:
 4. **Toggle trades**: Entry prices shown correctly in group_logger table
 5. **All groups**: Incomplete pair TP hits logged in activity
 6. **All groups**: No duplicate TP hit entries in activity log
+7. **Toggle triggers**: Cannot create new pairs after group saturation (C >= 3 or C >= 2 for groups > 0)
+8. **Negative pairs**: Always assigned to correct group (edge pair's group_id, not current_group)
+9. **Negative indices**: `_get_group_from_pair` correctly returns 0 for negative indices
 
 ---
 
@@ -354,3 +503,6 @@ if is_tp:
    - `_execute_trade_with_chain` (line 3718)
    - `_check_position_drops` (lines 3110, 3140)
    - `__init__` (add `_logged_tp_hits` set)
+   - `_create_next_negative_pair` (line 3453) - Add C check + fix group_id
+   - `_create_next_positive_pair` (line 3370) - Add C check + fix group_id
+   - `_get_group_from_pair` (line 708) - Add return 0 for negative indices
