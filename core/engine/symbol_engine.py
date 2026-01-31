@@ -799,6 +799,61 @@ class SymbolEngine:
             self.group_c_highwater[group_id] = current_c
             #print(f"[C-HIGHWATER] Group {group_id}: High-water updated {prev} -> {current_c}")
             
+    async def _cleanup_old_group_tracking(self, current_group: int): #Production fix to prevent memory leaks
+        """
+        Clean up tracking sets for ancestor groups (groups < current_group - 10).
+        These groups can no longer affect the strategy, so we don't need to track them.
+        """
+        if current_group < 10:
+            return  # Nothing to clean up for groups 0 - 9
+
+        cutoff_group = current_group - 10  # Keep current and parent, clean ancestors
+
+        # 1. Clean _logged_tp_hits
+        before_count = len(self._logged_tp_hits)
+        self._logged_tp_hits = {
+            (pair_idx, leg, group_id)
+            for (pair_idx, leg, group_id) in self._logged_tp_hits
+            if group_id >= cutoff_group
+        }
+        after_count = len(self._logged_tp_hits)
+        if before_count != after_count:
+            # self.activity_logger.info(f"[CLEANUP] _logged_tp_hits pruned: {before_count} -> {after_count}")
+            pass
+
+        # 2. Clean _pairs_tp_expanded (index -> group mapping used)
+        self._pairs_tp_expanded = {
+            pair_idx for pair_idx in self._pairs_tp_expanded
+            if self._get_group_from_pair(pair_idx) >= cutoff_group
+        }
+
+        # 3. Clean _incomplete_pairs_init_triggered
+        self._incomplete_pairs_init_triggered = {
+            pair_idx for pair_idx in self._incomplete_pairs_init_triggered
+            if self._get_group_from_pair(pair_idx) >= cutoff_group
+        }
+
+        # 4. Clean _triggered_groups
+        if hasattr(self, '_triggered_groups'):
+            self._triggered_groups = {
+                gid for gid in self._triggered_groups
+                if gid >= cutoff_group
+            }
+
+        # 5. Clean group-specific dictionaries (memory optimization)
+        groups_to_remove = [g for g in self.group_c_highwater.keys() if g < cutoff_group]
+        for g in groups_to_remove:
+            self.group_c_highwater.pop(g, None)
+            self.group_anchors.pop(g, None)
+            self.group_init_source.pop(g, None)
+            self.group_pending_retracement.pop(g, None)
+            self.group_retracement_anchor.pop(g, None)
+            self.group_retracement_levels_fired.pop(g, None)
+
+        if groups_to_remove:
+             # self.activity_logger.info(f"[CLEANUP] Pruned group data for groups < {cutoff_group}")
+             pass
+
     def _get_c_highwater(self, group_id: int) -> int:
         """Get the high-water mark for C for expansion gating."""
         return self.group_c_highwater[group_id]
@@ -955,6 +1010,9 @@ class SymbolEngine:
         self.group_anchors[group_id] = b_price
         self.anchor_price = b_price
         self.cycle_id = group_id  # keep legacy field in sync
+
+        # [MEMORY FIX] Cleanup old group tracking data
+        await self._cleanup_old_group_tracking(group_id)
 
         # Reset step triggers for new group (all directions)
         self.step1_bullish_triggered = False
