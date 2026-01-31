@@ -647,3 +647,246 @@ If C == 2: _force_artificial_tp_and_init()
 **Fix:** Removed the stray character and corrected indentation block for legacy fields.
 
 **Location:** `symbol_engine.py` (line ~411)
+
+---
+
+## Session Date: 2026-01-31
+
+---
+
+## Critical Bug Fixes (Symbol Engine)
+
+### Bug 1: `_handle_completed_pair_expansion` Uses LIVE C Instead of HIGHWATER
+
+**Problem:** When positions closed via SL, the live C count dropped and TP expansion fired AGAIN. This caused Group 2 to expand all the way to S203 when it should have stopped at C=2.
+
+**Root Cause:** `_count_completed_pairs_for_group()` returns the LIVE count of completed pairs. When pairs close via SL, this count drops, allowing expansion to fire repeatedly.
+
+**Fix Applied:**
+
+```python
+# OLD (BUG):
+C = self._count_completed_pairs_for_group(group_id)
+
+# NEW (FIXED):
+C = self._get_c_highwater(group_id)
+
+# Also added C>=2 block for groups > 0:
+if group_id > 0 and C >= 2:
+    print(f"[PRIOR-TP-DRIVER] BLOCKED: Group {group_id} C_highwater={C} >= 2")
+    return
+```
+
+**Location:** `_handle_completed_pair_expansion()` (line ~2981)
+
+---
+
+### Bug 2: Non-Atomic Step Expansion Fires for Groups > 0
+
+**Problem:** The non-atomic expansion at C==2 fired for ALL groups, but it should ONLY fire for Group 0. Groups > 0 should be blocked at C >= 2.
+
+**Fix Applied:**
+
+```python
+# Added after C >= 3 check:
+if self.current_group > 0 and C >= 2:
+    print(f"[EXPAND-BULL] BLOCKED: Group {self.current_group} C={C} >= 2 (non-atomic only for Group 0)")
+    return
+```
+
+**Locations:**
+
+- `_expand_bullish()` (line ~1191)
+- `_expand_bearish()` (line ~1316)
+
+---
+
+### Bug 3: TP Expansion at C==2 Fires for Groups > 0
+
+**Problem:** In `_execute_tp_expansion`, when C==2, non-atomic TP expansion fired for ALL groups. It should only fire for Group 0.
+
+**Fix Applied:**
+
+```python
+if C == 2:
+    if group_id > 0:
+        return  # Block non-atomic for groups > 0
+    # Only Group 0 gets non-atomic at C==2
+    print(f"[TP-EXPAND] C==2: B{complete_idx} only (Non-Atomic Fill)")
+    await self._place_single_leg_tp("buy", tick.ask, complete_idx)
+```
+
+**Locations:**
+
+- `_execute_tp_expansion()` bullish branch (line ~2770)
+- `_execute_tp_expansion()` bearish branch (line ~2851)
+
+---
+
+### Bug 7: `_create_next_negative_pair` Missing C Check and Wrong group_id
+
+**Problem:** When toggle trigger fired after non-atomic expansion (e.g., S0 re-entry), it called `_create_next_negative_pair` to create B-1. This function:
+
+1. Had NO C check - it created pairs even when C >= 3 (or C >= 2 for groups > 0)
+2. Set `new_pair.group_id = self.current_group` instead of using the edge pair's group_id
+
+This caused B-1 to be created when it shouldn't (after non-atomic S0), and B-1 got group_id=2 instead of group_id=0, leading to double INIT firing.
+
+**Example of the Bug:**
+
+```
+Timeline:
+1. Group 0: B0, S1, B1, S2, B2, S3 (all group_id=0)
+2. Non-atomic S0 placed (group_id=0, incomplete pair)
+3. current_group advances to 1, then 2
+4. Price returns to S0 level, toggle fires
+5. Toggle calls _create_next_negative_pair(0) to create B-1
+
+OLD CODE: new_pair.group_id = self.current_group → B-1 gets group_id=2 (WRONG!)
+          B-1's TP fires INIT for Group 3 (double INIT!)
+
+NEW CODE: new_pair.group_id = edge_pair.group_id → B-1 gets group_id=0 (CORRECT!)
+          B-1 belongs to Group 0, its TP won't fire expansion (C already >= 3)
+```
+
+**Fix Applied:**
+
+```python
+async def _create_next_negative_pair(self, edge_idx: int):
+    edge_pair = self.pairs.get(edge_idx)
+    if not edge_pair:
+        return
+
+    # FIX: Use edge pair's group_id for C check
+    group_id = edge_pair.group_id
+    C = self._get_c_highwater(group_id)
+    if C >= 3:
+        return
+    if group_id > 0 and C >= 2:
+        return
+
+    # ... pair creation logic ...
+
+    # FIX: Use edge pair's group_id, not current_group
+    new_pair.group_id = edge_pair.group_id
+```
+
+**Location:** `_create_next_negative_pair()` (line ~3461)
+
+---
+
+### Bug 8: `_create_next_positive_pair` Missing C Check and Wrong group_id
+
+**Problem:** Same issue as Bug 7 but for positive pair creation. When toggle trigger fired on the positive side, it could create pairs beyond saturation and with wrong group_id.
+
+**Fix Applied:** Same pattern as Bug 7 - added C check using edge_pair.group_id and set `new_pair.group_id = edge_pair.group_id`.
+
+**Location:** `_create_next_positive_pair()` (line ~3370)
+
+---
+
+### Bug 9: `_get_group_from_pair` Returns None for Negative Indices
+
+**Problem:** When a pair with negative index didn't exist in `self.pairs`, `_get_group_from_pair` returned `None` instead of 0. Negative indices (e.g., -1, -2) always belong to Group 0.
+
+**Fix Applied:**
+
+```python
+def _get_group_from_pair(self, pair_idx: int) -> int:
+    pair = self.pairs.get(pair_idx)
+    if pair is not None:
+        return pair.group_id
+    if pair_idx >= 0:
+        return pair_idx // self.GROUP_OFFSET
+    return 0  # FIX: Negative indices always belong to Group 0
+```
+
+**Location:** `_get_group_from_pair()` (line ~708)
+
+---
+
+## Why edge_pair.group_id Works (Detailed Explanation)
+
+The key insight is that **grid expansion extends the SAME group's grid**, not a new group.
+
+**Grid Structure:**
+
+```
+Group 0 Grid:
+  ... B-2, S-1, B-1, S0, B0, S1, B1, S2, B2, S3 ...
+  All pairs have group_id=0
+
+Group 1 Grid (starts at offset 100):
+  B100, S101, B101, S102, B102, S103 ...
+  All pairs have group_id=1
+```
+
+**When toggle triggers on S0 (Group 0's non-atomic pair):**
+
+- `edge_pair` = pair 0 (the pair that triggered expansion)
+- `edge_pair.group_id` = 0 (set when pair 0 was created during Group 0 INIT)
+- New pair B-1 should get `group_id = 0` because it's part of Group 0's grid
+
+**If we used `self.current_group`:**
+
+- `self.current_group` might be 2 at this point
+- B-1 would incorrectly get `group_id = 2`
+- When B-1 hits TP, the system would check Group 2's C count
+- This could fire expansion or INIT based on Group 2's state (wrong behavior!)
+
+---
+
+## Invariants Added
+
+1. **Edge pair determines new pair's group:** When creating pairs via toggle expansion, ALWAYS use `edge_pair.group_id`, never `self.current_group`.
+
+2. **C check uses edge pair's group:** When checking C for toggle expansion, use `_get_c_highwater(edge_pair.group_id)`, not `_get_c_highwater(self.current_group)`.
+
+3. **Negative indices belong to Group 0:** `_get_group_from_pair()` must return 0 for negative indices when pair doesn't exist.
+
+4. **Groups > 0 block at C >= 2:** Only Group 0 gets non-atomic expansion at C==2. All other groups stop at C >= 2.
+
+---
+
+## Runtime Hotfixes Applied (2026-01-31)
+
+### Runtime Bug: `_logged_tp_hits` Serialization Crash
+
+**Status:** ✅ FIXED
+
+**Problem:**
+
+- `_logged_tp_hits` is `Set[tuple]` containing tuples like `(pair_idx, leg, group_id)` → e.g., `(1, 'B', 0)`
+- JSON serializes tuples as **lists**: `[1, "B", 0]`
+- On restore, `set([[1, "B", 0], ...])` throws **TypeError: unhashable type: 'list'**
+
+**Fix Applied:**
+Added conversion logic in `load_state` to explicitly convert lists back to tuples before adding to the set.
+
+```python
+# load_state conversion:
+logged_tp_raw = md.get('_logged_tp_hits', [])
+self._logged_tp_hits = set()
+for item in logged_tp_raw:
+    if isinstance(item, list):
+        self._logged_tp_hits.add(tuple(item))
+    elif isinstance(item, tuple):
+        self._logged_tp_hits.add(item)
+```
+
+**Location:** `symbol_engine.py` (load_state)
+
+---
+
+### Runtime Bug: `_triggered_groups` Not Persisted
+
+**Status:** ✅ FIXED
+
+**Problem:** The `_triggered_groups` set is created lazily in `_is_group_init_triggered()` but is never saved or restored. This caused groups to potentially fire INIT again after restart.
+
+**Fix Applied:**
+
+- Added `_triggered_groups` to the global metadata dictionary in `save_state`.
+- Added logic to restore `self._triggered_groups` from metadata in `load_state`.
+
+**Location:** `symbol_engine.py` (save_state / load_state)

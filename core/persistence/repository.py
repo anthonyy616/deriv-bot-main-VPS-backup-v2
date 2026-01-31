@@ -58,6 +58,13 @@ class Repository:
             print(f"[REPOS] Migration: added 'metadata' column to 'symbol_state'")
         except Exception:
             pass
+
+        # MIGRATION: Add metadata column to grid_pairs if it doesn't exist
+        try:
+            await self.db.execute("ALTER TABLE grid_pairs ADD COLUMN metadata TEXT DEFAULT '{}'")
+            print(f"[REPOS] Migration: added 'metadata' column to 'grid_pairs'")
+        except Exception:
+            pass
             
         await self.db.commit()
 
@@ -99,7 +106,7 @@ class Repository:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
 
-    async def upsert_pair(self, pair_data: Dict[str, Any]):
+    async def upsert_pair(self, pair_data: Dict[str, Any], metadata: str = '{}'):
         """Insert or Update a single pair (Atomic operation)."""
         # Extract fields from pair_data dict
         await self.db.execute(
@@ -111,8 +118,8 @@ class Repository:
                 trade_count, next_action, is_reopened,
                 buy_in_zone, sell_in_zone,
                 hedge_ticket, hedge_direction, hedge_active,
-                locked_buy_entry, locked_sell_entry, tp_blocked, group_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                locked_buy_entry, locked_sell_entry, tp_blocked, group_id, metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol, pair_index) DO UPDATE SET
                 buy_price=excluded.buy_price,
                 sell_price=excluded.sell_price,
@@ -133,7 +140,8 @@ class Repository:
                 locked_buy_entry=excluded.locked_buy_entry,
                 locked_sell_entry=excluded.locked_sell_entry,
                 tp_blocked=excluded.tp_blocked,
-                group_id=excluded.group_id
+                group_id=excluded.group_id,
+                metadata=excluded.metadata
             """,
             (
                 self.symbol, pair_data['index'], pair_data['buy_price'], pair_data['sell_price'],
@@ -149,7 +157,8 @@ class Repository:
                 pair_data.get('locked_buy_entry', 0.0),
                 pair_data.get('locked_sell_entry', 0.0),
                 int(pair_data.get('tp_blocked', False)),
-                pair_data.get('group_id', 0)
+                pair_data.get('group_id', 0),
+                metadata
             )
         )
         await self.db.commit()

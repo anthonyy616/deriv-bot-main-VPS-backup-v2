@@ -4879,11 +4879,50 @@ class SymbolEngine:
     
     async def save_state(self):
         """Persist grid state to SQLite and update Group Logs."""
-        # Prepare metadata blob
-        metadata_dict = {
-            "group_direction": self.group_direction
+        # ====================================================================
+        # [PERSISTENCE OVERHAUL] Global Metadata Serialization (Bugs 12-19, 21)
+        # ====================================================================
+        
+        # 1. Convert Sets to Lists for JSON
+        init_triggered_list = list(getattr(self, '_incomplete_pairs_init_triggered', set()))
+        tp_expanded_list = list(getattr(self, '_pairs_tp_expanded', set()))
+        logged_tp_list = list(getattr(self, '_logged_tp_hits', set()))
+        retracement_fired_list = {gid: list(fired) for gid, fired in self.group_retracement_levels_fired.items()}
+        # [FIX] Persist _triggered_groups (Issue 1)
+        triggered_groups_list = list(getattr(self, '_triggered_groups', set()))
+
+        # 2. Build Global Metadata Dict
+        global_metadata = {
+            "group_direction": self.group_direction,
+            "current_group": self.current_group, # Bug 18
+            
+            # Global Logic State
+            "step1_bullish_triggered": self.step1_bullish_triggered, # Bug 21
+            "step1_bearish_triggered": self.step1_bearish_triggered,
+            "step2_bullish_triggered": self.step2_bullish_triggered,
+            "step2_bearish_triggered": self.step2_bearish_triggered,
+            "step1_triggered": self.step1_triggered,
+            "step2_triggered": self.step2_triggered,
+            
+            # Group Logic State (Bugs 12, 16, 17)
+            "group_c_highwater": dict(self.group_c_highwater),
+            "group_anchors": self.group_anchors,
+            "group_init_source": self.group_init_source,
+            "group_pending_retracement": self.group_pending_retracement,
+            "group_retracement_anchor": self.group_retracement_anchor,
+            "group_retracement_levels_fired": retracement_fired_list,
+
+            # Deduplication Sets (Bugs 13, 14, 15)
+            "_incomplete_pairs_init_triggered": init_triggered_list,
+            "_pairs_tp_expanded": tp_expanded_list,
+            "_logged_tp_hits": logged_tp_list,
+            "_triggered_groups": triggered_groups_list, # [FIX] Issue 1
+            
+            # Logic Flags (Bug 19)
+            "ticket_touch_flags": self.ticket_touch_flags
         }
-        metadata_json = json.dumps(metadata_dict)
+        
+        metadata_json = json.dumps(global_metadata)
 
         await self.repository.save_state(
             self.phase, self.center_price, self.iteration,
@@ -4891,9 +4930,17 @@ class SymbolEngine:
             metadata=metadata_json
         )
         
-        # Save All Pairs
+        # Save All Pairs with Pair-Level Metadata (Bugs 20, 22)
         for pair in self.pairs.values():
-            await self.repository.upsert_pair(asdict(pair))
+            # Build Pair Metadata
+            pair_metadata = {
+                "buy_lot_history": pair.buy_lot_history,
+                "sell_lot_history": pair.sell_lot_history,
+                "position_timestamps": pair.position_timestamps # Keys (tickets) will be stringified
+            }
+            pair_metadata_json = json.dumps(pair_metadata)
+            
+            await self.repository.upsert_pair(asdict(pair), metadata=pair_metadata_json)
             
         # [LOGGER INTEGRATION] Update the tabular log file
         if self.group_logger:
@@ -4925,35 +4972,96 @@ class SymbolEngine:
         self.cycle_id = state.get('cycle_id', 0)
         self.anchor_price = state.get('anchor_price', 0.0)
         
-        # Load metadata
+        # ====================================================================
+        # [PERSISTENCE OVERHAUL] Global Metadata Restoration (Bugs 12-19, 21)
+        # ====================================================================
         metadata_json = state.get('metadata', '{}')
         try:
-            metadata = json.loads(metadata_json)
-            self.group_direction = metadata.get('group_direction')
-        except Exception:
-            self.group_direction = None
+            md = json.loads(metadata_json)
+            
+            # 1. Basic Fields
+            self.group_direction = md.get('group_direction')
+            self.current_group = md.get('current_group', self.cycle_id) # Restore active group (Bug 18)
+            
+            # 2. Logic Flags (Bug 21)
+            self.step1_bullish_triggered = md.get('step1_bullish_triggered', False)
+            self.step1_bearish_triggered = md.get('step1_bearish_triggered', False)
+            self.step2_bullish_triggered = md.get('step2_bullish_triggered', False)
+            self.step2_bearish_triggered = md.get('step2_bearish_triggered', False)
+            self.step1_triggered = md.get('step1_triggered', False)
+            self.step2_triggered = md.get('step2_triggered', False)
+            
+            # 3. Group Logic Restoration (dicts)
+            self.group_c_highwater = defaultdict(int, {int(k): v for k, v in md.get('group_c_highwater', {}).items()})
+            self.group_anchors = {int(k): v for k, v in md.get('group_anchors', {}).items()}
+            self.group_init_source = {int(k): v for k, v in md.get('group_init_source', {}).items()}
+            self.group_pending_retracement = {int(k): v for k, v in md.get('group_pending_retracement', {}).items()}
+            self.group_retracement_anchor = {int(k): v for k, v in md.get('group_retracement_anchor', {}).items()}
+            
+            # Retracement Levels Fired (dict of sets)
+            retracement_fired_raw = md.get('group_retracement_levels_fired', {})
+            self.group_retracement_levels_fired = defaultdict(set)
+            for gid, levels in retracement_fired_raw.items():
+                self.group_retracement_levels_fired[int(gid)] = set(levels)
+            
+            # 4. Deduplication Sets (Lists -> Sets)
+            self._incomplete_pairs_init_triggered = set(md.get('_incomplete_pairs_init_triggered', []))
+            self._pairs_tp_expanded = set(md.get('_pairs_tp_expanded', []))
+            
+            # [FIX CRITICAL] Convert lists of lists back to tuples for set compatibility
+            logged_tp_raw = md.get('_logged_tp_hits', [])
+            self._logged_tp_hits = set()
+            for item in logged_tp_raw:
+                if isinstance(item, list):
+                    self._logged_tp_hits.add(tuple(item))
+                elif isinstance(item, tuple):
+                    self._logged_tp_hits.add(item)
+            
+            # [FIX] Restore _triggered_groups (Issue 1)
+            self._triggered_groups = set(md.get('_triggered_groups', []))
+            
+            # 5. Ticket Flags (Bug 19)
+            # Keys in JSON are strings, convert to int
+            tf_raw = md.get('ticket_touch_flags', {})
+            # [FIX] Deep copy needed or just dict comp? Dict comp works.
+            # Values are dicts {"tp_touched": bool, "sl_touched": bool}, which are JSON-safe.
+            self.ticket_touch_flags = {int(k): v for k, v in tf_raw.items()}
+            
+            print(f" {self.symbol}: Global metadata restored successfully.")
+
+        except Exception as e:
+            print(f" {self.symbol}: Failed to restore global metadata: {e}")
+            # Fallbacks are handled by __init__ defaults
         
-        # Restore last deal check time to prevent missing deals
+        # Restore last deal check time
         last_update_str = state.get('last_update_time')
         if last_update_str is not None:
-            # FIX: Handle case where DB returns float timestamp directly
             if isinstance(last_update_str, (float, int)):
                 self.last_deal_check_time = float(last_update_str)
             else:
                 try:
-                    # SQLite CURRENT_TIMESTAMP is 'YYYY-MM-DD HH:MM:SS'
-                    # Try handling both strict format and potential variations
                     dt = datetime.strptime(str(last_update_str), "%Y-%m-%d %H:%M:%S")
                     self.last_deal_check_time = dt.timestamp()
                 except ValueError:
                      try:
-                         # Attempt with microseconds if present
                          dt = datetime.strptime(str(last_update_str), "%Y-%m-%d %H:%M:%S.%f")
                          self.last_deal_check_time = dt.timestamp()
                      except Exception:
                          pass
         
-        # Load Pairs
+        # ====================================================================
+        # [PERSISTENCE OVERHAUL] Restore Ticket Map (Bug 10)
+        # ====================================================================
+        try:
+            self.ticket_map = await self.repository.get_ticket_map()
+            print(f" {self.symbol}: Loaded {len(self.ticket_map)} tickets from DB")
+        except Exception as e:
+            print(f" {self.symbol}: Failed to load ticket map: {e}")
+            self.ticket_map = {}
+
+        # ====================================================================
+        # [PERSISTENCE OVERHAUL] Restore Pairs & Pair Metadata (Bugs 10, 11, 20, 22)
+        # ====================================================================
         pair_rows = await self.repository.get_pairs()
         self.pairs = {}
         for row in pair_rows:
@@ -4963,7 +5071,7 @@ class SymbolEngine:
                 buy_price=row['buy_price'],
                 sell_price=row['sell_price']
             )
-            # Restore state
+            # Restore Standard State
             pair.buy_ticket = row['buy_ticket']
             pair.sell_ticket = row['sell_ticket']
             pair.buy_filled = bool(row['buy_filled'])
@@ -4979,6 +5087,28 @@ class SymbolEngine:
         
             # [PERSISTENCE] Restore group_id (default to 0 if missing)
             pair.group_id = row.get('group_id', 0)
+            
+            # [FIX Bug 10] Restore Hedge State
+            pair.hedge_ticket = row.get('hedge_ticket', 0)
+            pair.hedge_direction = row.get('hedge_direction')
+            pair.hedge_active = bool(row.get('hedge_active', False))
+            
+            # [FIX Bug 11] Restore Locked Entries
+            pair.locked_buy_entry = row.get('locked_buy_entry', 0.0)
+            pair.locked_sell_entry = row.get('locked_sell_entry', 0.0)
+            
+            # [FIX Bug 20, 22] Restore Pair Metadata (Lot History, Timestamps)
+            pair_md_json = row.get('metadata', '{}')
+            try:
+                pmd = json.loads(pair_md_json)
+                pair.buy_lot_history = pmd.get('buy_lot_history', [])
+                pair.sell_lot_history = pmd.get('sell_lot_history', [])
+                
+                # Restore timestamps (keys are strings in JSON, need ints for tickets)
+                ts_raw = pmd.get('position_timestamps', {})
+                pair.position_timestamps = {int(k): v for k, v in ts_raw.items()}
+            except Exception:
+                pass # Defaults already empty list/dict
             
             # [LOGGER SYNC] Restore state to GroupLogger
             if self.group_logger:
@@ -5029,14 +5159,12 @@ class SymbolEngine:
             # This prevents race conditions after crashes/restarts.
             
             # 1. FIX NEGATIVE PAIR RACE: Always latch zone if filled
-            #    If position is filled, zone MUST be latched to prevent re-trigger
             if pair.buy_filled:
                 pair.buy_in_zone = True
             if pair.sell_filled:
                 pair.sell_in_zone = True
             
             # 2. FIX POSITIVE PAIR WRONG DIRECTION: Sync toggle with fill state
-            #    If we have a sell but no buy (or last was sell), next must be buy
             if pair.sell_filled and not pair.buy_filled:
                 if pair.next_action != "buy":
                     print(f"[SYNC] {self.symbol} Pair {idx}: sell_filled but next_action was '{pair.next_action}' - correcting to 'buy'")
@@ -5047,18 +5175,25 @@ class SymbolEngine:
                     pair.next_action = "sell"
             
             # 3. SANITY CHECK: Repair trade_count if 0 but filled
-            #    If pair is filled but trade_count is 0, the DB was saved inconsistently
             if (pair.buy_filled or pair.sell_filled) and pair.trade_count == 0:
                 print(f"[SANITY] {self.symbol} Pair {idx}: Filled but trade_count=0 - correcting to trade_count=1")
                 pair.trade_count = 1
             
+            # 4. [NEW persistence fix] Ensure lot history matches trade_count
+            # If we lost lot history but have trade_count, reconstruct basic history
+            if pair.buy_filled and not pair.buy_lot_history:
+                 # Best guess: assumes 0.01 start
+                 pair.buy_lot_history = [self.lot_sizes[i] for i in range(min(pair.trade_count, len(self.lot_sizes)))]
+            if pair.sell_filled and not pair.sell_lot_history:
+                 pair.sell_lot_history = [self.lot_sizes[i] for i in range(min(pair.trade_count, len(self.lot_sizes)))]
+
             # ===== END STATE SYNCHRONIZATION =====
             
             self.pairs[idx] = pair
             # Update ground truth
             self.grid_truth.add_level(pair.buy_price, pair.sell_price, idx)
             
-        print(f" {self.symbol}: Loaded state (Phase={self.phase}, Pairs={len(self.pairs)})")
+        print(f" {self.symbol}: Loaded state (Phase={self.phase}, Pairs={len(self.pairs)}, ActiveGroup={self.current_group})")
 
     # ========================================================================
     # GROUP TRANSITION HELPERS
