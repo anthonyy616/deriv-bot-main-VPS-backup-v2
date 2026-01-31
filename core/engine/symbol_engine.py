@@ -720,7 +720,7 @@ class SymbolEngine:
         # Fallback: Calculate from index (legacy behavior)
         if pair_idx >= 0:
             return pair_idx // self.GROUP_OFFSET
-        
+        return 0   # negative pairs belong to only group 0 so just return 0, this is to handle it
     
     def _get_pair_offset(self, group_id: int) -> int:
         """Get the base pair offset for a group. Group 0 → 0, Group 1 → 100."""
@@ -3377,7 +3377,16 @@ class SymbolEngine:
         edge_pair = self.pairs.get(edge_idx)
         if not edge_pair:
             return
-        
+
+        group_id = edge_pair.group_id
+        C = self._get_c_highwater(group_id)
+        if C >= 3:
+            #print(f"[CREATE-NEG] BLOCKED: Group {group_id} C={C} >= 3 (saturated)")
+            return
+        if group_id > 0 and C >= 2:
+            #print(f"[CREATE-NEG] BLOCKED: Group {group_id} C={C} >= 2 (non-atomic only for Group 0)")
+            return
+
         # [DIRECTIONAL GUARD] Bullish Expansion Restriction
         # Use per-group tracking for direction guards
         init_source = self.group_init_source.get(self.current_group)
@@ -3406,8 +3415,7 @@ class SymbolEngine:
             buy_price=new_buy_price,
             sell_price=new_sell_price
         )
-        new_pair.group_id = self.current_group  # TASK 1 FIX: Assign group_id
-        
+        new_pair.group_id = edge_pair.group_id 
         # Positive pairs START with SELL
         new_pair.next_action = "sell"
         self.pairs[new_idx] = new_pair
@@ -3460,6 +3468,15 @@ class SymbolEngine:
         edge_pair = self.pairs.get(edge_idx)
         if not edge_pair:
             return
+        group_id = edge_pair.group_id
+        C = self._get_c_highwater(group_id)
+        if C >= 3:
+            #print(f"[CREATE-NEG] BLOCKED: Group {group_id} C={C} >= 3 (saturated)")
+            return
+        if group_id > 0 and C >= 2:
+            #print(f"[CREATE-NEG] BLOCKED: Group {group_id} C={C} >= 2 (non-atomic only for Group 0)")
+            return
+
         
         # [DIRECTIONAL GUARD] Bearish Expansion Restriction
         # Use per-group tracking for direction guards
@@ -3488,7 +3505,7 @@ class SymbolEngine:
             buy_price=new_buy_price,
             sell_price=new_sell_price
         )
-        new_pair.group_id = self.current_group  # TASK 1 FIX: Assign group_id
+        new_pair.group_id = edge_pair.group_id  #use edge pair's group_id, not current_group
         
         # Negative pairs START with BUY
         new_pair.next_action = "buy"
