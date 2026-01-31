@@ -445,9 +445,10 @@ class GroupLogger:
         # and "in tabular manner". State snapshot is best for this.
         
         # Use a fixed filename for the session so it doesn't rotate endlessly
-        # "groups_table_{session_id}.txt"
-        
-        filename = f"groups_log_{self.session_id}.txt"
+        # Include symbol name so each asset gets its own file
+
+        safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
+        filename = f"groups_log_{safe_symbol}_{self.session_id}.txt"
         path = os.path.join(self.log_dir, filename)
         
         try:

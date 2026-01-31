@@ -333,16 +333,7 @@ class TradeLog:
 
 
 class SymbolEngine:
-    """
-    Multi-Asset Infinite-Ladder Grid Strategy with Leapfrog mechanics.
-    
-    Phases:
-    - INIT: Place initial B1 (Buy Stop) and S1 (Sell Stop)
-    - WAITING_CENTER: Wait for BOTH B1 and S1 to fill
-    - EXPANDING: Add pairs until max_pairs reached
-    - RUNNING: Monitor TP/SL, execute Leapfrog, re-open pairs
-    """
-    
+   
     PHASE_INIT = "INIT"
     PHASE_WAITING_CENTER = "WAITING_CENTER"
     PHASE_EXPANDING = "EXPANDING"
@@ -2713,7 +2704,7 @@ class SymbolEngine:
                     # await self._execute_pair_reset(pair_idx, pair, direction)
                     break
 
-    # NUCLEAR RESET DISABLED: These functions are no longer used
+    # NUCLEAR RESET DISABLED: This function was used before but im commenting it out because we might revert to it 
     # Survivor legs now stay open when opposite leg closes
     # async def _execute_pair_reset(self, pair_idx: int, pair, closed_direction: str):
     #     """Helper to execute nuclear reset."""
@@ -2772,6 +2763,24 @@ class SymbolEngine:
         
         if incomplete_ticket:
             print(f"[ARTIFICIAL-TP] Closing incomplete pair {incomplete_pair_idx} ticket={incomplete_ticket}")
+            
+            # Log Artificial TP to GroupLogger
+            if self.group_logger:
+                # Use current group's lot history for this leg
+                pair = self.pairs.get(incomplete_pair_idx)
+                lot_hist = []
+                if pair:
+                    lot_hist = pair.buy_lot_history if incomplete_leg == 'B' else pair.sell_lot_history
+                
+                self.group_logger.log_tp_hit(
+                    group_id=self.current_group,
+                    pair_idx=incomplete_pair_idx,
+                    leg=incomplete_leg,
+                    price=event_price if event_price else (tick.ask + tick.bid)/2,
+                    was_incomplete=True,
+                    lot_history=lot_hist
+                )
+
             self._close_position(incomplete_ticket)
             
             # Cleanup
@@ -3253,7 +3262,21 @@ class SymbolEngine:
                             # Pass triggering pair index so Init can fill the missing leg of previous group
                             await self._execute_group_init(self.current_group + 1, event_price, is_bullish_source=is_bullish, trigger_pair_idx=pair_idx)
 
-                    else:
+                    # [TASK 5 FIX] Ensure ALL incomplete TPs for ALL groups are logged to group_logger
+                    # (Original code only logged completed pair TPs below this branch)
+                    if was_incomplete and self.group_logger:
+                         # Get lot history for the correct leg
+                         lot_hist = pair.buy_lot_history if leg == 'B' else pair.sell_lot_history
+                         self.group_logger.log_tp_hit(
+                             group_id=group_id,
+                             pair_idx=pair_idx,
+                             leg=leg,
+                             price=event_price,
+                             was_incomplete=True,
+                             lot_history=lot_hist
+                         )
+
+                    if not was_incomplete:
                         # Completed-pair TP
                         # FORCE NORMAL EXPANSION using High-Water C
                         # We do NOT skip based on live C dropping. We use high-water C to gate atomic/non-atomic logic inside.
