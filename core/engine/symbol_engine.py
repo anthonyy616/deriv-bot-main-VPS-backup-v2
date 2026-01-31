@@ -1178,12 +1178,16 @@ class SymbolEngine:
         """Expand grid bullish: complete pair N with B, start pair N+1 with S.
         If C==2, do NON-ATOMIC completion then immediately artificial-close + INIT next group.
         """
-        async with self.execution_lock:
+        async with self.execution_lock: #don't unlock unless you get race conditions
             # Use High-Water C for gating
             C = self._get_c_highwater(self.current_group)
             if C >= 3:
                 print(f"[EXPAND-BULL] BLOCKED C={C} >= 3")
                 return
+
+            if self.current_group > 0 and C >= 2:
+            #print(f"[EXPAND-BULL] BLOCKED: Group {self.current_group} C={C} >= 2 (non-atomic only for Group 0)")
+            return
 
             # [DIRECTIONAL GUARD] Bullish Expansion Restriction
             # Use per-group tracking for direction guards
@@ -1304,6 +1308,10 @@ class SymbolEngine:
             C = self._get_c_highwater(self.current_group)
             if C >= 3:
                 print(f"[EXPAND-BEAR] BLOCKED C={C} >= 3")
+                return
+            
+            if self.current_group > 0 and C >= 2:
+                #print(f"[EXPAND-BEAR] BLOCKED: Group {self.current_group} C={C} >= 2 (non-atomic only for Group 0)")
                 return
 
             # [DIRECTIONAL GUARD] Bearish Expansion Restriction
@@ -2757,6 +2765,8 @@ class SymbolEngine:
                 seed_idx = complete_idx + 1
                 
                 if C == 2:
+                    if group_id > 0:
+                        return #dont do anything 
                     print(f"[TP-EXPAND] C==2: B{complete_idx} only (Non-Atomic Fill)")
                     # Fire Non-Atomic Leg ONLY
                     await self._place_single_leg_tp("buy", tick.ask, complete_idx)
@@ -2836,6 +2846,9 @@ class SymbolEngine:
                 seed_idx = complete_idx - 1
 
                 if C == 2:
+                    if group_id > 0:
+                        return
+
                     print(f"[TP-EXPAND] C==2: S{complete_idx} only (Non-Atomic Fill)")
                     # Fire Non-Atomic Leg ONLY
                     await self._place_single_leg_tp("sell", tick.bid, complete_idx)
@@ -2978,13 +2991,17 @@ class SymbolEngine:
         This simply routes the event to check expansion conditions for the ACTIVE group.
         """
         group_id = self.current_group
-        C = self._count_completed_pairs_for_group(group_id)
+        C = self._get_c_highwater(group_id)
         if C >= 3: 
              # Already full, no expansion needed
              return
 
         #print(f"[PRIOR-TP-DRIVER] Driving Active Group {group_id} Check (C={C})")
         # Reuse the main expansion logic
+        if group_id > 0 and C >= 2:
+            print(f"[PRIOR-TP-DRIVER] BLOCKED: Group {group_id} C={C} >= 2")
+            return
+
         await self._execute_tp_expansion(group_id, event_price, is_bullish, C)
 
 
