@@ -94,8 +94,10 @@ class GridPair:
     
     locked_buy_entry: float = 0.0   # The actual execution price when BUY first fired
     locked_sell_entry: float = 0.0  # The actual execution price when SELL first fired
-    locked_buy_trigger: float = 0.0   # Grid price for BUY triggers (never changes)
-    locked_sell_trigger: float = 0.0  # Grid price for SELL triggers (never changes)
+    locked_buy_trigger: float = 0.0   # Compensated trigger for BUY re-entries (first_fill - spread)
+    locked_sell_trigger: float = 0.0  # Compensated trigger for SELL re-entries (first_fill + spread)
+    locked_buy_spread: float = 0.0    # Spread at first BUY execution (locked for consistency)
+    locked_sell_spread: float = 0.0   # Spread at first SELL execution (locked for consistency)
     tp_blocked: bool = False        # Permanent retirement flag (set on TP/SL)
     
     # Lot size history for progression tracking
@@ -4000,24 +4002,26 @@ class SymbolEngine:
                 continue
             
             # ================================================================
-            # USE LOCKED ENTRY PRICES FOR RE-ENTRIES
-            # Once a trade executes, its entry price is locked forever.
-            # Re-entries must happen at the exact same level.
+            # SPREAD-COMPENSATED TRIGGERS FOR CONSISTENT RE-ENTRIES
+            #
+            # First trade: Use grid price (no compensation)
+            # Re-entries: Use locked_trigger = first_fill - locked_spread
+            # This ensures all re-entries trigger at the SAME compensated level
             # ================================================================
-            # Use locked_trigger if set, otherwise grid price
-            base_buy_trigger = pair.locked_buy_trigger if pair.locked_buy_trigger > 0 else pair.buy_price
-            base_sell_trigger = pair.locked_sell_trigger if pair.locked_sell_trigger > 0 else pair.sell_price
 
-            # Apply spread compensation for re-entries (trade_count > 0)
-            if pair.trade_count > 0:
-                broker_spread = self.get_broker_spread()  # Pure MT5 spread, no caps
-                # BUY: trigger earlier (price - spread) so execution lands at grid
-                buy_trigger = base_buy_trigger - broker_spread
-                # SELL: trigger earlier (price + spread) so execution lands at grid
-                sell_trigger = base_sell_trigger + broker_spread
+            if pair.trade_count > 0 and pair.locked_buy_trigger > 0:
+                # Re-entry: Use the locked compensated trigger (set on first fill)
+                buy_trigger = pair.locked_buy_trigger
             else:
-                buy_trigger = base_buy_trigger
-                sell_trigger = base_sell_trigger
+                # First trade: Use grid price
+                buy_trigger = pair.buy_price
+
+            if pair.trade_count > 0 and pair.locked_sell_trigger > 0:
+                # Re-entry: Use the locked compensated trigger
+                sell_trigger = pair.locked_sell_trigger
+            else:
+                # First trade: Use grid price
+                sell_trigger = pair.sell_price
             
             # NOTE: Proximity-based re-entry for Phoenix pairs removed - no longer used
             # ================================================================
@@ -4536,26 +4540,46 @@ class SymbolEngine:
             )
             
             # ================================================================
-            # LOCKED ENTRY PRICES: Set ONCE on first execution, NEVER change
-            # This ensures re-entries happen at the exact same price level
+            # LOCKED ENTRY + SPREAD COMPENSATION: Set ONCE on first execution
+            #
+            # This ensures re-entries are CONSISTENT by:
+            # 1. Locking the execution price (for TP/SL alignment)
+            # 2. Locking the spread at first fill (for consistent compensation)
+            # 3. Locking the COMPENSATED trigger (first_fill - spread for BUY)
+            #
+            # Re-entries will trigger at locked_trigger which already accounts
+            # for spread, so fills land at approximately the same price.
             # ================================================================
             if pair:
                 if direction == "buy":
-                    # Lock GRID TRIGGER price (for re-entry triggers)
-                    if pair.locked_buy_trigger == 0.0:
-                        pair.locked_buy_trigger = pair.buy_price
-                        print(f"[LOCKED TRIGGER] Pair {index} BUY trigger at {pair.buy_price:.2f} (grid)")
-                    # Lock EXECUTION price (for TP/SL alignment)
                     if pair.locked_buy_entry == 0.0:
+                        # First BUY execution - lock everything
                         pair.locked_buy_entry = exec_price
-                        print(f"[LOCKED ENTRY] Pair {index} BUY entry at {exec_price:.2f} (exec)")
+
+                        # Lock the spread at this moment
+                        current_spread = self.get_broker_spread()
+                        pair.locked_buy_spread = current_spread
+
+                        # Lock the COMPENSATED trigger for re-entries
+                        # Re-entries trigger at (first_fill - spread) so they fill at ~first_fill
+                        pair.locked_buy_trigger = exec_price - current_spread
+
+                        print(f"[LOCKED] Pair {index} BUY: entry={exec_price:.2f}, spread={current_spread:.2f}, trigger={pair.locked_buy_trigger:.2f}")
+
                 elif direction == "sell":
-                    if pair.locked_sell_trigger == 0.0:
-                        pair.locked_sell_trigger = pair.sell_price
-                        print(f"[LOCKED TRIGGER] Pair {index} SELL trigger at {pair.sell_price:.2f} (grid)")
                     if pair.locked_sell_entry == 0.0:
+                        # First SELL execution - lock everything
                         pair.locked_sell_entry = exec_price
-                        print(f"[LOCKED ENTRY] Pair {index} SELL entry at {exec_price:.2f} (exec)")
+
+                        # Lock the spread at this moment
+                        current_spread = self.get_broker_spread()
+                        pair.locked_sell_spread = current_spread
+
+                        # Lock the COMPENSATED trigger for re-entries
+                        # Re-entries trigger at (first_fill + spread) so they fill at ~first_fill
+                        pair.locked_sell_trigger = exec_price + current_spread
+
+                        print(f"[LOCKED] Pair {index} SELL: entry={exec_price:.2f}, spread={current_spread:.2f}, trigger={pair.locked_sell_trigger:.2f}")
 
                 # Track lot size history for progression logging
                 if direction == "buy":
