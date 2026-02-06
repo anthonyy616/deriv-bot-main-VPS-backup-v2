@@ -94,6 +94,8 @@ class GridPair:
     
     locked_buy_entry: float = 0.0   # The actual execution price when BUY first fired
     locked_sell_entry: float = 0.0  # The actual execution price when SELL first fired
+    locked_buy_trigger: float = 0.0   # Grid price for BUY triggers (never changes)
+    locked_sell_trigger: float = 0.0  # Grid price for SELL triggers (never changes)
     tp_blocked: bool = False        # Permanent retirement flag (set on TP/SL)
     
     # Lot size history for progression tracking
@@ -519,6 +521,13 @@ class SymbolEngine:
     @property
     def spread(self) -> float:
         return float(self.config.get('spread', 20.0))
+
+    def get_broker_spread(self) -> float:
+        """Get current broker bid-ask spread from live tick data."""
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick and tick.ask > 0 and tick.bid > 0:
+            return tick.ask - tick.bid
+        return 0.0
     
     @property
     def max_pairs(self) -> int:
@@ -668,10 +677,6 @@ class SymbolEngine:
         # If already at cap (C >= 3), check if this would complete an INCOMPLETE pair
         if C >= 3:
             # EXCEPTION: If this trade will bring us to (or above) max_positions, ALLOW it.
-            # This is critical for small max_positions (e.g. 2) where the "completing" leg
-            # is also the "hedging" leg. If we block it, we prevent the hedge.
-            # Since hedging neutralizes the pair (removing it from C calculation), 
-            # this trade is effectively neutral to risk.
             if (pair.trade_count + 1) >= self.max_positions:
                 return True
 
@@ -1192,7 +1197,7 @@ class SymbolEngine:
                     # Block bullish expansion
                     pass
                 else:
-                    print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}, Group={self.current_group}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
+                    #print(f"[EXPAND-BULL] ask={ask:.2f} >= level={bull_level:.2f} (C={C}, Group={self.current_group}) -> B{incomplete_bull_pair}+S{incomplete_bull_pair+1}")
                     await self._expand_bullish(incomplete_bull_pair)
         
         # ================================================================
@@ -1228,7 +1233,7 @@ class SymbolEngine:
                     # Block bearish expansion
                     pass
                 else:
-                    print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}, Group={self.current_group}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
+                    #print(f"[EXPAND-BEAR] bid={bid:.2f} <= level={bear_level:.2f} (C={C}, Group={self.current_group}) -> S{incomplete_bear_pair}+B{incomplete_bear_pair-1}")
                     await self._expand_bearish(incomplete_bear_pair)
     
     async def _expand_bullish(self, pair_to_complete: int):
@@ -3999,8 +4004,20 @@ class SymbolEngine:
             # Once a trade executes, its entry price is locked forever.
             # Re-entries must happen at the exact same level.
             # ================================================================
-            buy_trigger = pair.locked_buy_entry if pair.locked_buy_entry > 0 else pair.buy_price
-            sell_trigger = pair.locked_sell_entry if pair.locked_sell_entry > 0 else pair.sell_price
+            # Use locked_trigger if set, otherwise grid price
+            base_buy_trigger = pair.locked_buy_trigger if pair.locked_buy_trigger > 0 else pair.buy_price
+            base_sell_trigger = pair.locked_sell_trigger if pair.locked_sell_trigger > 0 else pair.sell_price
+
+            # Apply spread compensation for re-entries (trade_count > 0)
+            if pair.trade_count > 0:
+                broker_spread = self.get_broker_spread()  # Pure MT5 spread, no caps
+                # BUY: trigger earlier (price - spread) so execution lands at grid
+                buy_trigger = base_buy_trigger - broker_spread
+                # SELL: trigger earlier (price + spread) so execution lands at grid
+                sell_trigger = base_sell_trigger + broker_spread
+            else:
+                buy_trigger = base_buy_trigger
+                sell_trigger = base_sell_trigger
             
             # NOTE: Proximity-based re-entry for Phoenix pairs removed - no longer used
             # ================================================================
@@ -4523,12 +4540,22 @@ class SymbolEngine:
             # This ensures re-entries happen at the exact same price level
             # ================================================================
             if pair:
-                if direction == "buy" and pair.locked_buy_entry == 0.0:
-                    pair.locked_buy_entry = exec_price
-                    print(f"[LOCKED] Pair {index} BUY entry locked at {exec_price:.2f}")
-                elif direction == "sell" and pair.locked_sell_entry == 0.0:
-                    pair.locked_sell_entry = exec_price
-                    print(f"[LOCKED] Pair {index} SELL entry locked at {exec_price:.2f}")
+                if direction == "buy":
+                    # Lock GRID TRIGGER price (for re-entry triggers)
+                    if pair.locked_buy_trigger == 0.0:
+                        pair.locked_buy_trigger = pair.buy_price
+                        print(f"[LOCKED TRIGGER] Pair {index} BUY trigger at {pair.buy_price:.2f} (grid)")
+                    # Lock EXECUTION price (for TP/SL alignment)
+                    if pair.locked_buy_entry == 0.0:
+                        pair.locked_buy_entry = exec_price
+                        print(f"[LOCKED ENTRY] Pair {index} BUY entry at {exec_price:.2f} (exec)")
+                elif direction == "sell":
+                    if pair.locked_sell_trigger == 0.0:
+                        pair.locked_sell_trigger = pair.sell_price
+                        print(f"[LOCKED TRIGGER] Pair {index} SELL trigger at {pair.sell_price:.2f} (grid)")
+                    if pair.locked_sell_entry == 0.0:
+                        pair.locked_sell_entry = exec_price
+                        print(f"[LOCKED ENTRY] Pair {index} SELL entry at {exec_price:.2f} (exec)")
 
                 # Track lot size history for progression logging
                 if direction == "buy":

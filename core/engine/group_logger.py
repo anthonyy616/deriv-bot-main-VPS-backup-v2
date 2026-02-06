@@ -286,9 +286,6 @@ class GroupLogger:
         group = self._get_or_create_group(group_id)
         p = self._get_or_create_pair(group, pair_idx)
         
-        # If trade_type is provided, update that leg. 
-        # If NOT provided, we might be calling generically? 
-        # SymbolEngine should pass trade_type for updates.
         
         if trade_type:
             l = p.buy_leg if trade_type in ["BUY", "B"] else p.sell_leg
@@ -381,8 +378,6 @@ class GroupLogger:
             )
             lines.append(row_s)
             
-            # Separator between pairs for readability? Optional.
-            # lines.append(self.ROW_CHAR * width)
 
         lines.append(header_line)
         
@@ -440,11 +435,6 @@ class GroupLogger:
         """Update the main single log file with latest state."""
         content = self.render_full_log(current_price)
         
-        # Overwrite mode - we want the file to represent CURRENT state
-        # The user said "all the tables should and MUST be in one file"
-        # and "in tabular manner". State snapshot is best for this.
-        
-        # Use a fixed filename for the session so it doesn't rotate endlessly
         # Include symbol name so each asset gets its own file
 
         safe_symbol = self.symbol.replace(" ", "_").replace("/", "_")
